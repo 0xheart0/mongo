@@ -31,10 +31,13 @@
  * so we cannot test it outside of a dbtest.
  */
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
@@ -44,11 +47,15 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace QueryStageAnd {
+
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::set;
 
     class QueryStageAndBase {
     public:
@@ -128,7 +135,7 @@ namespace QueryStageAnd {
 
                 WorkingSetMember* member = ws->get(id);
                 ASSERT(member->hasObj());
-                return member->obj;
+                return member->obj.value();
             }
 
             // We failed to produce a result.
@@ -156,7 +163,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashInvalidation : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -209,9 +216,9 @@ namespace QueryStageAnd {
             getLocs(&data, coll);
             size_t memUsageBefore = ah->getMemUsage();
             for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (coll->docFor(&_txn, *it)["foo"].numberInt() == 15) {
+                if (coll->docFor(&_txn, *it).value()["foo"].numberInt() == 15) {
                     ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
-                    remove(coll->docFor(&_txn, *it));
+                    remove(coll->docFor(&_txn, *it).value());
                     break;
                 }
             }
@@ -259,7 +266,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashInvalidateLookahead : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -312,7 +319,7 @@ namespace QueryStageAnd {
 
             size_t memUsageBefore = ah->getMemUsage();
             for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (0 == deletedObj.woCompare(coll->docFor(&_txn, *it))) {
+                if (0 == deletedObj.woCompare(coll->docFor(&_txn, *it).value())) {
                     ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
                     break;
                 }
@@ -334,7 +341,8 @@ namespace QueryStageAnd {
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
                 WorkingSetMember* wsm = ws.get(id);
-                ASSERT_NOT_EQUALS(0, deletedObj.woCompare(coll->docFor(&_txn, wsm->loc)));
+                ASSERT_NOT_EQUALS(0,
+                                  deletedObj.woCompare(coll->docFor(&_txn, wsm->loc).value()));
                 ++count;
             }
 
@@ -346,7 +354,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -396,7 +404,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeafFirstChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -449,7 +457,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeafLastChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -501,7 +509,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -563,7 +571,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashThreeLeafMiddleChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -623,7 +631,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashWithNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -683,7 +691,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashProducesNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -732,7 +740,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashWithMatcher : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -785,7 +793,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashFirstChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -844,7 +852,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashSecondChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -908,7 +916,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedInvalidation : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -958,7 +966,7 @@ namespace QueryStageAnd {
             // and make sure it shows up in the flagged results.
             ah->saveState();
             ah->invalidate(&_txn, *data.begin(), INVALIDATION_DELETION);
-            remove(coll->docFor(&_txn, *data.begin()));
+            remove(coll->docFor(&_txn, *data.begin()).value());
             ah->restoreState(&_txn);
 
             // Make sure the nuked obj is actually in the flagged data.
@@ -997,7 +1005,7 @@ namespace QueryStageAnd {
             // not flagged.
             ah->saveState();
             ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
-            remove(coll->docFor(&_txn, *it));
+            remove(coll->docFor(&_txn, *it).value());
             ah->restoreState(&_txn);
 
             // Get all results aside from the two we killed.
@@ -1026,7 +1034,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1080,7 +1088,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedWithNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1125,7 +1133,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedProducesNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1174,7 +1182,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedWithMatcher : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1220,7 +1228,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedByLastChild : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1262,11 +1270,11 @@ namespace QueryStageAnd {
                 WorkingSetID id = WorkingSet::INVALID_ID;
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
-                BSONObj thisObj = coll->docFor(&_txn, ws.get(id)->loc);
+                BSONObj thisObj = coll->docFor(&_txn, ws.get(id)->loc).value();
                 ASSERT_EQUALS(7 + count, thisObj["bar"].numberInt());
                 ++count;
                 if (WorkingSet::INVALID_ID != lastId) {
-                    BSONObj lastObj = coll->docFor(&_txn, ws.get(lastId)->loc);
+                    BSONObj lastObj = coll->docFor(&_txn, ws.get(lastId)->loc).value();
                     ASSERT_LESS_THAN(lastObj["bar"].woCompare(thisObj["bar"]), 0);
                 }
                 lastId = id;
@@ -1283,7 +1291,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedFirstChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1337,7 +1345,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedSecondChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {

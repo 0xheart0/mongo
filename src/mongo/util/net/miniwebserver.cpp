@@ -33,12 +33,19 @@
 
 #include "mongo/util/net/miniwebserver.h"
 
+#include <boost/shared_ptr.hpp>
 #include <pcrecpp.h>
 
+#include "mongo/config.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
+    using std::endl;
+    using std::stringstream;
+    using std::vector;
 
     MiniWebServer::MiniWebServer(const string& name, const string &ip, int port)
         : Listener(name, ip, port, false)
@@ -129,7 +136,7 @@ namespace mongo {
         char buf[4096];
         int len = 0;
         try {
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
             psock->doSSLHandshake();
 #endif
             psock->setTimeout(8);

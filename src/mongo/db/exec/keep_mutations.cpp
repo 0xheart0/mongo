@@ -33,6 +33,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* KeepMutationsStage::kStageType = "KEEP_MUTATIONS";
 
@@ -73,8 +76,8 @@ namespace mongo {
                 else if (PlanStage::NEED_TIME == status) {
                     ++_commonStats.needTime;
                 }
-                else if (PlanStage::NEED_FETCH == status) {
-                    ++_commonStats.needFetch;
+                else if (PlanStage::NEED_YIELD == status) {
+                    ++_commonStats.needYield;
                 }
 
                 return status;
@@ -145,11 +148,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* KeepMutationsStage::getCommonStats() {
+    const CommonStats* KeepMutationsStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* KeepMutationsStage::getSpecificStats() {
+    const SpecificStats* KeepMutationsStage::getSpecificStats() const {
         return NULL;
     }
 

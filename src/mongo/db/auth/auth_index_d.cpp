@@ -37,14 +37,17 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+
 namespace authindex {
 
 namespace {
@@ -78,13 +81,13 @@ namespace {
         const NamespaceString systemUsers = AuthorizationManager::usersCollectionNamespace;
 
         // Make sure the old unique index from v2.4 on system.users doesn't exist.
+        ScopedTransaction scopedXact(txn, MODE_IX);
         AutoGetDb autoDb(txn, systemUsers.db(), MODE_X);
         if (!autoDb.getDb()) {
             return Status::OK();
         }
 
-        Collection* collection = autoDb.getDb()->getCollection(txn,
-                                                               NamespaceString(systemUsers));
+        Collection* collection = autoDb.getDb()->getCollection(NamespaceString(systemUsers));
         if (!collection) {
             return Status::OK();
         }
@@ -107,34 +110,19 @@ namespace {
         invariant( collection );
         const NamespaceString& ns = collection->ns();
         if (ns == AuthorizationManager::usersCollectionNamespace) {
-            try {
-                Helpers::ensureIndex(txn,
-                                     collection,
-                                     v3SystemUsersKeyPattern,
-                                     true,  // unique
-                                     v3SystemUsersIndexName.c_str());
-            } catch (const DBException& e) {
-                if (e.getCode() == ASSERT_ID_DUPKEY) {
-                    log() << "Duplicate key exception while trying to build unique index on " <<
-                            ns << ".  This is likely due to problems during the upgrade process " <<
-                            endl;
-                }
-                throw;
-            }
+            collection->getIndexCatalog()->createIndexOnEmptyCollection(
+                txn,
+                BSON("name" << v3SystemUsersIndexName
+                  << "ns" << collection->ns().ns()
+                  << "key" << v3SystemUsersKeyPattern
+                  << "unique" << true));
         } else if (ns == AuthorizationManager::rolesCollectionNamespace) {
-            try {
-                Helpers::ensureIndex(txn,
-                                     collection,
-                                     v3SystemRolesKeyPattern,
-                                     true,  // unique
-                                     v3SystemRolesIndexName.c_str());
-            } catch (const DBException& e) {
-                if (e.getCode() == ASSERT_ID_DUPKEY) {
-                    log() << "Duplicate key exception while trying to build unique index on " <<
-                            ns << "." << endl;
-                }
-                throw;
-            }
+            collection->getIndexCatalog()->createIndexOnEmptyCollection(
+                txn,
+                BSON("name" << v3SystemRolesIndexName
+                  << "ns" << collection->ns().ns()
+                  << "key" << v3SystemRolesKeyPattern
+                  << "unique" << true));
         }
     }
 

@@ -37,14 +37,19 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/db/query/explain.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::string;
+    using std::stringstream;
 
     class DistinctCommand : public Command {
     public:
@@ -66,8 +71,12 @@ namespace mongo {
             help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result,
-                 bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             Timer t;
 
@@ -163,7 +172,7 @@ namespace mongo {
                 b.appendNumber( "nscanned" , stats.totalKeysExamined );
                 b.appendNumber( "nscannedObjects" , stats.totalDocsExamined );
                 b.appendNumber( "timems" , t.millis() );
-                b.append( "planSummary" , stats.summaryStr );
+                b.append( "planSummary" , Explain::getPlanSummary(exec.get()) );
                 result.append( "stats" , b.obj() );
             }
 

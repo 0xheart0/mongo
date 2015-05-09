@@ -28,19 +28,25 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
+    class CanonicalQuery;
     class OperationContext;
+    class PlanExecutor;
 
     struct DeleteStageParams {
         DeleteStageParams() :
             isMulti(false),
             shouldCallLogOp(false),
             fromMigrate(false),
-            isExplain(false) { }
+            isExplain(false),
+            returnDeleted(false),
+            canonicalQuery(NULL) { }
 
         // Should we delete all documents returned from the child (a "multi delete"), or at most one
         // (a "single delete")?
@@ -55,11 +61,18 @@ namespace mongo {
 
         // Are we explaining a delete command rather than actually executing it?
         bool isExplain;
+
+        // Should we return the document we just deleted?
+        bool returnDeleted;
+
+        // The parsed query predicate for this delete. Not owned here.
+        CanonicalQuery* canonicalQuery;
     };
 
     /**
-     * This stage delete documents by RecordId that are returned from its child.  NEED_TIME
-     * is returned after deleting a document.
+     * This stage delete documents by RecordId that are returned from its child. If the deleted
+     * document was requested to be returned, then ADVANCED is returned after deleting a document.
+     * Otherwise, NEED_TIME is returned after deleting a document.
      *
      * Callers of work() must be holding a write lock (and, for shouldCallLogOp=true deletes,
      * callers must have had the replication coordinator approve the write).
@@ -87,11 +100,18 @@ namespace mongo {
 
         virtual PlanStageStats* getStats();
 
-        virtual const CommonStats* getCommonStats();
+        virtual const CommonStats* getCommonStats() const;
 
-        virtual const SpecificStats* getSpecificStats();
+        virtual const SpecificStats* getSpecificStats() const;
 
         static const char* kStageType;
+
+        /**
+         * Extracts the number of documents deleted by the update plan 'exec'.
+         *
+         * Should only be called if the root plan stage of 'exec' is UPDATE and if 'exec' is EOF.
+         */
+        static long long getNumDeleted(PlanExecutor* exec);
 
     private:
         // Transactional context.  Not owned by us.
@@ -107,7 +127,13 @@ namespace mongo {
         // stage.
         Collection* _collection;
 
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
+
+        // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
+        WorkingSetID _idRetrying;
+
+        // If not WorkingSet::INVALID_ID, we return this member to our caller.
+        WorkingSetID _idReturning;
 
         // Stats
         CommonStats _commonStats;

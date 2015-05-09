@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/exec/sort.h"
 
 #include <algorithm>
@@ -37,12 +39,14 @@
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_key_generator.h"
 #include "mongo/db/query/lite_parsed_query.h"
-#include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::endl;
     using std::vector;
 
     // static
@@ -124,7 +128,7 @@ namespace mongo {
                                              BSONObj* objOut) const {
         BSONObj btreeKeyToUse;
 
-        Status btreeStatus = getBtreeKey(member.obj, &btreeKeyToUse);
+        Status btreeStatus = getBtreeKey(member.obj.value(), &btreeKeyToUse);
         if (!btreeStatus.isOK()) {
             return btreeStatus;
         }
@@ -227,7 +231,8 @@ namespace mongo {
         params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
         // We're creating a "virtual index" with key pattern equal to the sort order.
-        IndexEntry sortOrder(sortObj, IndexNames::BTREE, true, false, "doesnt_matter", BSONObj());
+        IndexEntry sortOrder(sortObj, IndexNames::BTREE, true, false, false, "doesnt_matter", NULL,
+                             BSONObj());
         params.indices.push_back(sortOrder);
 
         CanonicalQuery* rawQueryForSort;
@@ -236,7 +241,7 @@ namespace mongo {
         auto_ptr<CanonicalQuery> queryForSort(rawQueryForSort);
 
         vector<QuerySolution*> solns;
-        QLOG() << "Sort stage: Planning to obtain bounds for sort." << endl;
+        LOG(5) << "Sort stage: Planning to obtain bounds for sort." << endl;
         QueryPlanner::plan(*queryForSort, params, &solns);
 
         // TODO: are there ever > 1 solns?  If so, do we look for a specific soln?
@@ -396,8 +401,8 @@ namespace mongo {
             else if (PlanStage::NEED_TIME == code) {
                 ++_commonStats.needTime;
             }
-            else if (PlanStage::NEED_FETCH == code) {
-                ++_commonStats.needFetch;
+            else if (PlanStage::NEED_YIELD == code) {
+                ++_commonStats.needYield;
                 *out = id;
             }
 
@@ -478,11 +483,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* SortStage::getCommonStats() {
+    const CommonStats* SortStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* SortStage::getSpecificStats() {
+    const SpecificStats* SortStage::getSpecificStats() const {
         return &_specificStats;
     }
 

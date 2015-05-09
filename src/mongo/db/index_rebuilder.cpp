@@ -42,7 +42,8 @@
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -50,6 +51,10 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::vector;
 
 namespace {
     void checkNS(OperationContext* txn, const std::list<std::string>& nsToCheck) {
@@ -66,9 +71,9 @@ namespace {
             // for this namespace.
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_X);
-            Client::Context ctx(txn, ns);
+            OldClientContext ctx(txn, ns);
 
-            Collection* collection = ctx.db()->getCollection(txn, ns);
+            Collection* collection = ctx.db()->getCollection(ns);
             if ( collection == NULL )
                 continue;
 
@@ -110,6 +115,7 @@ namespace {
 
                 if (!serverGlobalParams.indexBuildRetry) {
                     log() << "  not rebuilding interrupted indexes";
+                    wunit.commit();
                     continue;
                 }
 
@@ -144,11 +150,11 @@ namespace {
 } // namespace
 
     void restartInProgressIndexesFromLastShutdown(OperationContext* txn) {
-        txn->getClient()->getAuthorizationSession()->grantInternalAuthorization();
+        AuthorizationSession::get(txn->getClient())->grantInternalAuthorization();
 
         std::vector<std::string> dbNames;
 
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->listDatabases( &dbNames );
 
         try {
@@ -156,6 +162,8 @@ namespace {
             for (std::vector<std::string>::const_iterator dbName = dbNames.begin();
                  dbName < dbNames.end();
                  ++dbName) {
+
+                ScopedTransaction scopedXact(txn, MODE_IS);
                 AutoGetDb autoDb(txn, *dbName, MODE_S);
 
                 Database* db = autoDb.getDb();

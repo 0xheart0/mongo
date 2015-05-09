@@ -40,9 +40,9 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/planner_ixselect.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
-
 
 namespace mongo {
 
@@ -57,11 +57,21 @@ namespace mongo {
         clearQueryCache();
         _keysComputed = false;
         computeIndexKeys( txn );
+        updatePlanCacheIndexEntries( txn );
         // query settings is not affected by info cache reset.
         // index filters should persist throughout life of collection
     }
 
+    const UpdateIndexData& CollectionInfoCache::indexKeys( OperationContext* txn ) const {
+        // This requires "some" lock, and MODE_IS is an expression for that, for now.
+        dassert(txn->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_IS));
+        invariant(_keysComputed);
+        return _indexedPaths;
+    }
+
     void CollectionInfoCache::computeIndexKeys( OperationContext* txn ) {
+        // This function modified objects attached to the Collection so we need a write lock
+        invariant(txn->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_X));
         _indexedPaths.clear();
 
         IndexCatalog::IndexIterator i = _collection->getIndexCatalog()->getIndexIterator(txn, true);
@@ -99,6 +109,17 @@ namespace mongo {
                     _indexedPaths.addPathComponent(ftsSpec.languageOverrideField());
                 }
             }
+
+            // handle filtered indexes
+            const IndexCatalogEntry* entry = i.catalogEntry(descriptor);
+            const MatchExpression* filter = entry->getFilterExpression();
+            if (filter) {
+                unordered_set<std::string> paths;
+                QueryPlannerIXSelect::getFields(filter, "", &paths);
+                for (auto it = paths.begin(); it != paths.end(); ++it) {
+                    _indexedPaths.addPath(*it);
+                }
+            }
         }
 
         _keysComputed = true;
@@ -123,6 +144,30 @@ namespace mongo {
 
     QuerySettings* CollectionInfoCache::getQuerySettings() const {
         return _querySettings.get();
+    }
+
+    void CollectionInfoCache::updatePlanCacheIndexEntries(OperationContext* txn) {
+        std::vector<IndexEntry> indexEntries;
+
+        // TODO We shouldn't need to include unfinished indexes, but we must here because the index
+        // catalog may be in an inconsistent state.  SERVER-18346.
+        const bool includeUnfinishedIndexes = true;
+        IndexCatalog::IndexIterator ii =
+            _collection->getIndexCatalog()->getIndexIterator(txn, includeUnfinishedIndexes);
+        while (ii.more()) {
+            const IndexDescriptor* desc = ii.next();
+            const IndexCatalogEntry* ice = ii.catalogEntry(desc);
+            indexEntries.emplace_back(desc->keyPattern(),
+                                      desc->getAccessMethodName(),
+                                      desc->isMultikey(txn),
+                                      desc->isSparse(),
+                                      desc->unique(),
+                                      desc->indexName(),
+                                      ice->getFilterExpression(),
+                                      desc->infoObj());
+        }
+
+        _planCache->notifyOfIndexEntries(indexEntries);
     }
 
 }

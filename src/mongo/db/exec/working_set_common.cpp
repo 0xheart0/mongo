@@ -26,9 +26,16 @@
  *    it in the license file.
  */
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/working_set.h"
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/exec/working_set_common.h"
+
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/query/canonical_query.h"
 
 namespace mongo {
 
@@ -43,32 +50,66 @@ namespace mongo {
         if (!member->hasLoc()) { return false; }
 
         // Do the fetch, invalidate the DL.
-        member->obj = collection->docFor(txn, member->loc).getOwned();
+        member->obj = collection->docFor(txn, member->loc);
+        member->obj.setValue(member->obj.value().getOwned() );
 
         member->state = WorkingSetMember::OWNED_OBJ;
         member->loc = RecordId();
         return true;
     }
 
+    void WorkingSetCommon::prepareForSnapshotChange(WorkingSet* workingSet) {
+        dassert(supportsDocLocking());
+
+        for (WorkingSet::iterator it = workingSet->begin(); it != workingSet->end(); ++it) {
+            if (it->state == WorkingSetMember::LOC_AND_IDX) {
+                it->isSuspicious = true;
+            }
+            else if (it->state == WorkingSetMember::LOC_AND_UNOWNED_OBJ) {
+                // We already have the data so convert directly to owned state.
+                it->obj.setValue(it->obj.value().getOwned());
+                it->state = WorkingSetMember::LOC_AND_OWNED_OBJ;
+            }
+        }
+    }
+
     // static
-    void WorkingSetCommon::completeFetch(OperationContext* txn,
-                                         WorkingSetMember* member,
-                                         const Collection* collection) {
+    bool WorkingSetCommon::fetch(OperationContext* txn,
+                                 WorkingSetMember* member,
+                                 const Collection* collection) {
         // The RecordFetcher should already have been transferred out of the WSM and used.
         invariant(!member->hasFetcher());
-
-        // If the diskloc was invalidated during fetch, then a "forced fetch" already converted this
-        // WSM into the owned object state. In this case, there is nothing more to do here.
-        if (WorkingSetMember::OWNED_OBJ == member->state) {
-            return;
-        }
 
         // We should have a RecordId but need to retrieve the obj. Get the obj now and reset all WSM
         // state appropriately.
         invariant(member->hasLoc());
-        member->obj = collection->docFor(txn, member->loc);
+
+        member->obj.reset();
+        if (!collection->findDoc(txn, member->loc, &member->obj)) {
+            return false;
+        }
+
+        if (member->isSuspicious) {
+            // Make sure that all of the keyData is still valid for this copy of the document.
+            // This ensures both that index-provided filters and sort orders still hold.
+            // TODO provide a way for the query planner to opt out of this checking if it is
+            // unneeded due to the structure of the plan.
+            invariant(!member->keyData.empty());
+            for (size_t i = 0; i < member->keyData.size(); i++) {
+                BSONObjSet keys;
+                member->keyData[i].index->getKeys(member->obj.value(), &keys);
+                if (!keys.count(member->keyData[i].keyData)) {
+                    // document would no longer be at this position in the index.
+                    return false;
+                }
+            }
+
+            member->isSuspicious = false;
+        }
+
         member->keyData.clear();
         member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
+        return true;
     }
 
     // static
@@ -104,7 +145,7 @@ namespace mongo {
         WorkingSetID wsid = ws->allocate();
         WorkingSetMember* member = ws->get(wsid);
         member->state = WorkingSetMember::OWNED_OBJ;
-        member->obj = buildMemberStatusObject(status);
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), buildMemberStatusObject(status));
 
         return wsid;
     }
@@ -130,11 +171,11 @@ namespace mongo {
         if (!member->hasOwnedObj()) {
             return;
         }
-        BSONObj obj = member->obj;
+        BSONObj obj = member->obj.value();
         if (!isValidStatusMemberObject(obj)) {
             return;
         }
-        *objOut = member->obj;
+        *objOut = obj;
     }
 
     // static
@@ -147,7 +188,7 @@ namespace mongo {
     // static
     Status WorkingSetCommon::getMemberStatus(const WorkingSetMember& member) {
         invariant(member.hasObj());
-        return getMemberObjectStatus(member.obj);
+        return getMemberObjectStatus(member.obj.value());
     }
 
     // static

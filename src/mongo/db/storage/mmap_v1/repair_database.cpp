@@ -35,6 +35,7 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
@@ -42,9 +43,10 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/util/file.h"
 #include "mongo/util/file_allocator.h"
@@ -53,6 +55,13 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::map;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     typedef boost::filesystem::path Path;
 
@@ -70,7 +79,7 @@ namespace mongo {
                              const string& path = storageGlobalParams.dbpath);
 
     void _deleteDataFiles(const std::string& database) {
-        if (mmapv1GlobalOptions.directoryperdb) {
+        if (storageGlobalParams.directoryperdb) {
             FileAllocator::get()->waitUntilFinished();
             MONGO_ASSERT_ON_EXCEPTION_WITH_MSG(
                     boost::filesystem::remove_all(
@@ -103,7 +112,7 @@ namespace mongo {
     // back up original database files to 'temp' dir
     void _renameForBackup( const std::string& database, const Path &reservedPath ) {
         Path newPath( reservedPath );
-        if (mmapv1GlobalOptions.directoryperdb)
+        if (storageGlobalParams.directoryperdb)
             newPath /= database;
         class Renamer : public FileOp {
         public:
@@ -150,7 +159,7 @@ namespace mongo {
     // move temp files to standard data dir
     void _replaceWithRecovered( const string& database, const char *reservedPathString ) {
         Path newPath(storageGlobalParams.dbpath);
-        if (mmapv1GlobalOptions.directoryperdb)
+        if (storageGlobalParams.directoryperdb)
             newPath /= database;
         class Replacer : public FileOp {
         public:
@@ -192,7 +201,7 @@ namespace mongo {
         string c = database;
         c += '.';
         boost::filesystem::path p(path);
-        if (mmapv1GlobalOptions.directoryperdb)
+        if (storageGlobalParams.directoryperdb)
             p /= database;
         boost::filesystem::path q;
         q = p / (c+"ns");
@@ -272,15 +281,7 @@ namespace mongo {
                                          const std::string& dbName,
                                          bool preserveClonedFilesOnFailure,
                                          bool backupOriginalFiles ) {
-        // We must hold some form of lock here
-        invariant(txn->lockState()->isLocked());
-        invariant( dbName.find( '.' ) == string::npos );
-
         scoped_ptr<RepairFileDeleter> repairFileDeleter;
-
-        log() << "repairDatabase " << dbName << endl;
-
-        BackgroundOperation::assertNoBgOpInProgForDb(dbName);
 
         // Must be done before and after repair
         getDur().syncDataAndTruncateJournal(txn);
@@ -300,7 +301,9 @@ namespace mongo {
         Path reservedPath =
             uniqueReservedPath( ( preserveClonedFilesOnFailure || backupOriginalFiles ) ?
                                 "backup" : "_tmp" );
-        MONGO_ASSERT_ON_EXCEPTION( boost::filesystem::create_directory( reservedPath ) );
+        bool created = false;
+        MONGO_ASSERT_ON_EXCEPTION( created = boost::filesystem::create_directory( reservedPath ) );
+        invariant( created );
         string reservedPathString = reservedPath.string();
 
         if ( !preserveClonedFilesOnFailure )
@@ -325,24 +328,21 @@ namespace mongo {
                 dbEntry.reset(new MMAPV1DatabaseCatalogEntry(txn,
                                                              dbName,
                                                              reservedPathString,
-                                                             mmapv1GlobalOptions.directoryperdb,
+                                                             storageGlobalParams.directoryperdb,
                                                              true));
-                invariant(!dbEntry->exists());
-                tempDatabase.reset( new Database(dbName, dbEntry.get()));
+                tempDatabase.reset( new Database(txn, dbName, dbEntry.get()));
             }
 
             map<string,CollectionOptions> namespacesToCopy;
             {
                 string ns = dbName + ".system.namespaces";
-                Client::Context ctx(txn,  ns );
-                Collection* coll = originalDatabase->getCollection( txn, ns );
+                OldClientContext ctx(txn,  ns );
+                Collection* coll = originalDatabase->getCollection( ns );
                 if ( coll ) {
-                    scoped_ptr<RecordIterator> it( coll->getIterator( txn,
-                                                                      DiskLoc(),
-                                                                      CollectionScanParams::FORWARD ) );
+                    scoped_ptr<RecordIterator> it( coll->getIterator(txn) );
                     while ( !it->isEOF() ) {
-                        DiskLoc loc = it->getNext();
-                        BSONObj obj = coll->docFor( txn, loc );
+                        RecordId loc = it->getNext();
+                        BSONObj obj = coll->docFor(txn, loc).value();
 
                         string ns = obj["name"].String();
 
@@ -377,12 +377,12 @@ namespace mongo {
                 Collection* tempCollection = NULL;
                 {
                     WriteUnitOfWork wunit(txn);
-                    tempCollection = tempDatabase->createCollection(txn, ns, options, true, false);
+                    tempCollection = tempDatabase->createCollection(txn, ns, options, false);
                     wunit.commit();
                 }
 
-                Client::Context readContext(txn, ns, originalDatabase);
-                Collection* originalCollection = originalDatabase->getCollection( txn, ns );
+                OldClientContext readContext(txn, ns, originalDatabase);
+                Collection* originalCollection = originalDatabase->getCollection( ns );
                 invariant( originalCollection );
 
                 // data
@@ -399,22 +399,23 @@ namespace mongo {
                     }
 
                     Status status = indexer.init( indexes );
-                    if ( !status.isOK() )
+                    if (!status.isOK()) {
                         return status;
+                    }
                 }
 
                 scoped_ptr<RecordIterator> iterator(originalCollection->getIterator(txn));
                 while ( !iterator->isEOF() ) {
-                    DiskLoc loc = iterator->getNext();
+                    RecordId loc = iterator->getNext();
                     invariant( !loc.isNull() );
 
-                    BSONObj doc = originalCollection->docFor( txn, loc );
+                    BSONObj doc = originalCollection->docFor(txn, loc).value();
 
                     WriteUnitOfWork wunit(txn);
-                    StatusWith<DiskLoc> result = tempCollection->insertDocument(txn,
-                                                                                doc,
-                                                                                &indexer,
-                                                                                false);
+                    StatusWith<RecordId> result = tempCollection->insertDocument(txn,
+                                                                                 doc,
+                                                                                 &indexer,
+                                                                                 false);
                     if ( !result.isOK() )
                         return result.getStatus();
 

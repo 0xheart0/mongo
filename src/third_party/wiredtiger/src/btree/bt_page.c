@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -20,7 +21,7 @@ static int  __inmem_row_leaf_entries(
  *	Check if a page matches the criteria for forced eviction.
  */
 static int
-__evict_force_check(WT_SESSION_IMPL *session, WT_PAGE *page)
+__evict_force_check(WT_SESSION_IMPL *session, WT_PAGE *page, uint32_t flags)
 {
 	WT_BTREE *btree;
 
@@ -31,13 +32,11 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_PAGE *page)
 		return (0);
 
 	/* Leaf pages only. */
-	if (page->type != WT_PAGE_COL_FIX &&
-	    page->type != WT_PAGE_COL_VAR &&
-	    page->type != WT_PAGE_ROW_LEAF)
+	if (WT_PAGE_IS_INTERNAL(page))
 		return (0);
 
-	/* Eviction may be turned off, although that's rare. */
-	if (F_ISSET(btree, WT_BTREE_NO_EVICTION))
+	/* Eviction may be turned off. */
+	if (LF_ISSET(WT_READ_NO_EVICT) || F_ISSET(btree, WT_BTREE_NO_EVICTION))
 		return (0);
 
 	/*
@@ -48,9 +47,14 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_PAGE *page)
 		return (0);
 
 	/* Trigger eviction on the next page release. */
-	page->read_gen = WT_READGEN_OLDEST;
+	__wt_page_evict_soon(page);
 
-	return (1);
+	/* Bump the oldest ID, we're about to do some visibility checks. */
+	__wt_txn_update_oldest(session, 0);
+
+	/* If eviction cannot succeed, don't try. */
+	return (
+	    __wt_page_can_evict(session, page, WT_EVICT_CHECK_SPLITS, NULL));
 }
 
 /*
@@ -67,9 +71,10 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 {
 	WT_DECL_RET;
 	WT_PAGE *page;
+	u_int sleep_cnt, wait_cnt;
 	int busy, force_attempts, oldgen;
 
-	for (force_attempts = oldgen = 0;;) {
+	for (force_attempts = oldgen = 0, wait_cnt = 0;;) {
 		switch (ref->state) {
 		case WT_REF_DISK:
 		case WT_REF_DELETED:
@@ -88,20 +93,31 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 		case WT_REF_READING:
 			if (LF_ISSET(WT_READ_CACHE))
 				return (WT_NOTFOUND);
-			/* FALLTHROUGH */
+			if (LF_ISSET(WT_READ_NO_WAIT))
+				return (WT_NOTFOUND);
+			WT_STAT_FAST_CONN_INCR(session, page_read_blocked);
+			break;
 		case WT_REF_LOCKED:
 			if (LF_ISSET(WT_READ_NO_WAIT))
 				return (WT_NOTFOUND);
-			/* The page is busy -- wait. */
+			WT_STAT_FAST_CONN_INCR(session, page_locked_blocked);
 			break;
 		case WT_REF_SPLIT:
 			return (WT_RESTART);
 		case WT_REF_MEM:
 			/*
-			 * The page is in memory: get a hazard pointer, update
-			 * the page's LRU and return.  The expected reason we
-			 * can't get a hazard pointer is because the page is
-			 * being evicted; yield and try again.
+			 * The page is in memory.
+			 *
+			 * Get a hazard pointer if one is required. We cannot
+			 * be evicting if no hazard pointer is required, we're
+			 * done.
+			 */
+			if (F_ISSET(S2BT(session), WT_BTREE_IN_MEMORY))
+				goto skip_evict;
+
+			/*
+			 * The expected reason we can't get a hazard pointer is
+			 * because the page is being evicted, yield, try again.
 			 */
 #ifdef HAVE_DIAGNOSTIC
 			WT_RET(
@@ -109,25 +125,47 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 #else
 			WT_RET(__wt_hazard_set(session, ref, &busy));
 #endif
-			if (busy)
-				break;
-
-			page = ref->page;
-			WT_ASSERT(session, page != NULL);
-
-			/* Forcibly evict pages that are too big. */
-			if (!LF_ISSET(WT_READ_NO_EVICT) &&
-			    force_attempts < 10 &&
-			    __evict_force_check(session, page)) {
-				++force_attempts;
-				WT_RET(__wt_page_release(session, ref, flags));
+			if (busy) {
+				WT_STAT_FAST_CONN_INCR(
+				    session, page_busy_blocked);
 				break;
 			}
 
-			/* Check if we need an autocommit transaction. */
-			if ((ret = __wt_txn_autocommit_check(session)) != 0) {
-				WT_TRET(__wt_hazard_clear(session, page));
-				return (ret);
+			/*
+			 * If eviction is configured for this file, check to see
+			 * if the page qualifies for forced eviction and update
+			 * the page's generation number. If eviction isn't being
+			 * done on this file, we're done.
+			 */
+			if (F_ISSET(S2BT(session), WT_BTREE_NO_EVICTION))
+				goto skip_evict;
+
+			/*
+			 * Forcibly evict pages that are too big.
+			 */
+			page = ref->page;
+			if (force_attempts < 10 &&
+			    __evict_force_check(session, page, flags)) {
+				++force_attempts;
+				ret = __wt_page_release_evict(session, ref);
+				/* If forced eviction fails, stall. */
+				if (ret == EBUSY) {
+					ret = 0;
+					wait_cnt += 1000;
+					WT_STAT_FAST_CONN_INCR(session,
+					    page_forcible_evict_blocked);
+					break;
+				} else
+					WT_RET(ret);
+
+				/*
+				 * The result of a successful forced eviction
+				 * is a page-state transition (potentially to
+				 * an in-memory page we can use, or a restart
+				 * return for our caller), continue the outer
+				 * page-acquisition loop.
+				 */
+				continue;
 			}
 
 			/*
@@ -138,18 +176,36 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 			 * Otherwise, update the page's read generation.
 			 */
 			if (oldgen && page->read_gen == WT_READGEN_NOTSET)
-				page->read_gen = WT_READGEN_OLDEST;
+				__wt_page_evict_soon(page);
 			else if (!LF_ISSET(WT_READ_NO_GEN) &&
+			    page->read_gen != WT_READGEN_OLDEST &&
 			    page->read_gen < __wt_cache_read_gen(session))
 				page->read_gen =
 				    __wt_cache_read_gen_set(session);
-
-			return (0);
+skip_evict:
+			/*
+			 * Check if we need an autocommit transaction.
+			 * Starting a transaction can trigger eviction, so skip
+			 * it if eviction isn't permitted.
+			 */
+			return (LF_ISSET(WT_READ_NO_EVICT) ? 0 :
+			    __wt_txn_autocommit_check(session));
 		WT_ILLEGAL_VALUE(session);
 		}
 
-		/* We failed to get the page -- yield before retrying. */
-		__wt_yield();
+		/*
+		 * We failed to get the page -- yield before retrying, and if
+		 * we've yielded enough times, start sleeping so we don't burn
+		 * CPU to no purpose.
+		 */
+		if (++wait_cnt < 1000)
+			__wt_yield();
+		else {
+			sleep_cnt = WT_MIN(wait_cnt, 10000);
+			wait_cnt *= 2;
+			WT_STAT_FAST_CONN_INCRV(session, page_sleep, sleep_cnt);
+			__wt_sleep(0, sleep_cnt);
+		}
 	}
 }
 
@@ -227,12 +283,12 @@ __wt_page_alloc(WT_SESSION_IMPL *session, uint8_t type,
 		WT_INTL_INDEX_SET(page, pindex);
 		if (alloc_refs)
 			for (i = 0; i < pindex->entries; ++i) {
-				WT_ERR(__wt_calloc_def(
-				    session, 1, &pindex->index[i]));
+				WT_ERR(__wt_calloc_one(
+				    session, &pindex->index[i]));
 				size += sizeof(WT_REF);
 			}
 		if (0) {
-err:			if ((pindex = WT_INTL_INDEX_COPY(page)) != NULL) {
+err:			if ((pindex = WT_INTL_INDEX_GET_SAFE(page)) != NULL) {
 				for (i = 0; i < pindex->entries; ++i)
 					__wt_free(session, pindex->index[i]);
 				__wt_free(session, pindex);
@@ -255,6 +311,7 @@ err:			if ((pindex = WT_INTL_INDEX_COPY(page)) != NULL) {
 
 	/* Increment the cache statistics. */
 	__wt_cache_page_inmem_incr(session, page, size);
+	(void)WT_ATOMIC_ADD8(cache->bytes_read, size);
 	(void)WT_ATOMIC_ADD8(cache->pages_inmem, 1);
 
 	*pagep = page;
@@ -266,8 +323,8 @@ err:			if ((pindex = WT_INTL_INDEX_COPY(page)) != NULL) {
  *	Build in-memory page information.
  */
 int
-__wt_page_inmem(WT_SESSION_IMPL *session,
-    WT_REF *ref, const void *image, uint32_t flags, WT_PAGE **pagep)
+__wt_page_inmem(WT_SESSION_IMPL *session, WT_REF *ref,
+    const void *image, size_t memsize, uint32_t flags, WT_PAGE **pagep)
 {
 	WT_DECL_RET;
 	WT_PAGE *page;
@@ -334,9 +391,10 @@ __wt_page_inmem(WT_SESSION_IMPL *session,
 
 	/*
 	 * Track the memory allocated to build this page so we can update the
-	 * cache statistics in a single call.
+	 * cache statistics in a single call. If the disk image is in allocated
+	 * memory, start with that.
 	 */
-	size = LF_ISSET(WT_PAGE_DISK_ALLOC) ? dsk->mem_size : 0;
+	size = LF_ISSET(WT_PAGE_DISK_ALLOC) ? memsize : 0;
 
 	switch (page->type) {
 	case WT_PAGE_COL_FIX:
@@ -417,7 +475,7 @@ __inmem_col_int(WT_SESSION_IMPL *session, WT_PAGE *page)
 	 * Walk the page, building references: the page contains value items.
 	 * The value items are on-page items (WT_CELL_VALUE).
 	 */
-	pindex = WT_INTL_INDEX_COPY(page);
+	pindex = WT_INTL_INDEX_GET_SAFE(page);
 	refp = pindex->index;
 	WT_CELL_FOREACH(btree, dsk, cell, unpack, i) {
 		ref = *refp++;
@@ -552,7 +610,7 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
 	 * location cookie pairs.  Keys are on-page/overflow items and location
 	 * cookies are WT_CELL_ADDR_XXX items.
 	 */
-	pindex = WT_INTL_INDEX_COPY(page);
+	pindex = WT_INTL_INDEX_GET_SAFE(page);
 	refp = pindex->index;
 	WT_CELL_FOREACH(btree, dsk, cell, unpack, i) {
 		ref = *refp;
@@ -574,7 +632,7 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
 
 			WT_ERR(__wt_row_ikey_incr(session, page,
 			    WT_PAGE_DISK_OFFSET(page, cell),
-			    current->data, current->size, &ref->key.ikey));
+			    current->data, current->size, ref));
 
 			*sizep += sizeof(WT_IKEY) + current->size;
 			break;
@@ -622,7 +680,7 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
 		}
 	}
 
-err:	__wt_scr_free(&current);
+err:	__wt_scr_free(session, &current);
 	return (ret);
 }
 

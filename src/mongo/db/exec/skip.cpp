@@ -33,6 +33,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* SkipStage::kStageType = "SKIP";
 
@@ -82,12 +85,12 @@ namespace mongo {
         else if (PlanStage::NEED_TIME == status) {
             ++_commonStats.needTime;
         }
-        else if (PlanStage::NEED_FETCH == status) {
-            ++_commonStats.needFetch;
+        else if (PlanStage::NEED_YIELD == status) {
+            ++_commonStats.needYield;
             *out = id;
         }
 
-        // NEED_TIME, NEED_FETCH, ERROR, IS_EOF
+        // NEED_TIME, NEED_YIELD, ERROR, IS_EOF
         return status;
     }
 
@@ -121,11 +124,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* SkipStage::getCommonStats() {
+    const CommonStats* SkipStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* SkipStage::getSpecificStats() {
+    const SpecificStats* SkipStage::getSpecificStats() const {
         return &_specificStats;
     }
 

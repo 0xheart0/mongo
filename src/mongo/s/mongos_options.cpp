@@ -1,4 +1,4 @@
-/*
+/**
  *    Copyright (C) 2013 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
@@ -32,11 +32,13 @@
 
 #include "mongo/s/mongos_options.h"
 
+#include <iostream>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/s/chunk.h"
@@ -48,6 +50,8 @@
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using std::endl;
 
     MongosGlobalParams mongosGlobalParams;
 
@@ -69,7 +73,7 @@ namespace mongo {
         }
 #endif
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         moe::OptionSection ssl_options("SSL options");
 
         ret = addSSLServerOptions(&ssl_options);
@@ -113,7 +117,7 @@ namespace mongo {
 
         options->addSection(sharding_options);
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         options->addSection(ssl_options);
 #endif
 
@@ -174,7 +178,7 @@ namespace mongo {
             return ret;
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         ret = canonicalizeSSLServerOptions(params);
         if (!ret.isOK()) {
             return ret;
@@ -251,15 +255,33 @@ namespace mongo {
             return Status(ErrorCodes::BadValue, "error: no args for --configdb");
         }
 
-        splitStringDelim(params["sharding.configDB"].as<std::string>(),
-                         &mongosGlobalParams.configdbs, ',');
-        if (mongosGlobalParams.configdbs.size() != 1 && mongosGlobalParams.configdbs.size() != 3) {
-            return Status(ErrorCodes::BadValue, "need either 1 or 3 configdbs");
+        std::string configdbString = params["sharding.configDB"].as<std::string>();
+        try {
+            std::string errmsg;
+            mongosGlobalParams.configdbs = ConnectionString::parse(configdbString, errmsg);
+
+            if (!mongosGlobalParams.configdbs.isValid()) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "Invalid configdb connection string: " << errmsg);
+            }
+        } catch (const DBException& e) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Invalid configdb connection string: " << e.what());
         }
 
-        if (mongosGlobalParams.configdbs.size() == 1) {
-            warning() << "running with 1 config server should be done only for testing purposes "
-                      << "and is not recommended for production" << endl;
+        std::vector<HostAndPort> configServers = mongosGlobalParams.configdbs.getServers();
+
+        if (!(mongosGlobalParams.configdbs.type() == ConnectionString::SYNC) &&
+                !(mongosGlobalParams.configdbs.type() == ConnectionString::SET &&
+                        configServers.size() == 1)) {
+            return Status(ErrorCodes::BadValue,
+                          "Must have either 3 node old-style config servers, or a single server "
+                          "replica set config server");
+        }
+
+        if (configServers.size() < 3) {
+            warning() << "running with less than 3 config servers should be done only for testing "
+                    "purposes and is not recommended for production" << endl;
         }
 
         if (params.count("upgrade")) {

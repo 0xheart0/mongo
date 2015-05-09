@@ -38,21 +38,33 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/client.h"
-#include "mongo/db/commands/fsync.h"
-#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/fsync.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/ops/delete.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/ops/insert.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/background.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::set;
+    using std::endl;
+    using std::list;
+    using std::string;
+    using std::vector;
+    using std::unique_ptr;
 
     Counter64 ttlPasses;
     Counter64 ttlDeletedDocuments;
@@ -61,6 +73,7 @@ namespace mongo {
     ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocuments", &ttlDeletedDocuments);
 
     MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorEnabled, bool, true );
+    MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorSleepSecs, int, 60 ); //used for testing
 
     class TTLMonitor : public BackgroundJob {
     public:
@@ -73,10 +86,10 @@ namespace mongo {
 
         virtual void run() {
             Client::initThread( name().c_str() );
-            cc().getAuthorizationSession()->grantInternalAuthorization();
+            AuthorizationSession::get(cc())->grantInternalAuthorization();
 
             while ( ! inShutdown() ) {
-                sleepsecs( 60 );
+                sleepsecs( ttlMonitorSleepSecs );
 
                 LOG(3) << "TTLMonitor thread awake" << endl;
 
@@ -92,39 +105,57 @@ namespace mongo {
                     continue;
                 }
 
-                // if part of replSet but not in a readable state (e.g. during initial sync), skip.
-                if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                        repl::ReplicationCoordinator::modeReplSet &&
-                        !repl::getGlobalReplicationCoordinator()->getCurrentMemberState().readable())
-                    continue;
+                try {
+                    doTTLPass();
+                }
+                catch ( const WriteConflictException& e ) {
+                    LOG(1) << "Got WriteConflictException in TTL thread";
+                }
 
-                set<string> dbs;
-                dbHolder().getAllShortNames( dbs );
+            }
+        }
 
-                ttlPasses.increment();
+    private:
 
-                for ( set<string>::const_iterator i=dbs.begin(); i!=dbs.end(); ++i ) {
-                    string db = *i;
+        void doTTLPass() {
+            // Count it as active from the moment the TTL thread wakes up
+            OperationContextImpl txn;
 
-                    vector<BSONObj> indexes;
-                    {
-                        OperationContextImpl txn;
-                        getTTLIndexesForDB( &txn, db, &indexes );
-                    }
+            // if part of replSet but not in a readable state (e.g. during initial sync), skip.
+            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+                repl::ReplicationCoordinator::modeReplSet &&
+                !repl::getGlobalReplicationCoordinator()->getMemberState().readable())
+                return;
 
-                    for ( vector<BSONObj>::const_iterator it = indexes.begin();
-                          it != indexes.end(); ++it ) {
+            set<string> dbs;
+            dbHolder().getAllShortNames( dbs );
 
-                        OperationContextImpl txn;
-                        if ( !doTTLForIndex( &txn, db, *it ) ) {
+            ttlPasses.increment();
+
+            for ( set<string>::const_iterator i=dbs.begin(); i!=dbs.end(); ++i ) {
+                string db = *i;
+
+                vector<BSONObj> indexes;
+                getTTLIndexesForDB(&txn, db, &indexes);
+
+                for ( vector<BSONObj>::const_iterator it = indexes.begin();
+                      it != indexes.end(); ++it ) {
+
+                    BSONObj idx = *it;
+                    try {
+                        if ( !doTTLForIndex( &txn, db, idx ) ) {
                             break;  // stop processing TTL indexes on this database
                         }
+                    } catch (const DBException& dbex) {
+                        error() << "Error processing ttl index: " << idx
+                                << " -- " << dbex.toString();
+                        // continue on to the next index
+                        continue;
                     }
                 }
             }
         }
 
-    private:
         /**
          * Acquire an IS-mode lock on the specified database and for each
          * collection in the database, append the specification of all
@@ -155,7 +186,7 @@ namespace mongo {
 
                 string ns = *it;
                 Lock::CollectionLock collLock( txn->lockState(), ns, MODE_IS );
-                CollectionCatalogEntry* coll = dbEntry->getCollectionCatalogEntry( txn, ns );
+                CollectionCatalogEntry* coll = dbEntry->getCollectionCatalogEntry( ns );
 
                 if ( !coll ) {
                     continue;  // skip since collection not found in catalog
@@ -182,62 +213,132 @@ namespace mongo {
          * @return true if caller should continue processing TTL indexes of collections
          *         on the specified database, and false otherwise
          */
-        bool doTTLForIndex( OperationContext* txn, const string& dbName, const BSONObj& idx ) {
+        bool doTTLForIndex(OperationContext* txn, const string& dbName, BSONObj idx) {
+            const string ns = idx["ns"].String();
+            if (!userAllowedWriteNS(ns).isOK()) {
+                error() << "namespace '" << ns << "' doesn't allow deletes, skipping ttl job for: "
+                        << idx;
+                return true;
+            }
+
             BSONObj key = idx["key"].Obj();
-            if ( key.nFields() != 1 ) {
-                error() << "key for ttl index can only have 1 field" << endl;
-                return true;
-            }
-            if ( !idx[secondsExpireField].isNumber() ) {
-                log() << "ttl indexes require the " << secondsExpireField << " field to be "
-                      << "numeric but received a type of: "
-                      << typeName( idx[secondsExpireField].type() );
+            if (key.nFields() != 1) {
+                error() << "key for ttl index can only have 1 field, skipping ttl job for: " << idx;
                 return true;
             }
 
-            BSONObj query;
-            {
-                BSONObjBuilder b;
-                long long expireMs = 1000 * idx[secondsExpireField].numberLong();
-                b.appendDate( "$lt", curTimeMillis64() - expireMs );
-                query = BSON( key.firstElement().fieldName() << b.obj() );
-            }
+            LOG(1) << "TTL -- ns: " << ns << " key: " << key;
 
-            LOG(1) << "TTL: " << key << " \t " << query << endl;
+            // Read the current time outside of the while loop, so that we don't expand our index
+            // bounds after every WriteConflictException.
+            unsigned long long now = curTimeMillis64();
 
-            long long n = 0;
-            {
-                const string ns = idx["ns"].String();
-
+            long long numDeleted = 0;
+            int attempt = 1;
+            while (1) {
+                ScopedTransaction scopedXact(txn, MODE_IX);
                 AutoGetDb autoDb(txn, dbName, MODE_IX);
                 Database* db = autoDb.getDb();
-                if (!db) return false;
+                if (!db) {
+                    return false;
+                }
 
-                Lock::CollectionLock collLock( txn->lockState(), ns, MODE_IX );
+                Lock::CollectionLock collLock(txn->lockState(), ns, MODE_IX);
 
-                Collection* collection = db->getCollection( txn, ns );
-                if ( !collection ) {
-                    // collection was dropped
+                Collection* collection = db->getCollection(ns);
+                if (!collection) {
+                    // Collection was dropped.
                     return true;
                 }
 
                 if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbName)) {
-                    // we've stepped down since we started this function,
-                    // so we should stop working as we only do deletes on the primary
+                    // We've stepped down since we started this function, so we should stop working
+                    // as we only do deletes on the primary.
                     return false;
                 }
 
-                if ( collection->getIndexCatalog()->findIndexByKeyPattern( txn, key ) == NULL ) {
-                    // index not finished yet
-                    LOG(1) << " skipping index because not finished";
+                IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByKeyPattern(txn,
+                                                                                             key);
+                if (!desc) {
+                    LOG(1) << "index not found (index build in progress? index dropped?), skipping "
+                           << "ttl job for: " << idx;
                     return true;
                 }
 
-                n = deleteObjects( txn, db, ns, query, PlanExecutor::YIELD_AUTO, false, true );
-                ttlDeletedDocuments.increment( n );
+                // Re-read 'idx' from the descriptor, in case the collection or index definition
+                // changed before we re-acquired the collection lock.
+                idx = desc->infoObj();
+
+                if (IndexType::INDEX_BTREE != IndexNames::nameToType(desc->getAccessMethodName())) {
+                    error() << "special index can't be used as a ttl index, skipping ttl job for: "
+                            << idx;
+                    return true;
+                }
+
+                BSONElement secondsExpireElt = idx[secondsExpireField];
+                if (!secondsExpireElt.isNumber()) {
+                    error() << "ttl indexes require the " << secondsExpireField << " field to be "
+                            << "numeric but received a type of "
+                            << typeName(secondsExpireElt.type()) << ", skipping ttl job for: "
+                            << idx;
+                    return true;
+                }
+
+                const Date_t kDawnOfTime(std::numeric_limits<long long>::min());
+                const BSONObj startKey = BSON("" << kDawnOfTime);
+                const BSONObj endKey =
+                    BSON("" << Date_t(now - (1000 * secondsExpireElt.numberLong())));
+                const bool endKeyInclusive = true;
+                // The canonical check as to whether a key pattern element is "ascending" or
+                // "descending" is (elt.number() >= 0).  This is defined by the Ordering class.
+                const InternalPlanner::Direction direction =
+                    (key.firstElement().number() >= 0) ? InternalPlanner::Direction::FORWARD
+                                                       : InternalPlanner::Direction::BACKWARD;
+                unique_ptr<PlanExecutor> exec(InternalPlanner::indexScan(txn,
+                                                                         collection,
+                                                                         desc,
+                                                                         startKey,
+                                                                         endKey,
+                                                                         endKeyInclusive,
+                                                                         direction));
+                exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
+
+                try {
+                    PlanExecutor::ExecState state;
+                    BSONObj obj;
+                    RecordId rid;
+                    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &rid))) {
+                        exec->saveState();
+                        {
+                            WriteUnitOfWork wunit(txn);
+                            collection->deleteDocument(txn, rid);
+                            wunit.commit();
+                        }
+                        ++numDeleted;
+                        ttlDeletedDocuments.increment();
+                        if (!exec->restoreState(txn)) {
+                            return true;
+                        }
+                    }
+                    if (PlanExecutor::IS_EOF != state) {
+                        if (PlanExecutor::FAILURE == state &&
+                                WorkingSetCommon::isValidStatusMemberObject(obj)) {
+                            error() << "ttl query execution for index " << idx << " failed with: "
+                                    << WorkingSetCommon::getMemberObjectStatus(obj);
+                            return true;
+                        }
+                        error() << "ttl query execution for index " << idx << " failed with state: "
+                                << PlanExecutor::statestr(state);
+                        return true;
+                    }
+                    break;
+                }
+                catch (const WriteConflictException& dle) {
+                    WriteConflictException::logAndBackoff(attempt++, "ttl", ns);
+                }
             }
 
-            LOG(1) << "\tTTL deleted: " << n << endl;
+            LOG(1) << "\tTTL deleted: " << numDeleted << endl;
             return true;
         }
     };

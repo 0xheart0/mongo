@@ -28,10 +28,11 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/d_state.h"
 
 namespace mongo {
@@ -89,15 +90,15 @@ namespace mongo {
 
         virtual PlanStageStats* getStats();
 
-        virtual const CommonStats* getCommonStats();
+        virtual const CommonStats* getCommonStats() const;
 
-        virtual const SpecificStats* getSpecificStats();
+        virtual const SpecificStats* getSpecificStats() const;
 
         static const char* kStageType;
 
     private:
         WorkingSet* _ws;
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         // Stats
         CommonStats _commonStats;
@@ -109,4 +110,3 @@ namespace mongo {
     };
 
 }  // namespace mongo
-

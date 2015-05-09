@@ -10,6 +10,9 @@
 /* Build the LevelDB API with Basho LevelDB support. */
 /* #undef HAVE_BASHOLEVELDB */
 
+/* LZ4 support automatically loaded. */
+/* #undef HAVE_BUILTIN_EXTENSION_LZ4 */
+
 /* Snappy support automatically loaded. */
 /* #undef HAVE_BUILTIN_EXTENSION_SNAPPY */
 
@@ -55,6 +58,9 @@
 /* Define to 1 if you have the `dl' library (-ldl). */
 /* #undef HAVE_LIBDL */
 
+/* Define to 1 if you have the `lz4' library (-llz4). */
+/* #undef HAVE_LIBLZ4 */
+
 /* Define to 1 if you have the `pthread' library (-lpthread). */
 /* #undef HAVE_LIBPTHREAD */
 
@@ -63,6 +69,9 @@
 
 /* Define to 1 if you have the `snappy' library (-lsnappy). */
 /* #undef HAVE_LIBSNAPPY */
+
+/* Define to 1 if you have the `tcmalloc' library (-ltcmalloc). */
+/* #undef HAVE_LIBTCMALLOC */
 
 /* Define to 1 if you have the `z' library (-lz). */
 /* #undef HAVE_LIBZ */
@@ -81,9 +90,6 @@
 
 /* Define to 1 if you have the `posix_memalign' function. */
 /* #undef HAVE_POSIX_MEMALIGN */
-
-/* Define to 1 if you have the <pthread_np.h> header file. */
-/* #undef HAVE_PTHREAD_NP_H */
 
 /* Build the LevelDB API with RocksDB support. */
 /* #undef HAVE_ROCKSDB */
@@ -117,6 +123,9 @@
 
 /* Enable verbose message configuration. */
 /* #undef HAVE_VERBOSE */
+
+/* Define to 1 if you have the <x86intrin.h> header file. */
+#define HAVE_X86INTRIN_H 1
 
 /* Spinlock type from mutex.h. */
 #define SPINLOCK_TYPE SPINLOCK_MSVC

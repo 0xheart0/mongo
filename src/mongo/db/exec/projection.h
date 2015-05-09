@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/projection_exec.h"
 #include "mongo/db/jsobj.h"
@@ -93,9 +95,9 @@ namespace mongo {
 
         PlanStageStats* getStats();
 
-        virtual const CommonStats* getCommonStats();
+        virtual const CommonStats* getCommonStats() const;
 
-        virtual const SpecificStats* getSpecificStats();
+        virtual const SpecificStats* getSpecificStats() const;
 
         typedef unordered_set<StringData, StringData::Hasher> FieldSet;
 
@@ -122,11 +124,11 @@ namespace mongo {
     private:
         Status transform(WorkingSetMember* member);
 
-        scoped_ptr<ProjectionExec> _exec;
+        boost::scoped_ptr<ProjectionExec> _exec;
 
         // _ws is not owned by us.
         WorkingSet* _ws;
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         // Stats
         CommonStats _commonStats;

@@ -46,6 +46,7 @@ namespace {
 namespace mongo {
 
     using std::auto_ptr;
+    using std::vector;
 
     const size_t AndHashStage::kLookAheadWorks = 10;
 
@@ -164,7 +165,7 @@ namespace mongo {
                         _dataMap.clear();
                         return PlanStage::FAILURE;
                     }
-                    // We ignore NEED_TIME. TODO: what do we want to do if we get NEED_FETCH here?
+                    // We ignore NEED_TIME. TODO: what do we want to do if we get NEED_YIELD here?
                 }
             }
 
@@ -286,10 +287,14 @@ namespace mongo {
                 return PlanStage::NEED_TIME;
             }
 
-            verify(member->hasLoc());
-            verify(_dataMap.end() == _dataMap.find(member->loc));
-
-            _dataMap[member->loc] = id;
+            if (!_dataMap.insert(std::make_pair(member->loc, id)).second) {
+                // Didn't insert because we already had this loc inside the map. This should only
+                // happen if we're seeing a newer copy of the same doc in a more recent snapshot.
+                // Throw out the newer copy of the doc.
+                _ws->free(id);
+                ++_commonStats.needTime;
+                return PlanStage::NEED_TIME;
+            }
 
             // Update memory stats.
             _memUsage += member->getMemUsage();
@@ -329,8 +334,8 @@ namespace mongo {
             if (PlanStage::NEED_TIME == childStatus) {
                 ++_commonStats.needTime;
             }
-            else if (PlanStage::NEED_FETCH == childStatus) {
-                ++_commonStats.needFetch;
+            else if (PlanStage::NEED_YIELD == childStatus) {
+                ++_commonStats.needYield;
                 *out = id;
             }
 
@@ -432,8 +437,8 @@ namespace mongo {
             if (PlanStage::NEED_TIME == childStatus) {
                 ++_commonStats.needTime;
             }
-            else if (PlanStage::NEED_FETCH == childStatus) {
-                ++_commonStats.needFetch;
+            else if (PlanStage::NEED_YIELD == childStatus) {
+                ++_commonStats.needYield;
                 *out = id;
             }
 
@@ -538,11 +543,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* AndHashStage::getCommonStats() {
+    const CommonStats* AndHashStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* AndHashStage::getSpecificStats() {
+    const SpecificStats* AndHashStage::getSpecificStats() const {
         return &_specificStats;
     }
 

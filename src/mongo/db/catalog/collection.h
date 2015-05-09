@@ -30,33 +30,39 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/mutable/damage_vector.h"
-#include "mongo/db/catalog/collection_cursor_cache.h"
 #include "mongo/db/catalog/collection_info_cache.h"
+#include "mongo/db/catalog/cursor_manager.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/snapshot.h"
 #include "mongo/platform/cstdint.h"
 
 namespace mongo {
 
     class CollectionCatalogEntry;
-    class Database;
+    class DatabaseCatalogEntry;
     class ExtentManager;
     class IndexCatalog;
+    class MatchExpression;
     class MultiIndexBlock;
-    class OperationContext;
-
-    class RecordIterator;
-    class RecordFetcher;
-
     class OpDebug;
+    class OperationContext;
+    class RecordFetcher;
+    class RecordIterator;
+    class UpdateDriver;
+    class UpdateRequest;
 
     struct CompactOptions {
 
@@ -99,13 +105,13 @@ namespace mongo {
      * this is NOT safe through a yield right now
      * not sure if it will be, or what yet
      */
-    class Collection : CappedDocumentDeleteCallback, UpdateMoveNotifier {
+    class Collection : CappedDocumentDeleteCallback, UpdateNotifier {
     public:
         Collection( OperationContext* txn,
-                    const StringData& fullNS,
+                    StringData fullNS,
                     CollectionCatalogEntry* details, // does not own
                     RecordStore* recordStore, // does not own
-                    Database* database ); // does not own
+                    DatabaseCatalogEntry* dbce ); // does not own
 
         ~Collection();
 
@@ -125,17 +131,17 @@ namespace mongo {
         const RecordStore* getRecordStore() const { return _recordStore; }
         RecordStore* getRecordStore() { return _recordStore; }
 
-        CollectionCursorCache* cursorCache() const { return &_cursorCache; }
+        CursorManager* getCursorManager() const { return &_cursorManager; }
 
         bool requiresIdIndex() const;
 
-        BSONObj docFor(OperationContext* txn, const RecordId& loc) const;
+        Snapshotted<BSONObj> docFor(OperationContext* txn, const RecordId& loc) const;
 
         /**
          * @param out - contents set to the right docs if exists, or nothing.
          * @return true iff loc exists
          */
-        bool findDoc(OperationContext* txn, const RecordId& loc, BSONObj* out) const;
+        bool findDoc(OperationContext* txn, const RecordId& loc, Snapshotted<BSONObj>* out) const;
 
         // ---- things that should move to a CollectionAccessMethod like thing
         /**
@@ -152,14 +158,6 @@ namespace mongo {
          */
         std::vector<RecordIterator*> getManyIterators( OperationContext* txn ) const;
 
-
-        /**
-         * does a table scan to do a count
-         * this should only be used at a very low level
-         * does no yielding, indexes, etc...
-         */
-        int64_t countTableScan( OperationContext* txn, const MatchExpression* expression );
-
         void deleteDocument( OperationContext* txn,
                              const RecordId& loc,
                              bool cappedOK = false,
@@ -174,8 +172,13 @@ namespace mongo {
          */
         StatusWith<RecordId> insertDocument( OperationContext* txn,
                                             const BSONObj& doc,
-                                            bool enforceQuota );
+                                            bool enforceQuota,
+                                            bool fromMigrate = false);
 
+        /**
+         * Callers must ensure no document validation is performed for this collection when calling
+         * this method.
+         */
         StatusWith<RecordId> insertDocument( OperationContext* txn,
                                             const DocWriter* doc,
                                             bool enforceQuota );
@@ -203,20 +206,27 @@ namespace mongo {
          * if not, it is moved
          * @return the post update location of the doc (may or may not be the same as oldLocation)
          */
-        StatusWith<RecordId> updateDocument( OperationContext* txn,
+        StatusWith<RecordId> updateDocument(OperationContext* txn,
                                             const RecordId& oldLocation,
+                                            const Snapshotted<BSONObj>& oldDoc,
                                             const BSONObj& newDoc,
                                             bool enforceQuota,
-                                            OpDebug* debug );
+                                            bool indexesAffected,
+                                            OpDebug* debug,
+                                            oplogUpdateEntryArgs& args);
+
+        bool updateWithDamagesSupported() const;
 
         /**
-         * right now not allowed to modify indexes
+         * Not allowed to modify indexes.
+         * Illegal to call if updateWithDamagesSupported() returns false.
          */
-        Status updateDocumentWithDamages( OperationContext* txn,
-                                          const RecordId& loc,
-                                          const RecordData& oldRec,
-                                          const char* damageSource,
-                                          const mutablebson::DamageVector& damages );
+        Status updateDocumentWithDamages(OperationContext* txn,
+                                         const RecordId& loc,
+                                         const Snapshotted<RecordData>& oldRec,
+                                         const char* damageSource,
+                                         const mutablebson::DamageVector& damages,
+                                         oplogUpdateEntryArgs& args);
 
         // -----------
 
@@ -256,6 +266,14 @@ namespace mongo {
          */
         void temp_cappedTruncateAfter( OperationContext* txn, RecordId end, bool inclusive );
 
+        /**
+         * Sets the validator for this collection.
+         *
+         * An empty validator removes all validation.
+         * Requires an exclusive lock on the collection.
+         */
+        Status setValidator(OperationContext* txn, BSONObj validator);
+
         // -----------
 
         //
@@ -283,12 +301,25 @@ namespace mongo {
 
     private:
 
+        /**
+         * Returns a non-ok Status if document does not pass this collection's validator.
+         */
+        Status checkValidation(OperationContext* txn, const BSONObj& document) const;
+
+        /**
+         * Returns a non-ok Status if validator is not legal for this collection.
+         */
+        StatusWith<std::unique_ptr<MatchExpression>> parseValidator(const BSONObj& validator) const;
+
         Status recordStoreGoingToMove( OperationContext* txn,
                                        const RecordId& oldLocation,
                                        const char* oldBuffer,
                                        size_t oldSize );
 
-        Status aboutToDeleteCapped( OperationContext* txn, const RecordId& loc );
+        Status recordStoreGoingToUpdateInPlace( OperationContext* txn,
+                                                const RecordId& loc );
+
+        Status aboutToDeleteCapped( OperationContext* txn, const RecordId& loc, RecordData data );
 
         /**
          * same semantics as insertDocument, but doesn't do:
@@ -306,14 +337,19 @@ namespace mongo {
         NamespaceString _ns;
         CollectionCatalogEntry* _details;
         RecordStore* _recordStore;
-        Database* _database;
+        DatabaseCatalogEntry* _dbce;
         CollectionInfoCache _infoCache;
         IndexCatalog _indexCatalog;
+
+        // Empty means no filter.
+        BSONObj _validatorDoc;
+        // Points into _validatorDoc. Null means no filter.
+        std::unique_ptr<MatchExpression> _validator;
 
         // this is mutable because read only users of the Collection class
         // use it keep state.  This seems valid as const correctness of Collection
         // should be about the data.
-        mutable CollectionCursorCache _cursorCache;
+        mutable CursorManager _cursorManager;
 
         friend class Database;
         friend class IndexCatalog;

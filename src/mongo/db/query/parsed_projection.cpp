@@ -32,6 +32,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::string;
+
     /**
      * Parses the projection 'spec' and checks its validity with respect to the query 'query'.
      * Puts covering information into 'out'.
@@ -149,7 +152,7 @@ namespace mongo {
                     }
 
                     if (e2.valuestr() != LiteParsedQuery::metaTextScore
-                        && e2.valuestr() != LiteParsedQuery::metaDiskLoc
+                        && e2.valuestr() != LiteParsedQuery::metaRecordId
                         && e2.valuestr() != LiteParsedQuery::metaIndexKey
                         && e2.valuestr() != LiteParsedQuery::metaGeoNearDistance
                         && e2.valuestr() != LiteParsedQuery::metaGeoNearPoint) {
@@ -236,6 +239,10 @@ namespace mongo {
 
         // Fill out the returned obj.
         auto_ptr<ParsedProjection> pp(new ParsedProjection());
+
+        // The positional operator uses the MatchDetails from the query
+        // expression to know which array element was matched.
+        pp->_requiresMatchDetails = arrayOpType == ARRAY_OP_POSITIONAL;
 
         // Save the raw spec.  It should be owned by the LiteParsedQuery.
         verify(spec.isOwned());

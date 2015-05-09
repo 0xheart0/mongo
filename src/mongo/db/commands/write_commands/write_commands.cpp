@@ -36,20 +36,25 @@
 #include "mongo/db/commands/write_commands/batch_executor.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/ops/delete_executor.h"
 #include "mongo/db/ops/delete_request.h"
-#include "mongo/db/ops/update_executor.h"
+#include "mongo/db/ops/parsed_delete.h"
+#include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/write_concern.h"
 #include "mongo/s/d_state.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     namespace {
 
@@ -63,11 +68,11 @@ namespace mongo {
 
     } // namespace
 
-    WriteCmd::WriteCmd( const StringData& name, BatchedCommandRequest::BatchType writeType ) :
+    WriteCmd::WriteCmd( StringData name, BatchedCommandRequest::BatchType writeType ) :
         Command( name ), _writeType( writeType ) {
     }
 
-    void WriteCmd::redactTooLongLog( mutablebson::Document* cmdObj, const StringData& fieldName ) {
+    void WriteCmd::redactTooLongLog( mutablebson::Document* cmdObj, StringData fieldName ) {
         namespace mmb = mutablebson;
         mmb::Element root = cmdObj->root();
         mmb::Element field = root.findFirstChildNamed( fieldName );
@@ -92,14 +97,14 @@ namespace mongo {
                                           const std::string& dbname,
                                           const BSONObj& cmdObj ) {
 
-        Status status( auth::checkAuthForWriteCommand( client->getAuthorizationSession(),
+        Status status( auth::checkAuthForWriteCommand( AuthorizationSession::get(client),
                 _writeType,
                 NamespaceString( parseNs( dbname, cmdObj ) ),
                 cmdObj ));
 
         // TODO: Remove this when we standardize GLE reporting from commands
         if ( !status.isOK() ) {
-            setLastError( status.code(), status.reason().c_str() );
+            LastError::get(client).setLastError(status.code(), status.reason());
         }
 
         return status;
@@ -113,11 +118,9 @@ namespace mongo {
                        BSONObj& cmdObj,
                        int options,
                        string& errMsg,
-                       BSONObjBuilder& result,
-                       bool fromRepl) {
-
-        // Can't be run on secondaries (logTheOp() == false, slaveOk() == false).
-        dassert( !fromRepl );
+                       BSONObjBuilder& result) {
+        // Can't be run on secondaries.
+        dassert(txn->writesAreReplicated());
         BatchedCommandRequest request( _writeType );
         BatchedCommandResponse response;
 
@@ -131,15 +134,18 @@ namespace mongo {
         // Internally, everything work with the namespace string as opposed to just the
         // collection name.
         NamespaceString nss(dbName, request.getNS());
-        request.setNS(nss.ns());
+        request.setNSS(nss);
 
-        BSONObj defaultWriteConcern =
-                repl::getGlobalReplicationCoordinator()->getGetLastErrorDefault();
+        StatusWith<WriteConcernOptions> wcStatus = extractWriteConcern(cmdObj);
+
+        if (!wcStatus.isOK()) {
+            return appendCommandStatus(result, wcStatus.getStatus());
+        }
+        txn->setWriteConcern(wcStatus.getValue());
 
         WriteBatchExecutor writeBatchExecutor(txn,
-                                              defaultWriteConcern,
                                               &globalOpCounters,
-                                              lastError.get());
+                                              &LastError::get(txn->getClient()));
 
         writeBatchExecutor.executeBatch( request, &response );
 
@@ -172,7 +178,7 @@ namespace mongo {
         // Internally, everything work with the namespace string as opposed to just the
         // collection name.
         NamespaceString nsString(dbname, request.getNS());
-        request.setNS(nsString.ns());
+        request.setNSS(nsString);
 
         // Do the validation of the batch that is shared with non-explained write batches.
         Status isValid = WriteBatchExecutor::validateBatch( request );
@@ -187,6 +193,8 @@ namespace mongo {
                            "explained write batches must be of size 1" );
         }
 
+        ScopedTransaction scopedXact(txn, MODE_IX);
+
         // Get a reference to the singleton batch item (it's the 0th item in the batch).
         BatchItemRef batchItem( &request, 0 );
 
@@ -197,7 +205,6 @@ namespace mongo {
             updateRequest.setUpdates( batchItem.getUpdate()->getUpdateExpr() );
             updateRequest.setMulti( batchItem.getUpdate()->getMulti() );
             updateRequest.setUpsert( batchItem.getUpdate()->getUpsert() );
-            updateRequest.setUpdateOpLog( true );
             UpdateLifecycleImpl updateLifecycle( true, updateRequest.getNamespaceString() );
             updateRequest.setLifecycle( &updateLifecycle );
             updateRequest.setExplain();
@@ -205,12 +212,12 @@ namespace mongo {
             // Explained updates can yield.
             updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-            // Use the request to create an UpdateExecutor, and from it extract the
-            // plan tree which will be used to execute this update.
-            UpdateExecutor updateExecutor( txn, &updateRequest, &txn->getCurOp()->debug() );
-            Status prepStatus = updateExecutor.prepare();
-            if ( !prepStatus.isOK() ) {
-                return prepStatus;
+            OpDebug* debug = &txn->getCurOp()->debug();
+
+            ParsedUpdate parsedUpdate( txn, &updateRequest );
+            Status parseStatus = parsedUpdate.parseRequest();
+            if ( !parseStatus.isOK() ) {
+                return parseStatus;
             }
 
             // Explains of write commands are read-only, but we take write locks so
@@ -218,22 +225,24 @@ namespace mongo {
             AutoGetDb autoDb( txn, nsString.db(), MODE_IX );
             Lock::CollectionLock colLock( txn->lockState(), nsString.ns(), MODE_IX );
 
-            // We check the shard version explicitly here rather than using Client::Context,
+            // We check the shard version explicitly here rather than using OldClientContext,
             // as Context can do implicit database creation if the db does not exist. We want
             // explain to be a no-op that reports a trivial EOF plan against non-existent dbs
             // or collections.
             ensureShardVersionOKOrThrow( nsString.ns() );
 
-            Status prepInLockStatus = updateExecutor.prepareInLock( autoDb.getDb() );
-            if ( !prepInLockStatus.isOK() ) {
-                return prepInLockStatus;
+            // Get a pointer to the (possibly NULL) collection.
+            Collection* collection = NULL;
+            if ( autoDb.getDb() ) {
+                collection = autoDb.getDb()->getCollection( nsString.ns() );
             }
 
-            // Executor registration and yield policy is handled internally by the update executor.
-            PlanExecutor* exec = updateExecutor.getPlanExecutor();
+            PlanExecutor* rawExec;
+            uassertStatusOK(getExecutorUpdate(txn, collection, &parsedUpdate, debug, &rawExec));
+            boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             // Explain the plan tree.
-            Explain::explainStages( exec, verbosity, out );
+            Explain::explainStages( exec.get(), verbosity, out );
             return Status::OK();
         }
         else {
@@ -243,19 +252,16 @@ namespace mongo {
             DeleteRequest deleteRequest( nsString );
             deleteRequest.setQuery( batchItem.getDelete()->getQuery() );
             deleteRequest.setMulti( batchItem.getDelete()->getLimit() != 1 );
-            deleteRequest.setUpdateOpLog(true);
             deleteRequest.setGod( false );
             deleteRequest.setExplain();
 
             // Explained deletes can yield.
             deleteRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-            // Use the request to create a DeleteExecutor, and from it extract the
-            // plan tree which will be used to execute this update.
-            DeleteExecutor deleteExecutor( txn, &deleteRequest );
-            Status prepStatus = deleteExecutor.prepare();
-            if ( !prepStatus.isOK() ) {
-                return prepStatus;
+            ParsedDelete parsedDelete(txn, &deleteRequest);
+            Status parseStatus = parsedDelete.parseRequest();
+            if (!parseStatus.isOK()) {
+                return parseStatus;
             }
 
             // Explains of write commands are read-only, but we take write locks so that timing
@@ -263,22 +269,24 @@ namespace mongo {
             AutoGetDb autoDb(txn, nsString.db(), MODE_IX);
             Lock::CollectionLock colLock(txn->lockState(), nsString.ns(), MODE_IX);
 
-            // We check the shard version explicitly here rather than using Client::Context,
+            // We check the shard version explicitly here rather than using OldClientContext,
             // as Context can do implicit database creation if the db does not exist. We want
             // explain to be a no-op that reports a trivial EOF plan against non-existent dbs
             // or collections.
             ensureShardVersionOKOrThrow( nsString.ns() );
 
-            Status prepInLockStatus = deleteExecutor.prepareInLock( autoDb.getDb() );
-            if ( !prepInLockStatus.isOK()) {
-                return prepInLockStatus;
+            // Get a pointer to the (possibly NULL) collection.
+            Collection* collection = NULL;
+            if (autoDb.getDb()) {
+                collection = autoDb.getDb()->getCollection(nsString.ns());
             }
 
-            // Executor registration and yield policy is handled internally by the delete executor.
-            PlanExecutor* exec = deleteExecutor.getPlanExecutor();
+            PlanExecutor* rawExec;
+            uassertStatusOK(getExecutorDelete(txn, collection, &parsedDelete, &rawExec));
+            boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             // Explain the plan tree.
-            Explain::explainStages( exec, verbosity, out );
+            Explain::explainStages(exec.get(), verbosity, out);
             return Status::OK();
         }
     }

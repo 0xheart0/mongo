@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -45,11 +45,14 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
 namespace mongo {
+
+    using std::set;
+    using std::string;
+    using std::stringstream;
 
     /* Usage:
        mydb.$cmd.findOne( { clone: "fromhost" } );
@@ -68,7 +71,7 @@ namespace mongo {
 
         virtual void help( stringstream &help ) const {
             help << "clone this database from an instance of the db on another host\n";
-            help << "{ clone : \"host13\" }";
+            help << "{clone: \"host13\"[, slaveOk: <bool>]}";
         }
 
         virtual Status checkAuthForCommand(ClientBasic* client,
@@ -77,7 +80,7 @@ namespace mongo {
             ActionSet actions;
             actions.addAction(ActionType::insert);
             actions.addAction(ActionType::createIndex);
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forDatabaseName(dbname), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
@@ -89,8 +92,7 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             string from = cmdObj.getStringField("clone");
             if ( from.empty() )
@@ -98,7 +100,7 @@ namespace mongo {
 
             CloneOptions opts;
             opts.fromDB = dbname;
-            opts.logForRepl = ! fromRepl;
+            opts.slaveOk = cmdObj["slaveOk"].trueValue();
 
             // See if there's any collections we should ignore
             if( cmdObj["collsToIgnore"].type() == Array ){

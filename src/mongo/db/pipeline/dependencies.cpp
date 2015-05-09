@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/dependencies.h"
@@ -34,6 +34,11 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::set;
+    using std::string;
+    using std::vector;
+
     namespace str = mongoutils::str;
 
     BSONObj DepsTracker::toProjection() const {
@@ -131,7 +136,7 @@ namespace {
             }
         }
 
-        return Value::consume(values);
+        return Value(std::move(values));
     }
 
     // Handles object-typed values including the top-level for ParsedDeps::extractFields

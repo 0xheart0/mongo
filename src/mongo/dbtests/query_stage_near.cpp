@@ -40,6 +40,7 @@
 namespace {
 
     using namespace mongo;
+    using boost::shared_ptr;
     using std::vector;
 
     /**
@@ -73,7 +74,7 @@ namespace {
             *out = _workingSet->allocate();
             WorkingSetMember* member = _workingSet->get(*out);
             member->state = WorkingSetMember::OWNED_OBJ;
-            member->obj = next;
+            member->obj = Snapshotted<BSONObj>(SnapshotId(), next);
 
             return PlanStage::ADVANCED;
         }
@@ -102,11 +103,11 @@ namespace {
             return new PlanStageStats(_stats, STAGE_UNKNOWN);
         }
 
-        virtual const CommonStats* getCommonStats() {
+        virtual const CommonStats* getCommonStats() const {
             return &_stats;
         }
 
-        virtual const SpecificStats* getSpecificStats() {
+        virtual const SpecificStats* getSpecificStats() const {
             return NULL;
         }
 
@@ -172,8 +173,23 @@ namespace {
 
         virtual StatusWith<double> computeDistance(WorkingSetMember* member) {
             ASSERT(member->hasObj());
-            return StatusWith<double>(member->obj["distance"].numberDouble());
+            return StatusWith<double>(member->obj.value()["distance"].numberDouble());
         }
+
+        virtual StageState initialize(OperationContext* txn,
+                                      WorkingSet* workingSet,
+                                      Collection* collection,
+                                      WorkingSetID* out) {
+            return IS_EOF;
+        }
+
+        virtual void finishSaveState() { }
+
+        virtual void finishRestoreState(OperationContext* txn) { }
+
+        virtual void finishInvalidate(OperationContext* txn,
+                                      const RecordId& dl,
+                                      InvalidationType type) { }
 
     private:
 
@@ -190,7 +206,7 @@ namespace {
 
         while (PlanStage::NEED_TIME == state) {
             while (PlanStage::ADVANCED == (state = stage->work(&nextMemberID))) {
-                results.push_back(workingSet->get(nextMemberID)->obj);
+                results.push_back(workingSet->get(nextMemberID)->obj.value());
             }
         }
 

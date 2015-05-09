@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -32,7 +33,7 @@ __truncate_file(WT_SESSION_IMPL *session, const char *name)
 	WT_RET(__wt_session_release_btree(session));
 
 	/* Close any btree handles in the file. */
-	WT_WITH_DHANDLE_LOCK(session,
+	WT_WITH_HANDLE_LIST_LOCK(session,
 	    ret = __wt_conn_dhandle_close_all(session, name, 0));
 	WT_RET(ret);
 
@@ -83,7 +84,7 @@ __truncate_dsrc(WT_SESSION_IMPL *session, const char *uri)
 	const char *cfg[2];
 
 	/* Open a cursor and traverse the object, removing every entry. */
-	cfg[0] = WT_CONFIG_BASE(session, session_open_cursor);
+	cfg[0] = WT_CONFIG_BASE(session, WT_SESSION_open_cursor);
 	cfg[1] = NULL;
 	WT_RET(__wt_open_cursor(session, uri, NULL, cfg, &cursor));
 	while ((ret = cursor->next(cursor)) == 0)
@@ -169,11 +170,15 @@ __wt_schema_range_truncate(
 	cursor = (start != NULL) ? start : stop;
 	uri = cursor->internal_uri;
 
-	if (WT_PREFIX_MATCH(uri, "file:"))
+	if (WT_PREFIX_MATCH(uri, "file:")) {
+		if (start != NULL)
+			WT_CURSOR_NEEDKEY(start);
+		if (stop != NULL)
+			WT_CURSOR_NEEDKEY(stop);
 		WT_WITH_BTREE(session, ((WT_CURSOR_BTREE *)cursor)->btree,
 		    ret = __wt_btcur_range_truncate(
 			(WT_CURSOR_BTREE *)start, (WT_CURSOR_BTREE *)stop));
-	else if (WT_PREFIX_MATCH(uri, "table:"))
+	} else if (WT_PREFIX_MATCH(uri, "table:"))
 		ret = __wt_table_range_truncate(
 		    (WT_CURSOR_TABLE *)start, (WT_CURSOR_TABLE *)stop);
 	else if ((dsrc = __wt_schema_get_source(session, uri)) != NULL &&
@@ -181,6 +186,6 @@ __wt_schema_range_truncate(
 		ret = dsrc->range_truncate(dsrc, &session->iface, start, stop);
 	else
 		ret = __wt_range_truncate(start, stop);
-
+err:
 	return (ret);
 }

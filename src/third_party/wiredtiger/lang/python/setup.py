@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 #
+# Public Domain 2014-2015 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -35,7 +36,7 @@ if not 'ARCHFLAGS' in os.environ:
     os.environ['ARCHFLAGS'] = ''
 
 # Suppress warnings building SWIG generated code
-extra_cflags = [ '-w' ]
+extra_cflags = [ '-w', '-I../../src/include']
 
 dir = os.path.dirname(__file__)
 

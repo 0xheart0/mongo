@@ -28,13 +28,21 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/collection_metadata.h"
 
-#include "mongo/bson/util/builder.h" // for StringBuilder
+#include "mongo/bson/util/builder.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::make_pair;
+    using std::string;
+    using std::vector;
 
     using mongoutils::str::stream;
 

@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <cctype>
 
@@ -38,6 +38,10 @@
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::string;
+    using std::vector;
 
     const char DocumentSourceMatch::matchName[] = "$match";
 
@@ -101,7 +105,7 @@ namespace {
     // the Match expression has been successfully parsed so they can assume that
     // input is well formed.
 
-    bool isAllDigits(const StringData& str) {
+    bool isAllDigits(StringData str) {
         if (str.empty())
             return false;
 
@@ -112,7 +116,7 @@ namespace {
         return true;
     }
 
-    bool isFieldnameRedactSafe(const StringData& fieldName) {
+    bool isFieldnameRedactSafe(StringData fieldName) {
         // Can't have numeric elements in the dotted path since redacting elements from an array
         // would change the indexes.
 
@@ -189,7 +193,7 @@ namespace {
                     }
                 }
                 if (!matches.empty())
-                    output[field.fieldNameStringData()] = Value::consume(matches);
+                    output[field.fieldNameStringData()] = Value(std::move(matches));
 
                 break;
             }
@@ -245,7 +249,7 @@ namespace {
                     }
 
                     if (!okClauses.empty())
-                        output["$or"] = Value::consume(okClauses);
+                        output["$or"] = Value(std::move(okClauses));
                 }
                 else if (str::equals(field.fieldName(), "$and")) {
                     // $and can include subset of elements (like $all).
@@ -256,7 +260,7 @@ namespace {
                             okClauses.push_back(Value(clause));
                     }
                     if (!okClauses.empty())
-                        output["$and"] = Value::consume(okClauses);
+                        output["$and"] = Value(std::move(okClauses));
                 }
 
                 continue;

@@ -32,6 +32,7 @@
 #include "mongo/client/dbclient_rs.h"
 
 #include <memory>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/connpool.h"
@@ -43,6 +44,14 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
 
 namespace {
 
@@ -194,6 +203,13 @@ namespace {
         return rsm->getServerAddress();
     }
 
+    HostAndPort DBClientReplicaSet::getSuspectedPrimaryHostAndPort() const {
+        if (!_master) {
+            return HostAndPort();
+        }
+        return _master->getServerHostAndPort();
+    }
+
     void DBClientReplicaSet::setRunCommandHook(DBClientWithCommands::RunCommandHookFunc func) {
         // Set the hooks in both our sub-connections and in ourselves.
         if (_master) {
@@ -328,7 +344,7 @@ namespace {
 
         _masterHost = h;
         _master.reset(newConn);
-        _master->setReplSetClientCallback(this);
+        _master->setParentReplSetName(_setName);
         _master->setRunCommandHook(_runCommandHook);
         _master->setPostRunCommandHook(_postRunCommandHook);
 
@@ -732,7 +748,7 @@ namespace {
                 newConn != NULL);
 
         _lastSlaveOkConn.reset(newConn);
-        _lastSlaveOkConn->setReplSetClientCallback(this);
+        _lastSlaveOkConn->setParentReplSetName(_setName);
         _lastSlaveOkConn->setRunCommandHook(_runCommandHook);
         _lastSlaveOkConn->setPostRunCommandHook(_postRunCommandHook);
 

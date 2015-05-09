@@ -30,6 +30,8 @@
 
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 
+#include <memory>
+
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
 
@@ -39,16 +41,16 @@ namespace mongo {
     // returns false when a key is inserted, and returns true again
     // when that is unindex.
     TEST( SortedDataInterface, IsEmpty ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+        const std::unique_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
+        const std::unique_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT( sorted->isEmpty( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, false ) );
@@ -57,12 +59,12 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT( !sorted->isEmpty( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 sorted->unindex( opCtx.get(), key1, loc1, false );
@@ -72,7 +74,7 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT( sorted->isEmpty( opCtx.get() ) );
         }
     }

@@ -46,9 +46,8 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/minvalid.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/rs_initialsync.h"
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/server_parameters.h"
@@ -64,11 +63,11 @@ namespace repl {
 
     void runSyncThread() {
         Client::initThread("rsSync");
-        cc().getAuthorizationSession()->grantInternalAuthorization();
+        AuthorizationSession::get(cc())->grantInternalAuthorization();
         ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
 
         // Set initial indexPrefetch setting
-        std::string& prefetch = replCoord->getSettings().rsIndexPrefetch;
+        const std::string& prefetch = replCoord->getSettings().rsIndexPrefetch;
         if (!prefetch.empty()) {
             BackgroundSync::IndexPrefetchConfig prefetchConfig = BackgroundSync::PREFETCH_ALL;
             if (prefetch == "none")
@@ -89,13 +88,13 @@ namespace repl {
             // check that we are in the set (and not an arbiter) before
             // trying to sync with other replicas.
             // TODO(spencer): Use a condition variable to await loading a config
-            if (replCoord->getReplicationMode() != ReplicationCoordinator::modeReplSet) {
-                log() << "replSet warning did not receive a valid config yet, sleeping 5 seconds ";
+            if (replCoord->getMemberState().startup()) {
+                warning() << "did not receive a valid config yet, sleeping 5 seconds ";
                 sleepsecs(5);
                 continue;
             }
 
-            const MemberState memberState = replCoord->getCurrentMemberState();
+            const MemberState memberState = replCoord->getMemberState();
 
             // An arbiter can never transition to any other state, and doesn't replicate, ever
             if (memberState.arbiter()) {
@@ -143,7 +142,6 @@ namespace repl {
                 sleepsecs(10);
             }
         }
-        cc().shutdown();
     }
 
 } // namespace repl

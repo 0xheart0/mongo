@@ -41,6 +41,10 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::endl;
+    using std::vector;
+
     static const char* kIdField = "_id";
 
     // static
@@ -166,7 +170,7 @@ namespace mongo {
             invariant(member->hasObj());
 
             // Apply the SIMPLE_DOC projection.
-            transformSimpleInclusion(member->obj, _includedFields, bob);
+            transformSimpleInclusion(member->obj.value(), _includedFields, bob);
         }
         else {
             invariant(ProjectionStageParams::COVERED_ONE_INDEX == _projImpl);
@@ -190,7 +194,7 @@ namespace mongo {
         member->state = WorkingSetMember::OWNED_OBJ;
         member->keyData.clear();
         member->loc = RecordId();
-        member->obj = bob.obj();
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), bob.obj());
         return Status::OK();
     }
 
@@ -238,8 +242,8 @@ namespace mongo {
         else if (PlanStage::NEED_TIME == status) {
             _commonStats.needTime++;
         }
-        else if (PlanStage::NEED_FETCH == status) {
-            _commonStats.needFetch++;
+        else if (PlanStage::NEED_YIELD == status) {
+            _commonStats.needYield++;
             *out = id;
         }
 
@@ -281,11 +285,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* ProjectionStage::getCommonStats() {
+    const CommonStats* ProjectionStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* ProjectionStage::getSpecificStats() {
+    const SpecificStats* ProjectionStage::getSpecificStats() const {
         return &_specificStats;
     }
 

@@ -36,6 +36,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* CountStage::kStageType = "COUNT";
 
@@ -153,10 +156,10 @@ namespace mongo {
                 _ws->free(id);
             }
         }
-        else if (PlanStage::NEED_FETCH == state) {
+        else if (PlanStage::NEED_YIELD == state) {
             *out = id;
-            _commonStats.needFetch++;
-            return PlanStage::NEED_FETCH;
+            _commonStats.needYield++;
+            return PlanStage::NEED_YIELD;
         }
 
         _commonStats.needTime++;
@@ -206,11 +209,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* CountStage::getCommonStats() {
+    const CommonStats* CountStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* CountStage::getSpecificStats() {
+    const SpecificStats* CountStage::getSpecificStats() const {
         return &_specificStats;
     }
 

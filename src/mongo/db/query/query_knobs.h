@@ -65,9 +65,9 @@ namespace mongo {
     // performance?
     extern int internalQueryCacheFeedbacksStored;
 
-    // How many stddevs must a feedback be from the 'reference' performance for us to evict the
-    // entry from the cache?
-    extern double internalQueryCacheStdDeviations;
+    // How many times more works must we perform in order to justify plan cache eviction
+    // and replanning?
+    extern double internalQueryCacheEvictionRatio;
 
     // How many write ops should we allow in a collection before tossing all cache entries?
     extern int internalQueryCacheWriteOpsBetweenFlush;
@@ -98,12 +98,10 @@ namespace mongo {
 
     extern int internalQueryExecMaxBlockingSortBytes;
 
-    // Yield after this many "should yield?" checks. Only applies to storage engines that
-    // do not support doc-level locking.
+    // Yield after this many "should yield?" checks.
     extern int internalQueryExecYieldIterations;
 
-    // Yield if it's been at least this many milliseconds since we last yielded. Only applies
-    // to storage engines that do not support doc-level locking.
+    // Yield if it's been at least this many milliseconds since we last yielded.
     extern int internalQueryExecYieldPeriodMS;
 
 }  // namespace mongo

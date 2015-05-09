@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -11,10 +12,7 @@ static int __btree_conf(WT_SESSION_IMPL *, WT_CKPT *ckpt);
 static int __btree_get_last_recno(WT_SESSION_IMPL *);
 static int __btree_page_sizes(WT_SESSION_IMPL *);
 static int __btree_preload(WT_SESSION_IMPL *);
-static int __btree_tree_open_empty(WT_SESSION_IMPL *, int, int);
-
-static int pse1(WT_SESSION_IMPL *, const char *, uint32_t, uint32_t);
-static int pse2(WT_SESSION_IMPL *, const char *, uint32_t, uint32_t, int);
+static int __btree_tree_open_empty(WT_SESSION_IMPL *, int);
 
 /*
  * __wt_btree_open --
@@ -102,14 +100,15 @@ __wt_btree_open(WT_SESSION_IMPL *session, const char *op_cfg[])
 		    ckpt.raw.data, ckpt.raw.size,
 		    root_addr, &root_addr_size, readonly));
 		if (creation || root_addr_size == 0)
-			WT_ERR(__btree_tree_open_empty(
-			    session, creation, readonly));
+			WT_ERR(__btree_tree_open_empty(session, creation));
 		else {
 			WT_ERR(__wt_btree_tree_open(
 			    session, root_addr, root_addr_size));
 
 			/* Warm the cache, if possible. */
-			WT_ERR(__btree_preload(session));
+			WT_WITH_PAGE_INDEX(session,
+			    ret = __btree_preload(session));
+			WT_ERR(ret);
 
 			/* Get the last record number in a column-store file. */
 			if (btree->type != BTREE_ROW)
@@ -134,16 +133,13 @@ __wt_btree_close(WT_SESSION_IMPL *session)
 {
 	WT_BM *bm;
 	WT_BTREE *btree;
-	WT_DATA_HANDLE *dhandle;
 	WT_DECL_RET;
 
-	dhandle = session->dhandle;
 	btree = S2BT(session);
 
 	if ((bm = btree->bm) != NULL) {
 		/* Unload the checkpoint, unless it's a special command. */
-		if (F_ISSET(dhandle, WT_DHANDLE_OPEN) &&
-		    !F_ISSET(btree,
+		if (!F_ISSET(btree,
 		    WT_BTREE_SALVAGE | WT_BTREE_UPGRADE | WT_BTREE_VERIFY))
 			WT_TRET(bm->checkpoint_unload(bm, session));
 
@@ -174,6 +170,8 @@ __wt_btree_close(WT_SESSION_IMPL *session)
 
 	btree->bulk_load_ok = 0;
 
+	F_CLR(btree, WT_BTREE_SPECIAL_FLAGS);
+
 	return (ret);
 }
 
@@ -186,15 +184,12 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 {
 	WT_BTREE *btree;
 	WT_CONFIG_ITEM cval, metadata;
-	WT_CONNECTION_IMPL *conn;
-	WT_NAMED_COMPRESSOR *ncomp;
 	int64_t maj_version, min_version;
 	uint32_t bitcnt;
 	int fixed;
 	const char **cfg;
 
 	btree = S2BT(session);
-	conn = S2C(session);
 	cfg = btree->dhandle->cfg;
 
 	/* Dump out format information. */
@@ -213,7 +208,7 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 
 	/* Validate file types and check the data format plan. */
 	WT_RET(__wt_config_gets(session, cfg, "key_format", &cval));
-	WT_RET(__wt_struct_check(session, cval.str, cval.len, NULL, NULL));
+	WT_RET(__wt_struct_confchk(session, &cval));
 	if (WT_STRING_MATCH("r", cval.str, cval.len))
 		btree->type = BTREE_COL_VAR;
 	else
@@ -221,18 +216,19 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 	WT_RET(__wt_strndup(session, cval.str, cval.len, &btree->key_format));
 
 	WT_RET(__wt_config_gets(session, cfg, "value_format", &cval));
-	WT_RET(__wt_struct_check(session, cval.str, cval.len, NULL, NULL));
+	WT_RET(__wt_struct_confchk(session, &cval));
 	WT_RET(__wt_strndup(session, cval.str, cval.len, &btree->value_format));
 
 	/* Row-store key comparison and key gap for prefix compression. */
 	if (btree->type == BTREE_ROW) {
-		WT_RET(
-		    __wt_config_gets(session, cfg, "app_metadata", &metadata));
-		WT_RET(__wt_config_gets(session, cfg, "collator", &cval));
-		if (cval.len != 0)
+		WT_RET(__wt_config_gets_none(session, cfg, "collator", &cval));
+		if (cval.len != 0) {
+			WT_RET(__wt_config_gets(
+			    session, cfg, "app_metadata", &metadata));
 			WT_RET(__wt_collator_config(
 			    session, btree->dhandle->name, &cval, &metadata,
 			    &btree->collator, &btree->collator_owned));
+		}
 
 		WT_RET(__wt_config_gets(session, cfg, "key_gap", &cval));
 		btree->key_gap = (uint32_t)cval.val;
@@ -257,13 +253,13 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 
 	/* Eviction; the metadata file is never evicted. */
 	if (WT_IS_METADATA(btree->dhandle))
-		F_SET(btree, WT_BTREE_NO_EVICTION | WT_BTREE_NO_HAZARD);
+		F_SET(btree, WT_BTREE_IN_MEMORY | WT_BTREE_NO_EVICTION);
 	else {
 		WT_RET(__wt_config_gets(session, cfg, "cache_resident", &cval));
 		if (cval.val)
-			F_SET(btree, WT_BTREE_NO_EVICTION | WT_BTREE_NO_HAZARD);
+			F_SET(btree, WT_BTREE_IN_MEMORY | WT_BTREE_NO_EVICTION);
 		else
-			F_CLR(btree, WT_BTREE_NO_EVICTION);
+			F_CLR(btree, WT_BTREE_IN_MEMORY | WT_BTREE_NO_EVICTION);
 	}
 
 	/* Checksums */
@@ -307,18 +303,8 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 		break;
 	}
 
-	WT_RET(__wt_config_gets(session, cfg, "block_compressor", &cval));
-	if (cval.len > 0) {
-		TAILQ_FOREACH(ncomp, &conn->compqh, q)
-			if (WT_STRING_MATCH(ncomp->name, cval.str, cval.len)) {
-				btree->compressor = ncomp->compressor;
-				break;
-			}
-		if (btree->compressor == NULL)
-			WT_RET_MSG(session, EINVAL,
-			    "unknown block compressor '%.*s'",
-			    (int)cval.len, cval.str);
-	}
+	WT_RET(__wt_config_gets_none(session, cfg, "block_compressor", &cval));
+	WT_RET(__wt_compressor_config(session, &cval, &btree->compressor));
 
 	/* Initialize locks. */
 	WT_RET(__wt_rwlock_alloc(
@@ -371,18 +357,21 @@ __wt_btree_tree_open(
 	 */
 	WT_CLEAR(dsk);
 
-	/* Read the page, then build the in-memory version of the page. */
+	/*
+	 * Read the page, then build the in-memory version of the page. Clear
+	 * any local reference to an allocated copy of the disk image on return,
+	 * the page steals it.
+	 */
 	WT_ERR(__wt_bt_read(session, &dsk, addr, addr_size));
-	WT_ERR(__wt_page_inmem(session, NULL, dsk.data,
+	WT_ERR(__wt_page_inmem(session, NULL, dsk.data, dsk.memsize,
 	    WT_DATA_IN_ITEM(&dsk) ?
-	    WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED , &page));
+	    WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED, &page));
+	dsk.mem = NULL;
 
 	/* Finish initializing the root, root reference links. */
 	__wt_root_ref_init(&btree->root, page, btree->type != BTREE_ROW);
 
-	if (0) {
-err:		__wt_buf_free(session, &dsk);
-	}
+err:	__wt_buf_free(session, &dsk);
 	return (ret);
 }
 
@@ -391,16 +380,17 @@ err:		__wt_buf_free(session, &dsk);
  *	Create an empty in-memory tree.
  */
 static int
-__btree_tree_open_empty(WT_SESSION_IMPL *session, int creation, int readonly)
+__btree_tree_open_empty(WT_SESSION_IMPL *session, int creation)
 {
 	WT_BTREE *btree;
 	WT_DECL_RET;
-	WT_PAGE *root, *leaf;
+	WT_PAGE *leaf, *root;
 	WT_PAGE_INDEX *pindex;
 	WT_REF *ref;
 
 	btree = S2BT(session);
 	root = leaf = NULL;
+	ref = NULL;
 
 	/*
 	 * Newly created objects can be used for cursor inserts or for bulk
@@ -414,13 +404,10 @@ __btree_tree_open_empty(WT_SESSION_IMPL *session, int creation, int readonly)
 	}
 
 	/*
-	 * A note about empty trees: the initial tree is a root page and a leaf
-	 * page.  We need a pair of pages instead of just a single page because
-	 * we can reconcile the leaf page while the root stays pinned in memory.
-	 * If the pair is evicted without being modified, that's OK, nothing is
-	 * ever written.
-	 *
-	 * Create the root and leaf pages.
+	 * A note about empty trees: the initial tree is a single root page.
+	 * It has a single reference to a leaf page, marked deleted.  The leaf
+	 * page will be created by the first update.  If the root is evicted
+	 * without being modified, that's OK, nothing is ever written.
 	 *
 	 * !!!
 	 * Be cautious about changing the order of updates in this code: to call
@@ -434,13 +421,12 @@ __btree_tree_open_empty(WT_SESSION_IMPL *session, int creation, int readonly)
 		    __wt_page_alloc(session, WT_PAGE_COL_INT, 1, 1, 1, &root));
 		root->pg_intl_parent_ref = &btree->root;
 
-		pindex = WT_INTL_INDEX_COPY(root);
+		pindex = WT_INTL_INDEX_GET_SAFE(root);
 		ref = pindex->index[0];
 		ref->home = root;
-		WT_ERR(__wt_btree_new_leaf_page(session, &leaf));
-		ref->page = leaf;
+		ref->page = NULL;
 		ref->addr = NULL;
-		ref->state = WT_REF_MEM;
+		ref->state = WT_REF_DELETED;
 		ref->key.recno = 1;
 		break;
 	case BTREE_ROW:
@@ -448,51 +434,22 @@ __btree_tree_open_empty(WT_SESSION_IMPL *session, int creation, int readonly)
 		    __wt_page_alloc(session, WT_PAGE_ROW_INT, 0, 1, 1, &root));
 		root->pg_intl_parent_ref = &btree->root;
 
-		pindex = WT_INTL_INDEX_COPY(root);
+		pindex = WT_INTL_INDEX_GET_SAFE(root);
 		ref = pindex->index[0];
 		ref->home = root;
-		WT_ERR(__wt_btree_new_leaf_page(session, &leaf));
-		ref->page = leaf;
+		ref->page = NULL;
 		ref->addr = NULL;
-		ref->state = WT_REF_MEM;
-		WT_ERR(__wt_row_ikey_incr(
-		    session, root, 0, "", 1, &ref->key.ikey));
+		ref->state = WT_REF_DELETED;
+		WT_ERR(__wt_row_ikey_incr(session, root, 0, "", 1, ref));
 		break;
 	WT_ILLEGAL_VALUE_ERR(session);
 	}
 
-	/*
-	 * Mark the leaf page dirty: we didn't create an entirely valid root
-	 * page (specifically, the root page's disk address isn't set, and it's
-	 * the act of reconciling the leaf page that makes it work, we don't
-	 * try and use the original disk address of modified pages).  We could
-	 * get around that by leaving the leaf page clean and building a better
-	 * root page, but then we get into trouble because a checkpoint marks
-	 * the root page dirty to force a write, and without reconciling the
-	 * leaf page we won't realize there's no records to write, we'll write
-	 * a root page, which isn't correct for an empty tree.
-	 *
-	 * Earlier versions of this code kept the leaf page clean, but with the
-	 * "empty" flag set in the leaf page's modification structure; in that
-	 * case, checkpoints works (forced reconciliation of a root with a
-	 * single "empty" page wouldn't write any blocks). That version had
-	 * memory leaks because the eviction code didn't correctly handle pages
-	 * that were "clean" (and so never reconciled), yet "modified" with an
-	 * "empty" flag.  The goal of this code is to mimic a real tree that
-	 * simply has no records, for whatever reason, and trust reconciliation
-	 * to figure out it's empty and not write any blocks.
-	 *
-	 * We do not set the tree's modified flag because the checkpoint code
-	 * skips unmodified files in closing checkpoints (checkpoints that
-	 * don't require a write unless the file is actually dirty).  There's
-	 * no need to reconcile this file unless the application does a real
-	 * checkpoint or it's actually modified.
-	 *
-	 * Only do this for a live tree, not for checkpoints.  If we open an
-	 * empty checkpoint, the leaf page cannot be dirty or eviction may try
-	 * to write it, which will fail because checkpoints are read-only.
-	 */
-	if (!readonly) {
+	/* Bulk loads require a leaf page for reconciliation: create it now. */
+	if (F_ISSET(btree, WT_BTREE_BULK)) {
+		WT_ERR(__wt_btree_new_leaf_page(session, &leaf));
+		ref->page = leaf;
+		ref->state = WT_REF_MEM;
 		WT_ERR(__wt_page_modify_init(session, leaf));
 		__wt_page_only_modify_set(session, leaf);
 	}
@@ -511,7 +468,7 @@ err:	if (leaf != NULL)
 
 /*
  * __wt_btree_new_leaf_page --
- *	Create an empty leaf page and link it into a reference in its parent.
+ *	Create an empty leaf page.
  */
 int
 __wt_btree_new_leaf_page(WT_SESSION_IMPL *session, WT_PAGE **pagep)
@@ -523,15 +480,15 @@ __wt_btree_new_leaf_page(WT_SESSION_IMPL *session, WT_PAGE **pagep)
 	switch (btree->type) {
 	case BTREE_COL_FIX:
 		WT_RET(
-		    __wt_page_alloc(session, WT_PAGE_COL_FIX, 1, 0, 1, pagep));
+		    __wt_page_alloc(session, WT_PAGE_COL_FIX, 1, 0, 0, pagep));
 		break;
 	case BTREE_COL_VAR:
 		WT_RET(
-		    __wt_page_alloc(session, WT_PAGE_COL_VAR, 1, 0, 1, pagep));
+		    __wt_page_alloc(session, WT_PAGE_COL_VAR, 1, 0, 0, pagep));
 		break;
 	case BTREE_ROW:
 		WT_RET(
-		    __wt_page_alloc(session, WT_PAGE_ROW_LEAF, 0, 0, 1, pagep));
+		    __wt_page_alloc(session, WT_PAGE_ROW_LEAF, 0, 0, 0, pagep));
 		break;
 	WT_ILLEGAL_VALUE(session);
 	}
@@ -549,8 +506,11 @@ __wt_btree_evictable(WT_SESSION_IMPL *session, int on)
 
 	btree = S2BT(session);
 
-	/* The metadata file is never evicted. */
-	if (on && !WT_IS_METADATA(btree->dhandle))
+	/* Permanently cache-resident files can never be evicted. */
+	if (F_ISSET(btree, WT_BTREE_IN_MEMORY))
+		return;
+
+	if (on)
 		F_CLR(btree, WT_BTREE_NO_EVICTION);
 	else
 		F_SET(btree, WT_BTREE_NO_EVICTION);
@@ -595,7 +555,7 @@ __btree_get_last_recno(WT_SESSION_IMPL *session)
 	btree = S2BT(session);
 
 	next_walk = NULL;
-	WT_RET(__wt_tree_walk(session, &next_walk, WT_READ_PREV));
+	WT_RET(__wt_tree_walk(session, &next_walk, NULL, WT_READ_PREV));
 	if (next_walk == NULL)
 		return (WT_NOTFOUND);
 
@@ -623,43 +583,24 @@ __btree_page_sizes(WT_SESSION_IMPL *session)
 	btree = S2BT(session);
 	cfg = btree->dhandle->cfg;
 
+	/*
+	 * Get the allocation size.  Allocation sizes must be a power-of-two,
+	 * nothing else makes sense.
+	 */
 	WT_RET(__wt_direct_io_size_check(
 	    session, cfg, "allocation_size", &btree->allocsize));
-	WT_RET(__wt_direct_io_size_check(
-	    session, cfg, "internal_page_max", &btree->maxintlpage));
-	WT_RET(__wt_config_gets(session, cfg, "internal_item_max", &cval));
-	btree->maxintlitem = (uint32_t)cval.val;
-	WT_RET(__wt_direct_io_size_check(
-	    session, cfg, "leaf_page_max", &btree->maxleafpage));
-	WT_RET(__wt_config_gets(session, cfg, "leaf_item_max", &cval));
-	btree->maxleafitem = (uint32_t)cval.val;
-
-	WT_RET(__wt_config_gets(session, cfg, "split_pct", &cval));
-	btree->split_pct = (int)cval.val;
-
-	/*
-	 * When a page is forced to split, we want at least 50 entries on its
-	 * parent.
-	 */
-	WT_RET(__wt_config_gets(session, cfg, "memory_page_max", &cval));
-	btree->maxmempage = WT_MAX((uint64_t)cval.val, 50 * btree->maxleafpage);
-
-	/*
-	 * Don't let pages grow to more than half the cache size.  Otherwise,
-	 * with very small caches, we can end up in a situation where nothing
-	 * can be evicted.  Take care getting the cache size: with a shared
-	 * cache, it may not have been set.
-	 */
-	cache_size = S2C(session)->cache_size;
-	if (cache_size > 0)
-		btree->maxmempage = WT_MIN(btree->maxmempage, cache_size / 2);
-
-	/* Allocation sizes must be a power-of-two, nothing else makes sense. */
 	if (!__wt_ispo2(btree->allocsize))
 		WT_RET_MSG(session,
 		    EINVAL, "the allocation size must be a power of two");
 
-	/* All page sizes must be in units of the allocation size. */
+	/*
+	 * Get the internal/leaf page sizes.
+	 * All page sizes must be in units of the allocation size.
+	 */
+	WT_RET(__wt_direct_io_size_check(
+	    session, cfg, "internal_page_max", &btree->maxintlpage));
+	WT_RET(__wt_direct_io_size_check(
+	    session, cfg, "leaf_page_max", &btree->maxleafpage));
 	if (btree->maxintlpage < btree->allocsize ||
 	    btree->maxintlpage % btree->allocsize != 0 ||
 	    btree->maxleafpage < btree->allocsize ||
@@ -669,107 +610,88 @@ __btree_page_sizes(WT_SESSION_IMPL *session)
 		    "size (%" PRIu32 "B)", btree->allocsize);
 
 	/*
-	 * Set the split percentage: reconciliation splits to a smaller-than-
-	 * maximum page size so we don't split every time a new entry is added.
+	 * When a page is forced to split, we want at least 50 entries on its
+	 * parent.
+	 *
+	 * Don't let pages grow larger than a quarter of the cache, with too-
+	 * small caches, we can end up in a situation where nothing can be
+	 * evicted.  Take care getting the cache size: with a shared cache,
+	 * it may not have been set.
 	 */
+	WT_RET(__wt_config_gets(session, cfg, "memory_page_max", &cval));
+	btree->maxmempage =
+	    WT_MAX((uint64_t)cval.val, 50 * (uint64_t)btree->maxleafpage);
+	cache_size = S2C(session)->cache_size;
+	if (cache_size > 0)
+		btree->maxmempage = WT_MIN(btree->maxmempage, cache_size / 4);
+
+	/*
+	 * Get the split percentage (reconciliation splits pages into smaller
+	 * than the maximum page size chunks so we don't split every time a
+	 * new entry is added). Determine how large newly split pages will be.
+	 */
+	WT_RET(__wt_config_gets(session, cfg, "split_pct", &cval));
+	btree->split_pct = (int)cval.val;
 	intl_split_size = __wt_split_page_size(btree, btree->maxintlpage);
 	leaf_split_size = __wt_split_page_size(btree, btree->maxleafpage);
 
 	/*
-	 * Default values for internal and leaf page items: make sure at least
-	 * 8 items fit on split pages.
+	 * In-memory split configuration.
 	 */
-	if (btree->maxintlitem == 0)
-		    btree->maxintlitem = intl_split_size / 8;
-	if (btree->maxleafitem == 0)
-		    btree->maxleafitem = leaf_split_size / 8;
+	if (__wt_config_gets(
+	    session, cfg, "split_deepen_min_child", &cval) == WT_NOTFOUND ||
+	    cval.val == 0)
+		btree->split_deepen_min_child = WT_SPLIT_DEEPEN_MIN_CHILD_DEF;
+	else
+		btree->split_deepen_min_child = (u_int)cval.val;
+	if (__wt_config_gets(
+	    session, cfg, "split_deepen_per_child", &cval) == WT_NOTFOUND ||
+	    cval.val == 0)
+		btree->split_deepen_per_child = WT_SPLIT_DEEPEN_PER_CHILD_DEF;
+	else
+		btree->split_deepen_per_child = (u_int)cval.val;
 
 	/*
-	 * If raw compression is configured, the application owns page layout,
-	 * it's not our problem.   Hopefully the application chose well.
-	 */
-	if (btree->compressor != NULL &&
-	    btree->compressor->compress_raw != NULL)
-		return (0);
-
-	/* Check we can fit at least 2 items on a page. */
-	if (btree->maxintlitem > btree->maxintlpage / 2)
-		return (pse1(session, "internal",
-		    btree->maxintlpage, btree->maxintlitem));
-	if (btree->maxleafitem > btree->maxleafpage / 2)
-		return (pse1(session, "leaf",
-		    btree->maxleafpage, btree->maxleafitem));
-
-	/*
-	 * Take into account the size of a split page:
+	 * Get the maximum internal/leaf page key/value sizes.
 	 *
-	 * Make it a separate error message so it's clear what went wrong.
+	 * In historic versions of WiredTiger, the maximum internal/leaf page
+	 * key/value sizes were set by the internal_item_max and leaf_item_max
+	 * configuration strings. Look for those strings if we don't find the
+	 * newer ones.
 	 */
-	if (btree->maxintlitem > intl_split_size / 2)
-		return (pse2(session, "internal",
-		    btree->maxintlpage, btree->maxintlitem, btree->split_pct));
-	if (btree->maxleafitem > leaf_split_size / 2)
-		return (pse2(session, "leaf",
-		    btree->maxleafpage, btree->maxleafitem, btree->split_pct));
+	WT_RET(__wt_config_gets(session, cfg, "internal_key_max", &cval));
+	btree->maxintlkey = (uint32_t)cval.val;
+	if (btree->maxintlkey == 0) {
+		WT_RET(
+		    __wt_config_gets(session, cfg, "internal_item_max", &cval));
+		btree->maxintlkey = (uint32_t)cval.val;
+	}
+	WT_RET(__wt_config_gets(session, cfg, "leaf_key_max", &cval));
+	btree->maxleafkey = (uint32_t)cval.val;
+	WT_RET(__wt_config_gets(session, cfg, "leaf_value_max", &cval));
+	btree->maxleafvalue = (uint32_t)cval.val;
+	if (btree->maxleafkey == 0 && btree->maxleafvalue == 0) {
+		WT_RET(__wt_config_gets(session, cfg, "leaf_item_max", &cval));
+		btree->maxleafkey = (uint32_t)cval.val;
+		btree->maxleafvalue = (uint32_t)cval.val;
+	}
+
+	/*
+	 * Default/maximum for internal and leaf page keys: split-page / 10.
+	 * Default for leaf page values: split-page / 2.
+	 *
+	 * It's difficult for applications to configure this in any exact way as
+	 * they have to duplicate our calculation of how many keys must fit on a
+	 * page, and given a split-percentage and page header, that isn't easy
+	 * to do. If the maximum internal key value is too large for the page,
+	 * reset it to the default.
+	 */
+	if (btree->maxintlkey == 0 || btree->maxintlkey > intl_split_size / 10)
+		    btree->maxintlkey = intl_split_size / 10;
+	if (btree->maxleafkey == 0)
+		    btree->maxleafkey = leaf_split_size / 10;
+	if (btree->maxleafvalue == 0)
+		    btree->maxleafvalue = leaf_split_size / 2;
 
 	return (0);
-}
-
-/*
- * __wt_split_page_size --
- *	Split page size calculation: we don't want to repeatedly split every
- * time a new entry is added, so we split to a smaller-than-maximum page size.
- */
-uint32_t
-__wt_split_page_size(WT_BTREE *btree, uint32_t maxpagesize)
-{
-	uintmax_t a;
-	uint32_t split_size;
-
-	/*
-	 * Ideally, the split page size is some percentage of the maximum page
-	 * size rounded to an allocation unit (round to an allocation unit so
-	 * we don't waste space when we write).
-	 */
-	a = maxpagesize;			/* Don't overflow. */
-	split_size = (uint32_t)
-	    WT_ALIGN((a * (u_int)btree->split_pct) / 100, btree->allocsize);
-
-	/*
-	 * If the result of that calculation is the same as the allocation unit
-	 * (that happens if the maximum size is the same size as an allocation
-	 * unit, use a percentage of the maximum page size).
-	 */
-	if (split_size == btree->allocsize)
-		split_size = (uint32_t)((a * (u_int)btree->split_pct) / 100);
-
-	return (split_size);
-}
-
-/*
- * pse1 --
- *	Page size error message 1.
- */
-static int
-pse1(WT_SESSION_IMPL *session, const char *type, uint32_t max, uint32_t ovfl)
-{
-	WT_RET_MSG(session, EINVAL,
-	    "%s page size (%" PRIu32 "B) too small for the maximum item size "
-	    "(%" PRIu32 "B); the page must be able to hold at least 2 items",
-	    type, max, ovfl);
-}
-
-/*
- * pse2 --
- *	Page size error message 2.
- */
-static int
-pse2(WT_SESSION_IMPL *session,
-    const char *type, uint32_t max, uint32_t ovfl, int pct)
-{
-	WT_RET_MSG(session, EINVAL,
-	    "%s page size (%" PRIu32 "B) too small for the maximum item size "
-	    "(%" PRIu32 "B), because of the split percentage (%d %%); a split "
-	    "page must be able to hold at least 2 items",
-	    type, max, ovfl, pct);
 }

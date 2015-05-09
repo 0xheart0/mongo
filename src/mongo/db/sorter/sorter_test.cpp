@@ -31,11 +31,13 @@
 #include "mongo/db/sorter/sorter.h"
 
 #include <boost/filesystem.hpp>
+#include <boost/make_shared.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/thread.hpp>
 
+#include "mongo/config.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/goodies.h"
 #include "mongo/util/mongoutils/str.h"
 
 // Need access to internal classes
@@ -44,6 +46,7 @@
 namespace mongo {
     using namespace mongo::sorter;
     using boost::make_shared;
+    using std::pair;
 
     // Stub to avoid including the server_options library
     // TODO: This should go away once we can do these checks at compile time
@@ -339,7 +342,7 @@ namespace mongo {
 
                 // The debug builds are too slow to run these tests.
                 // Among other things, MSVC++ makes all heap functions O(N) not O(logN).
-#if !defined(_DEBUG)
+#if !defined(MONGO_CONFIG_DEBUG_BUILD)
                 { // merge all data ASC
                     boost::shared_ptr<IWSorter> sorters[] = {
                         makeSorter(opts, IWComparator(ASC)),
@@ -374,7 +377,7 @@ namespace mongo {
             }
 
             // add data to the sorter
-            virtual void addData(ptr<IWSorter> sorter) {
+            virtual void addData(unowned_ptr<IWSorter> sorter) {
                 sorter->add(2,-2);
                 sorter->add(1,-1);
                 sorter->add(0,0);
@@ -405,7 +408,7 @@ namespace mongo {
                 return boost::shared_ptr<IWSorter>(IWSorter::make(adjustSortOptions(opts), comp));
             }
 
-            boost::shared_ptr<IWIterator> done(ptr<IWSorter> sorter) {
+            boost::shared_ptr<IWIterator> done(unowned_ptr<IWSorter> sorter) {
                 return boost::shared_ptr<IWIterator>(sorter->done());
             }
         };
@@ -414,7 +417,7 @@ namespace mongo {
             virtual SortOptions adjustSortOptions(SortOptions opts) {
                 return opts.Limit(5);
             }
-            void addData(ptr<IWSorter> sorter) {
+            void addData(unowned_ptr<IWSorter> sorter) {
                 sorter->add(0,0);
                 sorter->add(3,-3);
                 sorter->add(4,-4);
@@ -431,7 +434,7 @@ namespace mongo {
         };
 
         class Dupes : public Basic {
-            void addData(ptr<IWSorter> sorter) {
+            void addData(unowned_ptr<IWSorter> sorter) {
                 sorter->add(1,-1);
                 sorter->add(-1,1);
                 sorter->add(1,-1);
@@ -472,7 +475,7 @@ namespace mongo {
                 return opts.MaxMemoryUsageBytes(MEM_LIMIT).ExtSortAllowed();
             }
 
-            void addData(ptr<IWSorter> sorter) {
+            void addData(unowned_ptr<IWSorter> sorter) {
                 for (int i=0; i<NUM_ITEMS; i++)
                     sorter->add(_array[i], -_array[i]);
 

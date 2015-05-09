@@ -38,6 +38,7 @@
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
@@ -46,72 +47,35 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/scopeguard.h"
+
+#if !defined(__has_feature)
+#define __has_feature(x) 0
+#endif
 
 namespace mongo {
 
-    namespace {
-        int mdb_handle_error(WT_EVENT_HANDLER *handler, WT_SESSION *session,
-                             int errorCode, const char *message) {
-            try {
-                error() << "WiredTiger (" << errorCode << ") " << message;
-                fassert( 28558, errorCode != WT_PANIC );
-            }
-            catch (...) {
-                std::terminate();
-            }
-            return 0;
-        }
+    using std::set;
+    using std::string;
 
-        int mdb_handle_message( WT_EVENT_HANDLER *handler, WT_SESSION *session,
-                                const char *message) {
-            try {
-                log() << "WiredTiger " << message;
-            }
-            catch (...) {
-                std::terminate();
-            }
-            return 0;
-        }
-
-        int mdb_handle_progress( WT_EVENT_HANDLER *handler, WT_SESSION *session,
-                                 const char *operation, uint64_t progress) {
-            try {
-                log() << "WiredTiger progress " << operation << " " << progress;
-            }
-            catch (...) {
-                std::terminate();
-            }
-
-            return 0;
-        }
-
-        int mdb_handle_close( WT_EVENT_HANDLER *handler, WT_SESSION *session,
-                              WT_CURSOR *cursor) {
-            return 0;
-        }
-
-    }
 
     WiredTigerKVEngine::WiredTigerKVEngine( const std::string& path,
                                             const std::string& extraOpenOptions,
-                                            bool durable )
-        : _durable( durable ),
-          _epoch( 0 ),
+                                            bool durable,
+                                            bool repair )
+        : _eventHandler(WiredTigerUtil::defaultEventHandlers()),
+          _path( path ),
+          _durable( durable ),
           _sizeStorerSyncTracker( 100000, 60 * 1000 ) {
 
-        _eventHandler.handle_error = mdb_handle_error;
-        _eventHandler.handle_message = mdb_handle_message;
-        _eventHandler.handle_progress = mdb_handle_progress;
-        _eventHandler.handle_close = mdb_handle_close;
-
-        int cacheSizeGB = 1;
-
-        {
+        size_t cacheSizeGB = wiredTigerGlobalOptions.cacheSizeGB;
+        if (cacheSizeGB == 0) {
+            // Since the user didn't provide a cache size, choose a reasonable default value.
             ProcessInfo pi;
             unsigned long long memSizeMB  = pi.getMemSizeMB();
             if ( memSizeMB  > 0 ) {
                 double cacheMB = memSizeMB / 2;
-                cacheSizeGB = static_cast<int>( cacheMB / 1024 );
+                cacheSizeGB = static_cast<size_t>( cacheMB / 1024 );
                 if ( cacheSizeGB < 1 )
                     cacheSizeGB = 1;
             }
@@ -135,12 +99,15 @@ namespace mongo {
         ss << "create,";
         ss << "cache_size=" << cacheSizeGB << "G,";
         ss << "session_max=20000,";
-        ss << "extensions=[local=(entry=index_collator_extension)],";
-        ss << "statistics=(all),";
+        ss << "eviction=(threads_max=4),";
+        ss << "statistics=(fast),";
         if ( _durable ) {
-            ss << "log=(enabled=true,archive=true,path=journal),";
+            ss << "log=(enabled=true,archive=true,path=journal,compressor=";
+            ss << wiredTigerGlobalOptions.journalCompressor << "),";
         }
-        ss << "checkpoint=(wait=60,log_size=2GB),";
+        ss << "checkpoint=(wait=" << wiredTigerGlobalOptions.checkpointDelaySecs;
+        ss << ",log_size=2GB),";
+        ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
         ss << extraOpenOptions;
         string config = ss.str();
         log() << "wiredtiger_open config: " << config;
@@ -150,74 +117,107 @@ namespace mongo {
         if (ret == EINVAL) {
             fassertFailedNoTrace(28561);
         }
-        invariantWTOK(ret);
+        else if (ret != 0) {
+            Status s(wtRCToStatus(ret));
+            msgassertedNoTrace(28595, s.reason());
+        }
+
         _sessionCache.reset( new WiredTigerSessionCache( this ) );
 
         _sizeStorerUri = "table:sizeStorer";
         {
-            WiredTigerSession session( _conn, -1 );
-            WiredTigerSizeStorer* ss = new WiredTigerSizeStorer();
-            ss->loadFrom( &session, _sizeStorerUri );
-            _sizeStorer.reset( ss );
+            WiredTigerSession session(_conn);
+            if (repair && _hasUri(session.getSession(), _sizeStorerUri)) {
+                log() << "Repairing size cache";
+                fassertNoTrace(28577, _salvageIfNeeded(_sizeStorerUri.c_str()));
+            }
+            _sizeStorer.reset(new WiredTigerSizeStorer(_conn, _sizeStorerUri));
+            _sizeStorer->fillCache();
         }
     }
 
 
     WiredTigerKVEngine::~WiredTigerKVEngine() {
         if (_conn) {
-            cleanShutdown(NULL); // our impl doesn't use the OperationContext
+            cleanShutdown();
         }
 
-        _sizeStorer.reset( NULL );
-
         _sessionCache.reset( NULL );
-
     }
 
-    void WiredTigerKVEngine::cleanShutdown(OperationContext* txn) {
+    void WiredTigerKVEngine::cleanShutdown() {
         log() << "WiredTigerKVEngine shutting down";
         syncSizeInfo(true);
         if (_conn) {
-            // this must be the last thing we do before _conn->close();
+            // these must be the last things we do before _conn->close();
+            _sizeStorer.reset( NULL );
             _sessionCache->shuttingDown();
 
-            // TODO consider passing "leak_memory=true" to close() when not running a leak checker.
-            invariantWTOK( _conn->close(_conn, NULL) );
+#if !__has_feature(address_sanitizer)
+            const char* config = "leak_memory=true";
+#else
+            const char* config = NULL;
+#endif
+            invariantWTOK( _conn->close(_conn, config) );
             _conn = NULL;
         }
     }
 
     Status WiredTigerKVEngine::okToRename( OperationContext* opCtx,
-                                           const StringData& fromNS,
-                                           const StringData& toNS,
-                                           const StringData& ident,
+                                           StringData fromNS,
+                                           StringData toNS,
+                                           StringData ident,
                                            const RecordStore* originalRecordStore ) const {
-        _sizeStorer->store( _uri( ident ),
-                            originalRecordStore->numRecords( opCtx ),
-                            originalRecordStore->dataSize( opCtx ) );
+        _sizeStorer->storeToCache(_uri( ident ),
+                                  originalRecordStore->numRecords( opCtx ),
+                                  originalRecordStore->dataSize( opCtx ) );
         syncSizeInfo(true);
         return Status::OK();
     }
 
     int64_t WiredTigerKVEngine::getIdentSize( OperationContext* opCtx,
-                                              const StringData& ident ) {
-        WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession();
+                                              StringData ident ) {
+        WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
         return WiredTigerUtil::getIdentSize(session->getSession(), _uri(ident) );
     }
 
     Status WiredTigerKVEngine::repairIdent( OperationContext* opCtx,
-                                            const StringData& ident ) {
-        WiredTigerSession session( _conn, -1 );
-        WT_SESSION* s = session.getSession();
+                                            StringData ident ) {
+        WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
+        session->closeAllCursors();
         string uri = _uri(ident);
-        return wtRCToStatus( s->compact(s, uri.c_str(), NULL ) );
+        return _salvageIfNeeded(uri.c_str());
+    }
+
+    Status WiredTigerKVEngine::_salvageIfNeeded(const char* uri) {
+        // Using a side session to avoid transactional issues
+        WiredTigerSession sessionWrapper(_conn);
+        WT_SESSION* session = sessionWrapper.getSession();
+
+        int rc = (session->verify)(session, uri, NULL);
+        if (rc == 0) {
+            log() << "Verify succeeded on uri " << uri << ". Not salvaging.";
+            return Status::OK();
+        }
+
+        if (rc == EBUSY) {
+            // SERVER-16457: verify and salvage are occasionally failing with EBUSY. For now we
+            // lie and return OK to avoid breaking tests. This block should go away when that ticket
+            // is resolved.
+            error() << "Verify on " << uri << " failed with EBUSY. Assuming no salvage is needed.";
+            return Status::OK();
+        }
+
+        // TODO need to cleanup the sizeStorer cache after salvaging.
+        log() << "Verify failed on uri " << uri << ". Running a salvage operation.";
+        return wtRCToStatus(session->salvage(session, uri, NULL), "Salvage failed:");
     }
 
     int WiredTigerKVEngine::flushAllFiles( bool sync ) {
         LOG(1) << "WiredTigerKVEngine::flushAllFiles";
         syncSizeInfo(true);
 
-        WiredTigerSession session( _conn, -1 );
+        WiredTigerSession session(_conn);
         WT_SESSION* s = session.getSession();
         invariantWTOK( s->checkpoint(s, NULL ) );
 
@@ -229,14 +229,10 @@ namespace mongo {
             return;
 
         try {
-            WiredTigerSession session( _conn, -1 );
-            WT_SESSION* s = session.getSession();
-            invariantWTOK( s->begin_transaction( s, sync ? "sync=true" : NULL ) );
-            _sizeStorer->storeInto( &session, _sizeStorerUri );
-            invariantWTOK( s->commit_transaction( s, NULL ) );
+            _sizeStorer->syncCache(sync);
         }
-        catch ( const WriteConflictException& de ) {
-            // ignore, it means someone else is doing it
+        catch (const WriteConflictException&) {
+            // ignore, we'll try again later.
         }
     }
 
@@ -253,12 +249,14 @@ namespace mongo {
     }
 
     Status WiredTigerKVEngine::createRecordStore( OperationContext* opCtx,
-                                                  const StringData& ns,
-                                                  const StringData& ident,
+                                                  StringData ns,
+                                                  StringData ident,
                                                   const CollectionOptions& options ) {
-        WiredTigerSession session( _conn, -1 );
+        _checkIdentPath( ident );
+        WiredTigerSession session(_conn);
 
-        StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(ns, options, _rsOptions);
+        StatusWith<std::string> result =
+            WiredTigerRecordStore::generateCreateString(ns, options, _rsOptions);
         if (!result.isOK()) {
             return result.getStatus();
         }
@@ -266,13 +264,13 @@ namespace mongo {
 
         string uri = _uri( ident );
         WT_SESSION* s = session.getSession();
-        LOG(1) << "WiredTigerKVEngine::createRecordStore uri: " << uri << " config: " << config;
+        LOG(2) << "WiredTigerKVEngine::createRecordStore uri: " << uri << " config: " << config;
         return wtRCToStatus( s->create( s, uri.c_str(), config.c_str() ) );
     }
 
     RecordStore* WiredTigerKVEngine::getRecordStore( OperationContext* opCtx,
-                                                     const StringData& ns,
-                                                     const StringData& ident,
+                                                     StringData ns,
+                                                     StringData ident,
                                                      const CollectionOptions& options ) {
 
         if (options.capped) {
@@ -288,34 +286,45 @@ namespace mongo {
         }
     }
 
-    string WiredTigerKVEngine::_uri( const StringData& ident ) const {
+    string WiredTigerKVEngine::_uri( StringData ident ) const {
         return string("table:") + ident.toString();
     }
 
     Status WiredTigerKVEngine::createSortedDataInterface( OperationContext* opCtx,
-                                                          const StringData& ident,
+                                                          StringData ident,
                                                           const IndexDescriptor* desc ) {
-        return wtRCToStatus( WiredTigerIndex::Create( opCtx, _uri( ident ), _indexOptions, desc ) );
+        _checkIdentPath( ident );
+        StatusWith<std::string> result =
+            WiredTigerIndex::generateCreateString(_indexOptions, *desc);
+        if (!result.isOK()) {
+            return result.getStatus();
+        }
+
+        std::string config = result.getValue();
+
+        LOG(2) << "WiredTigerKVEngine::createSortedDataInterface ident: " << ident
+               << " config: " << config;
+        return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
     }
 
     SortedDataInterface* WiredTigerKVEngine::getSortedDataInterface( OperationContext* opCtx,
-                                                                     const StringData& ident,
+                                                                     StringData ident,
                                                                      const IndexDescriptor* desc ) {
         if ( desc->unique() )
-            return new WiredTigerIndexUnique( _uri( ident ), desc );
-        return new WiredTigerIndexStandard( _uri( ident ), desc );
+            return new WiredTigerIndexUnique( opCtx, _uri( ident ), desc );
+        return new WiredTigerIndexStandard( opCtx, _uri( ident ), desc );
     }
 
     Status WiredTigerKVEngine::dropIdent( OperationContext* opCtx,
-                                          const StringData& ident ) {
+                                          StringData ident ) {
         _drop( ident );
         return Status::OK();
     }
 
-    bool WiredTigerKVEngine::_drop( const StringData& ident ) {
+    bool WiredTigerKVEngine::_drop( StringData ident ) {
         string uri = _uri( ident );
 
-        WiredTigerSession session( _conn, -1 );
+        WiredTigerSession session(_conn);
 
         int ret = session.getSession()->drop( session.getSession(), uri.c_str(), "force" );
         LOG(1) << "WT drop of  " << uri << " res " << ret;
@@ -328,9 +337,8 @@ namespace mongo {
         if ( ret == EBUSY ) {
             // this is expected, queue it up
             {
-                boost::mutex::scoped_lock lk( _identToDropMutex );
+                boost::lock_guard<boost::mutex> lk( _identToDropMutex );
                 _identToDrop.insert( uri );
-                _epoch++;
             }
             _sessionCache->closeAll();
             return false;
@@ -345,21 +353,21 @@ namespace mongo {
             _sizeStorerSyncTracker.resetLastTime();
             syncSizeInfo(false);
         }
-        boost::mutex::scoped_lock lk( _identToDropMutex );
+        boost::lock_guard<boost::mutex> lk( _identToDropMutex );
         return !_identToDrop.empty();
     }
 
     void WiredTigerKVEngine::dropAllQueued() {
         set<string> mine;
         {
-            boost::mutex::scoped_lock lk( _identToDropMutex );
+            boost::lock_guard<boost::mutex> lk( _identToDropMutex );
             mine = _identToDrop;
         }
 
         set<string> deleted;
 
         {
-            WiredTigerSession session( _conn, -1 );
+            WiredTigerSession session(_conn);
             for ( set<string>::const_iterator it = mine.begin(); it != mine.end(); ++it ) {
                 string uri = *it;
                 int ret = session.getSession()->drop( session.getSession(), uri.c_str(), "force" );
@@ -380,7 +388,7 @@ namespace mongo {
         }
 
         {
-            boost::mutex::scoped_lock lk( _identToDropMutex );
+            boost::lock_guard<boost::mutex> lk( _identToDropMutex );
             for ( set<string>::const_iterator it = deleted.begin(); it != deleted.end(); ++it ) {
                 _identToDrop.erase( *it );
             }
@@ -391,9 +399,30 @@ namespace mongo {
         return true;
     }
 
+    bool WiredTigerKVEngine::supportsDirectoryPerDB() const {
+        return true;
+    }
+
+    bool WiredTigerKVEngine::hasIdent(OperationContext* opCtx, StringData ident) const {
+        return _hasUri(WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx)->getSession(),
+                       _uri(ident));
+    }
+
+    bool WiredTigerKVEngine::_hasUri(WT_SESSION* session, const std::string& uri) const {
+        // can't use WiredTigerCursor since this is called from constructor.
+        WT_CURSOR* c = NULL;
+        int ret = session->open_cursor(session, "metadata:", NULL, NULL, &c);
+        if (ret == ENOENT) return false;
+        invariantWTOK(ret);
+        ON_BLOCK_EXIT(c->close, c);
+
+        c->set_key(c, uri.c_str());
+        return c->search(c) == 0;
+    }
+
     std::vector<std::string> WiredTigerKVEngine::getAllIdents( OperationContext* opCtx ) const {
         std::vector<std::string> all;
-        WiredTigerCursor cursor( "metadata:", WiredTigerSession::kMetadataCursorId, opCtx );
+        WiredTigerCursor cursor( "metadata:", WiredTigerSession::kMetadataCursorId, false, opCtx );
         WT_CURSOR* c = cursor.get();
         if ( !c )
             return all;
@@ -421,5 +450,28 @@ namespace mongo {
 
     int WiredTigerKVEngine::reconfigure(const char* str) {
         return _conn->reconfigure(_conn, str);
+    }
+
+    void WiredTigerKVEngine::_checkIdentPath( StringData ident ) {
+        size_t start = 0;
+        size_t idx;
+        while ( ( idx = ident.find( '/', start ) ) != string::npos ) {
+            StringData dir = ident.substr( 0, idx );
+
+            boost::filesystem::path subdir = _path;
+            subdir /= dir.toString();
+            if ( !boost::filesystem::exists( subdir ) ) {
+                LOG(1) << "creating subdirectory: " << dir;
+                try {
+                    boost::filesystem::create_directory( subdir );
+                }
+                catch (const std::exception& e) {
+                    error() << "error creating path " << subdir.string() << ' ' << e.what();
+                    throw;
+                }
+            }
+
+            start = idx + 1;
+        }
     }
 }

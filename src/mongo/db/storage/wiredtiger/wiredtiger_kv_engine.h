@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 
 #include <wiredtiger.h>
@@ -52,7 +53,8 @@ namespace mongo {
     public:
         WiredTigerKVEngine( const std::string& path,
                             const std::string& extraOpenOptions = "",
-                            bool durable = true );
+                            bool durable = true,
+                            bool repair = false );
         virtual ~WiredTigerKVEngine();
 
         void setRecordStoreExtraOptions( const std::string& options );
@@ -60,48 +62,52 @@ namespace mongo {
 
         virtual bool supportsDocLocking() const;
 
+        virtual bool supportsDirectoryPerDB() const;
+
         virtual bool isDurable() const { return _durable; }
 
         virtual RecoveryUnit* newRecoveryUnit();
 
         virtual Status createRecordStore( OperationContext* opCtx,
-                                          const StringData& ns,
-                                          const StringData& ident,
+                                          StringData ns,
+                                          StringData ident,
                                           const CollectionOptions& options );
 
         virtual RecordStore* getRecordStore( OperationContext* opCtx,
-                                             const StringData& ns,
-                                             const StringData& ident,
+                                             StringData ns,
+                                             StringData ident,
                                              const CollectionOptions& options );
 
         virtual Status createSortedDataInterface( OperationContext* opCtx,
-                                                  const StringData& ident,
+                                                  StringData ident,
                                                   const IndexDescriptor* desc );
 
         virtual SortedDataInterface* getSortedDataInterface( OperationContext* opCtx,
-                                                             const StringData& ident,
+                                                             StringData ident,
                                                              const IndexDescriptor* desc );
 
         virtual Status dropIdent( OperationContext* opCtx,
-                                  const StringData& ident );
+                                  StringData ident );
 
         virtual Status okToRename( OperationContext* opCtx,
-                                   const StringData& fromNS,
-                                   const StringData& toNS,
-                                   const StringData& ident,
+                                   StringData fromNS,
+                                   StringData toNS,
+                                   StringData ident,
                                    const RecordStore* originalRecordStore ) const;
 
         virtual int flushAllFiles( bool sync );
 
         virtual int64_t getIdentSize( OperationContext* opCtx,
-                                      const StringData& ident );
+                                      StringData ident );
 
         virtual Status repairIdent( OperationContext* opCtx,
-                                    const StringData& ident );
+                                    StringData ident );
+
+        virtual bool hasIdent(OperationContext* opCtx, StringData ident) const;
 
         std::vector<std::string> getAllIdents( OperationContext* opCtx ) const;
 
-        virtual void cleanShutdown(OperationContext* txn);
+        virtual void cleanShutdown();
 
         // wiredtiger specific
         // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
@@ -112,30 +118,40 @@ namespace mongo {
         void dropAllQueued();
         bool haveDropsQueued() const;
 
-        int currentEpoch() const { return _epoch; }
-
         void syncSizeInfo(bool sync) const;
+
+        /**
+         * Initializes a background job to remove excess documents in the oplog collections.
+         * This applies to the capped collections in the local.oplog.* namespaces (specifically
+         * local.oplog.rs for replica sets and local.oplog.$main for master/slave replication).
+         * Returns true if a background job is running for the namespace.
+         */
+        static bool initRsOplogBackgroundThread(StringData ns);
 
     private:
 
-        string _uri( const StringData& ident ) const;
-        bool _drop( const StringData& ident );
+        Status _salvageIfNeeded(const char* uri);
+        void _checkIdentPath( StringData ident );
+
+        bool _hasUri(WT_SESSION* session, const std::string& uri) const;
+
+        std::string _uri( StringData ident ) const;
+        bool _drop( StringData ident );
 
         WT_CONNECTION* _conn;
         WT_EVENT_HANDLER _eventHandler;
         boost::scoped_ptr<WiredTigerSessionCache> _sessionCache;
+        std::string _path;
         bool _durable;
 
-        string _rsOptions;
-        string _indexOptions;
+        std::string _rsOptions;
+        std::string _indexOptions;
 
         std::set<std::string> _identToDrop;
         mutable boost::mutex _identToDropMutex;
 
-        int _epoch; // this is how we keep track of if a session is too old
-
-        scoped_ptr<WiredTigerSizeStorer> _sizeStorer;
-        string _sizeStorerUri;
+        boost::scoped_ptr<WiredTigerSizeStorer> _sizeStorer;
+        std::string _sizeStorerUri;
         mutable ElapsedTracker _sizeStorerSyncTracker;
     };
 

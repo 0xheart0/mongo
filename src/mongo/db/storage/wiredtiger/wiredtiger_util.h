@@ -30,15 +30,20 @@
 
 #pragma once
 
+#include <limits>
 #include <wiredtiger.h>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
     class BSONObjBuilder;
+    class OperationContext;
+    class WiredTigerConfigParser;
 
     inline bool wt_keeptxnopen() {
         return false;
@@ -87,21 +92,119 @@ namespace mongo {
     public:
 
         /**
+         * Fetch the type and source fields out of the colgroup metadata.  'tableUri' must be a
+         * valid table: uri.
+         */
+        static void fetchTypeAndSourceURI(OperationContext* opCtx,
+                                          const std::string& tableUri,
+                                          std::string* type,
+                                          std::string* source);
+
+        /**
          * Reads contents of table using URI and exports all keys to BSON as string elements.
          * Additional, adds 'uri' field to output document.
          */
         static Status exportTableToBSON(WT_SESSION* s,
-                                        const std::string& uri, const std::string& config,
+                                        const std::string& uri,
+                                        const std::string& config,
                                         BSONObjBuilder* bob);
 
-        static int64_t getIdentSize(WT_SESSION* s,
-                                    const std::string& uri );
+        /**
+         * Gets entire metadata string for collection/index at URI.
+         */
+        static StatusWith<std::string> getMetadata(OperationContext* opCtx,
+                                                   StringData uri);
+
+        /**
+         * Reads app_metadata for collection/index at URI as a BSON document.
+         */
+        static Status getApplicationMetadata(OperationContext* opCtx,
+                                             StringData uri,
+                                             BSONObjBuilder* bob);
+
+        static StatusWith<BSONObj> getApplicationMetadata(OperationContext* opCtx,
+                                                          StringData uri);
+
+        /**
+         * Validates formatVersion in application metadata for 'uri'.
+         * Version must be numeric and be in the range [minimumVersion, maximumVersion].
+         * URI is used in error messages only.
+         */
+        static Status checkApplicationMetadataFormatVersion(OperationContext* opCtx,
+                                                            StringData uri,
+                                                            int64_t minimumVersion,
+                                                            int64_t maximumVersion);
+        /**
+         * Reads individual statistics using URI.
+         * List of statistics keys WT_STAT_* can be found in wiredtiger.h.
+         */
+        static StatusWith<uint64_t> getStatisticsValue(WT_SESSION* session,
+                                                       const std::string& uri,
+                                                       const std::string& config,
+                                                       int statisticsKey);
+
+        /**
+         * Reads individual statistics using URI and casts to type ResultType.
+         * Caps statistics value at max(ResultType) in case of overflow.
+         */
+        template<typename ResultType>
+        static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
+                                                           const std::string& uri,
+                                                           const std::string& config,
+                                                           int statisticsKey);
+
+        /**
+         * Reads individual statistics using URI and casts to type ResultType.
+         * Caps statistics value at 'maximumResultType'.
+         */
+        template<typename ResultType>
+        static StatusWith<ResultType> getStatisticsValueAs(WT_SESSION* session,
+                                                           const std::string& uri,
+                                                           const std::string& config,
+                                                           int statisticsKey,
+                                                           ResultType maximumResultType);
+
+        static int64_t getIdentSize(WT_SESSION* s, const std::string& uri );
+
+        /**
+         * Returns a WT_EVENT_HANDER with MongoDB's default handlers.
+         * The default handlers just log so it is recommended that you consider calling them even if
+         * you are capturing the output.
+         *
+         * There is no default "close" handler. You only need to provide one if you need to call a
+         * destructor.
+         */
+        static WT_EVENT_HANDLER defaultEventHandlers();
+
+        /**
+         * Calls WT_SESSION::validate() on a side-session to ensure that your current transaction
+         * isn't left in an invalid state.
+         *
+         * If errors is non-NULL, all error messages will be appended to the array.
+         */
+        static int verifyTable(OperationContext* txn, const std::string& uri,
+                               std::vector<std::string>* errors = NULL);
+
+    private:
+        /**
+         * Casts unsigned 64-bit statistics value to T.
+         * If original value exceeds maximum value of T, return max(T).
+         */
+        template<typename T>
+        static T _castStatisticsValue(uint64_t statisticsValue);
+
+        /**
+         * Casts unsigned 64-bit statistics value to T.
+         * If original value exceeds 'maximumResultType', return 'maximumResultType'.
+         */
+        template<typename T>
+        static T _castStatisticsValue(uint64_t statisticsValue, T maximumResultType);
     };
 
     class WiredTigerConfigParser {
         MONGO_DISALLOW_COPYING(WiredTigerConfigParser);
     public:
-        WiredTigerConfigParser(const StringData& config) {
+        WiredTigerConfigParser(StringData config) {
             invariantWTOK(wiredtiger_config_parser_open(NULL, config.rawData(), config.size(),
                                                         &_parser));
         }
@@ -127,4 +230,44 @@ namespace mongo {
         WT_CONFIG_PARSER* _parser;
     };
 
-}
+    // static
+    template<typename ResultType>
+    StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
+                                                                const std::string& uri,
+                                                                const std::string& config,
+                                                                int statisticsKey) {
+        return getStatisticsValueAs<ResultType>(session, uri, config, statisticsKey,
+                                                std::numeric_limits<ResultType>::max());
+    }
+
+    // static
+    template<typename ResultType>
+    StatusWith<ResultType> WiredTigerUtil::getStatisticsValueAs(WT_SESSION* session,
+                                                                const std::string& uri,
+                                                                const std::string& config,
+                                                                int statisticsKey,
+                                                                ResultType maximumResultType) {
+        StatusWith<uint64_t> result = getStatisticsValue(session, uri, config, statisticsKey);
+        if (!result.isOK()) {
+            return StatusWith<ResultType>(result.getStatus());
+        }
+        return StatusWith<ResultType>(_castStatisticsValue<ResultType>(result.getValue(),
+                                                                       maximumResultType));
+    }
+
+    // static
+    template<typename ResultType>
+    ResultType WiredTigerUtil::_castStatisticsValue(uint64_t statisticsValue) {
+        return _castStatisticsValue<ResultType>(statisticsValue,
+                                                std::numeric_limits<ResultType>::max());
+    }
+
+    // static
+    template<typename ResultType>
+    ResultType WiredTigerUtil::_castStatisticsValue(uint64_t statisticsValue,
+                                                   ResultType maximumResultType) {
+        return statisticsValue > static_cast<uint64_t>(maximumResultType) ?
+            maximumResultType : static_cast<ResultType>(statisticsValue);
+    }
+
+}  // namespace mongo

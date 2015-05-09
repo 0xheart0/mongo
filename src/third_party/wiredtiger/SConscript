@@ -2,7 +2,8 @@
 import re
 import textwrap
 
-Import("env windows darwin solaris linux freebsd")
+Import("env debugBuild")
+Import("get_option")
 
 env = env.Clone()
 env.InjectThirdPartyIncludePaths(libraries=['snappy', 'zlib'])
@@ -11,15 +12,30 @@ env.Append(CPPPATH=[
         "src/include",
     ])
 
-if windows:
+# Enable asserts, and optional rich logging in debug builds
+if debugBuild:
+    env.Append(CPPDEFINES=[
+        "HAVE_DIAGNOSTIC",
+        "HAVE_VERBOSE",
+        ])
+
+if env.TargetOSIs('windows'):
     env.Append(CPPPATH=["build_win"])
-elif darwin:
+    env.Append(CFLAGS=[
+        "/wd4090" # Ignore warning about mismatched const qualifiers
+    ])
+    if get_option('allocator') == 'tcmalloc':
+        env.InjectThirdPartyIncludePaths(libraries=['gperftools'])
+        env.Append(CPPDEFINES=['HAVE_LIBTCMALLOC'])
+elif env.TargetOSIs('osx'):
     env.Append(CPPPATH=["build_darwin"])
-elif solaris:
+elif env.TargetOSIs('solaris'):
     env.Append(CPPPATH=["build_solaris"])
-elif freebsd:
+elif env.TargetOSIs('freebsd'):
     env.Append(CPPPATH=["build_freebsd"])
-elif linux:
+elif env.TargetOSIs('openbsd'):
+    env.Append(CPPPATH=["build_openbsd"])
+elif env.TargetOSIs('linux'):
     env.Append(CPPPATH=["build_linux"])
     env.Append(CPPDEFINES=["_GNU_SOURCE"])
 else:
@@ -66,7 +82,8 @@ replacements = {
     '@VERSION_STRING@' : VERSION_STRING,
     '@uintmax_t_decl@': "",
     '@uintptr_t_decl@': "",
-    '@off_t_decl@' : 'typedef int64_t wt_off_t;' if windows else "typedef off_t wt_off_t;",
+    '@off_t_decl@' : 'typedef int64_t wt_off_t;' if env.TargetOSIs('windows')
+        else "typedef off_t wt_off_t;",
     '@wiredtiger_includes_decl@': wiredtiger_includes
 }
 
@@ -80,7 +97,7 @@ env.Substfile(
 #
 # WiredTiger library
 #
-filelistfile = "dist/filelist.win" if windows else 'dist/filelist'
+filelistfile = "build_win/filelist.win" if env.TargetOSIs('windows') else 'dist/filelist'
 
 wtsources = []
 

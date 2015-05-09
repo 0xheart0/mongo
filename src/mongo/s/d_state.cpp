@@ -28,63 +28,73 @@
 *    then also delete it in the license file.
 */
 
-
-/**
-   these are commands that live in mongod
-   mostly around shard management and checking
- */
-
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
+
+#include "mongo/s/d_state.h"
 
 #include <map>
 #include <string>
 #include <vector>
 
+#include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/db.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/wire_version.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/client/connpool.h"
-#include "mongo/s/chunk_version.h"
+#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
+#include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/config.h"
-#include "mongo/s/d_state.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/metadata_loader.h"
-#include "mongo/s/shard.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/util/queue.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/log.h"
-
+#include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
+
+    bool isMongos() {
+        return false;
+    }
+
 
     // -----ShardingState START ----
 
     ShardingState::ShardingState()
-        : _enabled(false) , _mutex( "ShardingState" ),
+        : _enabled(false),
           _configServerTickets( 3 /* max number of concurrent config server refresh threads */ ) {
     }
 
-    void ShardingState::enable( const string& server ) {
-        scoped_lock lk(_mutex);
+    bool ShardingState::enabled() {
+        boost::lock_guard<boost::mutex> lk(_mutex);
+        return _enabled;
+    }
 
-        _enabled = true;
-        verify( server.size() );
-        if ( _configServer.size() == 0 )
-            _configServer = server;
-        else {
-            verify( server == _configServer );
-        }
+    string ShardingState::getConfigServer() {
+        boost::lock_guard<boost::mutex> lk(_mutex);
+        invariant(_enabled);
+
+        return configServer.getConnectionString().toString();
     }
 
     void ShardingState::initialize(const string& server) {
@@ -92,9 +102,7 @@ namespace mongo {
                 "Unable to obtain host name during sharding initialization.",
                 !getHostName().empty());
 
-        ShardedConnectionInfo::addHook();
-        shardingState.enable(server);
-        configServer.init(server);
+        shardingState._initialize(server);
     }
 
     // TODO: Consolidate and eliminate these various ways of setting / validating shard names
@@ -102,8 +110,13 @@ namespace mongo {
         return setShardNameAndHost( name, "" );
     }
 
+    std::string ShardingState::getShardName() {
+        boost::lock_guard<boost::mutex> lk(_mutex);
+        return _shardName;
+    }
+
     bool ShardingState::setShardNameAndHost( const string& name, const string& host ) {
-        scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
         if ( _shardName.size() == 0 ) {
             // TODO SERVER-2299 remotely verify the name is sound w.r.t IPs
             _shardName = name;
@@ -150,25 +163,21 @@ namespace mongo {
         msgasserted( 13298 , ss.str() );
     }
 
-    void ShardingState::resetShardingState() {
-        scoped_lock lk(_mutex);
-        
-        _enabled = false;
-        _configServer.clear();
-        _shardName.clear();
+    void ShardingState::clearCollectionMetadata() {
+        boost::lock_guard<boost::mutex> lk(_mutex);
         _collMetadata.clear();
     }
 
     // TODO we shouldn't need three ways for checking the version. Fix this.
     bool ShardingState::hasVersion( const string& ns ) {
-        scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find(ns);
         return it != _collMetadata.end();
     }
 
     bool ShardingState::hasVersion( const string& ns , ChunkVersion& version ) {
-        scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find(ns);
         if ( it == _collMetadata.end() )
@@ -179,8 +188,8 @@ namespace mongo {
         return true;
     }
 
-    const ChunkVersion ShardingState::getVersion( const string& ns ) const {
-        scoped_lock lk(_mutex);
+    ChunkVersion ShardingState::getVersion(const string& ns) {
+        boost::lock_guard<boost::mutex> lk(_mutex);
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
         if ( it != _collMetadata.end() ) {
@@ -198,8 +207,8 @@ namespace mongo {
                                     const BSONObj& max,
                                     ChunkVersion version) {
         
-        txn->lockState()->assertWriteLocked( ns );
-        scoped_lock lk( _mutex );
+        invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
+        boost::lock_guard<boost::mutex> lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
         verify( it != _collMetadata.end() ) ;
@@ -227,9 +236,9 @@ namespace mongo {
     void ShardingState::undoDonateChunk(OperationContext* txn,
                                         const string& ns,
                                         CollectionMetadataPtr prevMetadata) {
-        
-        txn->lockState()->assertWriteLocked( ns );        
-        scoped_lock lk( _mutex );
+
+        invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
+        boost::lock_guard<boost::mutex> lk( _mutex );
         
         log() << "ShardingState::undoDonateChunk acquired _mutex" << endl;
 
@@ -245,8 +254,8 @@ namespace mongo {
                                      const OID& epoch,
                                      string* errMsg ) {
         
-        txn->lockState()->assertWriteLocked( ns );
-        scoped_lock lk( _mutex );
+        invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
+        boost::lock_guard<boost::mutex> lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
         if ( it == _collMetadata.end() ) {
@@ -290,8 +299,8 @@ namespace mongo {
                                        const OID& epoch,
                                        string* errMsg ) {
         
-        txn->lockState()->assertWriteLocked( ns );
-        scoped_lock lk( _mutex );
+        invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
+        boost::lock_guard<boost::mutex> lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
         if ( it == _collMetadata.end() ) {
@@ -335,8 +344,8 @@ namespace mongo {
                                     const vector<BSONObj>& splitKeys,
                                     ChunkVersion version ) {
         
-        txn->lockState()->assertWriteLocked( ns );
-        scoped_lock lk( _mutex );
+        invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
+        boost::lock_guard<boost::mutex> lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
         verify( it != _collMetadata.end() ) ;
@@ -359,8 +368,8 @@ namespace mongo {
                                      const BSONObj& maxKey,
                                      ChunkVersion mergedVersion ) {
 
-        txn->lockState()->assertWriteLocked( ns );
-        scoped_lock lk( _mutex );
+        invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
+        boost::lock_guard<boost::mutex> lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
         verify( it != _collMetadata.end() );
@@ -378,7 +387,7 @@ namespace mongo {
     }
 
     void ShardingState::resetMetadata( const string& ns ) {
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
 
         warning() << "resetting metadata for " << ns << ", this should only be used in testing"
                   << endl;
@@ -412,7 +421,7 @@ namespace mongo {
 
         CollectionMetadataPtr storedMetadata;
         {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             CollectionMetadataMap::iterator it = _collMetadata.find( ns );
             if ( it != _collMetadata.end() ) storedMetadata = it->second;
         }
@@ -458,6 +467,33 @@ namespace mongo {
         return doRefreshMetadata(txn, ns, ChunkVersion(0, 0, OID()), false, latestShardVersion);
     }
 
+    void ShardingState::_initialize(const string& server) {
+        // Ensure only one caller at a time initializes
+        boost::lock_guard<boost::mutex> lk(_mutex);
+
+        if (_enabled) {
+            // TODO: Do we need to throw exception if the config servers have changed from what we
+            // already have in place? How do we test for that?
+            return;
+        }
+
+        ShardedConnectionInfo::addHook();
+
+        std::string errmsg;
+        ConnectionString configServerCS = ConnectionString::parse(server, errmsg);
+        uassert(28633,
+                str::stream() << "Invalid config server connection string: " << errmsg,
+                configServerCS.isValid());
+
+        configServer.init(configServerCS);
+
+        auto catalogManager = stdx::make_unique<CatalogManagerLegacy>();
+        uassertStatusOK(catalogManager->init(configServerCS));
+        grid.setCatalogManager(std::move(catalogManager));
+
+        _enabled = true;
+    }
+
     Status ShardingState::doRefreshMetadata( OperationContext* txn,
                                              const string& ns,
                                              const ChunkVersion& reqShardVersion,
@@ -474,23 +510,18 @@ namespace mongo {
         //
 
         CollectionMetadataPtr beforeMetadata;
-        string shardName;
-        string configServer;
 
         {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
 
             // We can't reload if sharding is not enabled - i.e. without a config server location
             if (!_enabled) {
-
                 string errMsg = str::stream() << "cannot refresh metadata for " << ns
                                               << " before sharding has been enabled";
 
                 warning() << errMsg;
                 return Status(ErrorCodes::NotYetInitialized, errMsg);
             }
-            // Checked when enabling sharding
-            dassert(!_configServer.empty());
 
             // We also can't reload if a shard name has not yet been set.
             if (_shardName.empty()) {
@@ -502,11 +533,10 @@ namespace mongo {
                 return Status(ErrorCodes::NotYetInitialized, errMsg);
             }
 
-            shardName = _shardName;
-            configServer = _configServer;
-
-            CollectionMetadataMap::iterator it = _collMetadata.find( ns );
-            if ( it != _collMetadata.end() ) beforeMetadata = it->second;
+            CollectionMetadataMap::iterator it = _collMetadata.find(ns);
+            if (it != _collMetadata.end()) {
+                beforeMetadata = it->second;
+            }
         }
 
         ChunkVersion beforeShardVersion;
@@ -545,17 +575,18 @@ namespace mongo {
                  << ", current metadata version is " << beforeCollVersion << endl;
 
         string errMsg;
-        ConnectionString configServerLoc = ConnectionString::parse( configServer, errMsg );
-        MetadataLoader mdLoader( configServerLoc );
+
+        MetadataLoader mdLoader;
         CollectionMetadata* remoteMetadataRaw = new CollectionMetadata();
         CollectionMetadataPtr remoteMetadata( remoteMetadataRaw );
 
         Timer refreshTimer;
         Status status =
-                mdLoader.makeCollectionMetadata( ns,
-                                                 shardName,
-                                                 ( fullReload ? NULL : beforeMetadata.get() ),
-                                                 remoteMetadataRaw );
+                mdLoader.makeCollectionMetadata(grid.catalogManager(),
+                                                ns,
+                                                getShardName(),
+                                                fullReload ? NULL : beforeMetadata.get(),
+                                                remoteMetadataRaw);
         long long refreshMillis = refreshTimer.millis();
 
         if ( status.code() == ErrorCodes::NamespaceNotFound ) {
@@ -603,37 +634,15 @@ namespace mongo {
             // Get the metadata now that the load has completed
             //
 
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
 
             // Don't reload if our config server has changed or sharding is no longer enabled
             if (!_enabled) {
-
                 string errMsg = str::stream() << "could not refresh metadata for " << ns
                                               << ", sharding is no longer enabled";
 
                 warning() << errMsg;
                 return Status(ErrorCodes::NotYetInitialized, errMsg);
-            }
-
-            if (_configServer != configServer) {
-
-                string errMsg = str::stream() << "could not refresh metadata for " << ns
-                                              << ", server is now attached to cluster "
-                                              << _configServer << " instead of " << configServer;
-
-                warning() << errMsg;
-                return Status(ErrorCodes::IncompatibleShardingMetadata, errMsg);
-            }
-
-            // Don't reload if our shard name has changed
-            if (_shardName != shardName) {
-
-                string errMsg = str::stream() << "could not refresh metadata for " << ns
-                                              << ", shard name changed during reload from "
-                                              << _shardName << " to " << shardName;
-
-                warning() << errMsg;
-                return Status(ErrorCodes::IncompatibleShardingMetadata, errMsg);
             }
 
             CollectionMetadataMap::iterator it = _collMetadata.find( ns );
@@ -645,6 +654,7 @@ namespace mongo {
             }
 
             *latestShardVersion = afterShardVersion;
+
             //
             // Resolve newer pending chunks with the remote metadata, finish construction
             //
@@ -779,22 +789,25 @@ namespace mongo {
     }
 
     void ShardingState::appendInfo(BSONObjBuilder& builder) {
-
-        scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
 
         builder.appendBool("enabled", _enabled);
-        if (!_enabled)
+        if (!_enabled) {
             return;
+        }
 
-        builder.append("configServer", _configServer);
+        builder.append("configServer", configServer.getConnectionString().toString());
         builder.append("shardName", _shardName);
 
         BSONObjBuilder versionB(builder.subobjStart("versions"));
-        for (CollectionMetadataMap::iterator it = _collMetadata.begin(); it != _collMetadata.end();
-            ++it) {
+        for (CollectionMetadataMap::const_iterator it = _collMetadata.begin();
+             it != _collMetadata.end();
+             ++it) {
+
             CollectionMetadataPtr metadata = it->second;
             versionB.appendTimestamp(it->first, metadata->getShardVersion().toLong());
         }
+
         versionB.done();
     }
 
@@ -809,7 +822,7 @@ namespace mongo {
     }
 
     CollectionMetadataPtr ShardingState::getCollectionMetadata( const string& ns ) {
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
 
         CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
         if ( it == _collMetadata.end() ) {
@@ -861,10 +874,10 @@ namespace mongo {
     }
 
     void ShardedConnectionInfo::addHook() {
-        static mongo::mutex lock("ShardedConnectionInfo::addHook mutex");
+        static mongo::mutex lock;
         static bool done = false;
 
-        scoped_lock lk(lock);
+        boost::lock_guard<boost::mutex> lk(lock);
         if (!done) {
             log() << "first cluster operation detected, adding sharding hook to enable versioning "
                     "and authentication to remote servers" << endl;
@@ -917,7 +930,12 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             ShardedConnectionInfo::reset();
             return true;
         }
@@ -983,15 +1001,20 @@ namespace mongo {
             return checkConfigOrInit(txn, configdb, authoritative, errmsg, result, true);
         }
 
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
-            // Compatibility error for < v2.8 mongoses still active in the cluster
-            // TODO: Remove post-2.8
+            // Compatibility error for < v3.0 mongoses still active in the cluster
+            // TODO: Remove post-3.0
             if (!cmdObj["serverID"].eoo()) {
 
                 // This mongos is too old to talk to us
-                string errMsg = stream() << "v2.8 mongod is incompatible with v2.6 mongos, "
-                                         << "a v2.6 mongos may be running in the v2.8 cluster at "
+                string errMsg = stream() << "v3.0 mongod is incompatible with v2.6 mongos, "
+                                         << "a v2.6 mongos may be running in the v3.0 cluster at "
                                          << txn->getClient()->clientAddress(false);
                 error() << errMsg;
                 return appendCommandStatus(result, Status(ErrorCodes::ProtocolError, errMsg));
@@ -1005,7 +1028,7 @@ namespace mongo {
             
             // step 1
 
-            lastError.disableForCommand();
+            LastError::get(txn->getClient()).disable();
             ShardedConnectionInfo* info = ShardedConnectionInfo::get( true );
 
             bool authoritative = cmdObj.getBoolField( "authoritative" );
@@ -1224,7 +1247,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                     ActionType::getShardVersion)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -1235,28 +1258,44 @@ namespace mongo {
             return parseNsFullyQualified(dbname, cmdObj);
         }
 
-        bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            string ns = cmdObj["getShardVersion"].valuestrsafe();
-            if ( ns.size() == 0 ) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
+            const string ns = cmdObj["getShardVersion"].valuestrsafe();
+            if (ns.size() == 0) {
                 errmsg = "need to specify full namespace";
                 return false;
             }
 
-            result.append( "configServer" , shardingState.getConfigServer() );
+            if (shardingState.enabled()) {
+                result.append("configServer", shardingState.getConfigServer());
+            }
+            else {
+                result.append("configServer", "");
+            }
 
-            result.appendTimestamp( "global" , shardingState.getVersion(ns).toLong() );
+            result.appendTimestamp("global", shardingState.getVersion(ns).toLong());
 
-            ShardedConnectionInfo* info = ShardedConnectionInfo::get( false );
-            result.appendBool( "inShardedMode" , info != 0 );
-            if ( info )
-                result.appendTimestamp( "mine" , info->getVersion(ns).toLong() );
-            else
-                result.appendTimestamp( "mine" , 0 );
+            ShardedConnectionInfo* const info = ShardedConnectionInfo::get(false);
+            result.appendBool("inShardedMode", info != NULL);
+            if (info) {
+                result.appendTimestamp("mine", info->getVersion(ns).toLong());
+            }
+            else {
+                result.appendTimestamp("mine", 0);
+            }
 
-            if ( cmdObj["fullMetadata"].trueValue() ) {
-                CollectionMetadataPtr metadata = shardingState.getCollectionMetadata( ns );
-                if ( metadata ) result.append( "metadata", metadata->toBSON() );
-                else result.append( "metadata", BSONObj() );
+            if (cmdObj["fullMetadata"].trueValue()) {
+                CollectionMetadataPtr metadata = shardingState.getCollectionMetadata(ns);
+                if (metadata) {
+                    result.append("metadata", metadata->toBSON());
+                }
+                else {
+                    result.append("metadata", BSONObj());
+                }
             }
 
             return true;
@@ -1278,10 +1317,15 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            Client::Context ctx(txn, dbname);
+            OldClientContext ctx(txn, dbname);
 
             shardingState.appendInfo( result );
             return true;
@@ -1323,6 +1367,11 @@ namespace mongo {
         // TODO : all collections at some point, be sharded or not, will have a version
         //  (and a CollectionMetadata)
         received = info->getVersion( ns );
+
+        if (ChunkVersion::isIgnoredVersion(received)) {
+            return true;
+        }
+
         wanted = shardingState.getVersion( ns );
 
         if( received.isWriteCompatibleWith( wanted ) ) return true;
@@ -1385,4 +1434,12 @@ namespace mongo {
 
     void usingAShardConnection( const string& addr ) {
     }
+
+    void saveGLEStats(const BSONObj& result, const std::string& conn) {
+        // Declared in cluster_last_error_info.h.
+        //
+        // This can be called in mongod, which is unfortunate.  To fix this,
+        // we can redesign how connection pooling works on mongod for sharded operations.
+    }
+
 }

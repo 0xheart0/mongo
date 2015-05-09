@@ -32,12 +32,12 @@
 #include <iostream>
 #include <iomanip>
 #include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/base/init.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/client/native_sasl_client_session.h"
 #include "mongo/client/sasl_scramsha1_client_conversation.h"
-#include "mongo/client/syncclusterconnection.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine_v8.h"
@@ -48,6 +48,8 @@
 #include "mongo/util/text.h"
 
 using namespace std;
+using boost::scoped_array;
+using boost::shared_ptr;
 
 namespace mongo {
 
@@ -109,6 +111,7 @@ namespace mongo {
             mongo = scope->createV8Function(mongoConsExternal);
         mongo->InstanceTemplate()->SetInternalFieldCount(1);
         v8::Handle<v8::ObjectTemplate> proto = mongo->PrototypeTemplate();
+        scope->injectV8Method("runCommand", mongoRunCommand, proto);
         scope->injectV8Method("find", mongoFind, proto);
         scope->injectV8Method("insert", mongoInsert, proto);
         scope->injectV8Method("remove", mongoRemove, proto);
@@ -127,13 +130,10 @@ namespace mongo {
 
 
     v8::Handle<v8::Value> mongoConsExternal(V8Scope* scope, const v8::Arguments& args) {
-        char host[255];
+        string host = "127.0.0.1";
         if (args.Length() > 0 && args[0]->IsString()) {
-            uassert(16666, "string argument too long", args[0]->ToString()->Utf8Length() < 250);
-            args[0]->ToString()->WriteAscii(host);
-        }
-        else {
-            strcpy(host, "127.0.0.1");
+            v8::String::Utf8Value utf(args[0]);
+            host = string(*utf);
         }
 
         // only allow function template to be used by a constructor
@@ -192,6 +192,24 @@ namespace mongo {
             static_cast<boost::shared_ptr<DBClientBase>*>(c->Value());
         massert(16667, "Unable to get db client connection", conn && conn->get());
         return *conn;
+    }
+
+    /**
+     * JavaScript binding for Mongo.prototype.runCommand(database, cmdObj, queryOptions)
+     */
+    v8::Handle<v8::Value> mongoRunCommand(V8Scope* scope, const v8::Arguments& args) {
+        argumentCheck(args.Length() == 3, "runCommand needs 3 args");
+        argumentCheck(args[0]->IsString(), "the database parameter to runCommand must be a string");
+        argumentCheck(args[1]->IsObject(), "the cmdObj parameter to runCommand must be an object");
+        argumentCheck(args[2]->IsNumber(), "the options parameter to runCommand must be a number");
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
+        const string database = toSTLString(args[0]);
+        BSONObj cmdObj = scope->v8ToMongo(args[1]->ToObject());
+        int queryOptions = args[2]->Int32Value();
+        BSONObj cmdRes;
+        conn->runCommand(database, cmdObj, cmdRes, queryOptions);
+        // the returned object is not read only as some of our tests depend on modifying it.
+        return scope->mongoToLZV8(cmdRes, false /* read only */);
     }
 
     /**
@@ -847,7 +865,7 @@ namespace mongo {
                 return v8AssertionException("Timestamp increment must be a number");
             }
             int64_t t = args[0]->IntegerValue();
-            int64_t largestVal = int64_t(OpTime::max().getSecs());
+            int64_t largestVal = int64_t(Timestamp::max().getSecs());
             if( t > largestVal )
                 return v8AssertionException( str::stream()
                         << "The first argument must be in seconds; "
@@ -883,8 +901,9 @@ namespace mongo {
         // uassert if invalid base64 string
         string tmpBase64 = base64::decode(*utf);
         // length property stores the decoded length
-        it->ForceSet(scope->v8StringData("len"), v8::Number::New(tmpBase64.length()));
-        it->ForceSet(scope->v8StringData("type"), type);
+        it->ForceSet(scope->v8StringData("len"), v8::Number::New(tmpBase64.length()),
+                     v8::PropertyAttribute::ReadOnly);
+        it->ForceSet(scope->v8StringData("type"), type, v8::PropertyAttribute::ReadOnly);
         it->SetInternalField(0, args[1]);
 
         return it;
@@ -911,15 +930,14 @@ namespace mongo {
     v8::Handle<v8::Value> binDataToHex(V8Scope* scope, const v8::Arguments& args) {
         v8::Handle<v8::Object> it = args.This();
         verify(scope->BinDataFT()->HasInstance(it));
-        int len = v8::Handle<v8::Number>::Cast(it->Get(v8::String::New("len")))->Int32Value();
         verify(it->InternalFieldCount() == 1);
         string data = base64::decode(toSTLString(it->GetInternalField(0)));
         stringstream ss;
         ss.setf (ios_base::hex, ios_base::basefield);
         ss.fill ('0');
         ss.setf (ios_base::right, ios_base::adjustfield);
-        for(int i = 0; i < len; i++) {
-            unsigned v = (unsigned char) data[i];
+        for(std::string::iterator it = data.begin(); it != data.end(); ++it) {
+            unsigned v = (unsigned char) *it;
             ss << setw(2) << v;
         }
         return v8::String::New(ss.str().c_str());

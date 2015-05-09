@@ -1,5 +1,3 @@
-// parallel.h
-
 /*    Copyright 2009 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
@@ -33,56 +31,21 @@
 
 #pragma once
 
-#include "mongo/client/export_macros.h"
-#include "mongo/db/dbmessage.h"
-#include "mongo/db/matcher/matcher.h"
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/shard.h"
-#include "mongo/util/concurrency/mvar.h"
+#include "mongo/s/client/shard_connection.h"
 
 namespace mongo {
 
-    class StaleConfigException;
-
-    /**
-     * holder for a server address and a query to run
-     */
-    class MONGO_CLIENT_API ServerAndQuery {
-    public:
-        ServerAndQuery( const std::string& server , BSONObj extra = BSONObj() , BSONObj orderObject = BSONObj() ) :
-            _server( server ) , _extra( extra.getOwned() ) , _orderObject( orderObject.getOwned() ) {
-        }
-
-        bool operator<( const ServerAndQuery& other ) const {
-            if ( ! _orderObject.isEmpty() )
-                return _orderObject.woCompare( other._orderObject ) < 0;
-
-            if ( _server < other._server )
-                return true;
-            if ( other._server > _server )
-                return false;
-            return _extra.woCompare( other._extra ) < 0;
-        }
-
-        std::string toString() const {
-            StringBuilder ss;
-            ss << "server:" << _server << " _extra:" << _extra.toString() << " _orderObject:" << _orderObject.toString();
-            return ss.str();
-        }
-
-        operator std::string() const {
-            return toString();
-        }
-
-        std::string _server;
-        BSONObj _extra;
-        BSONObj _orderObject;
-    };
-
-    class ParallelConnectionMetadata;
     class DBClientCursorHolder;
+    class Shard;
+    class StaleConfigException;
+    class ParallelConnectionMetadata;
 
-    class MONGO_CLIENT_API CommandInfo {
+
+    class CommandInfo {
     public:
         std::string versionedNS;
         BSONObj cmdFilter;
@@ -99,12 +62,10 @@ namespace mongo {
         }
     };
 
-    typedef shared_ptr<ShardConnection> ShardConnectionPtr;
-
     class DBClientCursor;
-    typedef shared_ptr<DBClientCursor> DBClientCursorPtr;
+    typedef boost::shared_ptr<DBClientCursor> DBClientCursorPtr;
 
-    class MONGO_CLIENT_API ParallelConnectionState {
+    class ParallelConnectionState {
     public:
 
         ParallelConnectionState() :
@@ -117,7 +78,7 @@ namespace mongo {
 
         // Version information
         ChunkManagerPtr manager;
-        ShardPtr primary;
+        boost::shared_ptr<Shard> primary;
 
         // Cursor status information
         long long count;
@@ -131,9 +92,9 @@ namespace mongo {
     };
 
     typedef ParallelConnectionState PCState;
-    typedef shared_ptr<PCState> PCStatePtr;
+    typedef boost::shared_ptr<PCState> PCStatePtr;
 
-    class MONGO_CLIENT_API ParallelConnectionMetadata {
+    class ParallelConnectionMetadata {
     public:
 
         ParallelConnectionMetadata() :
@@ -163,7 +124,7 @@ namespace mongo {
     };
 
     typedef ParallelConnectionMetadata PCMData;
-    typedef shared_ptr<PCMData> PCMDataPtr;
+    typedef boost::shared_ptr<PCMData> PCMDataPtr;
 
     /**
      * Runs a query in parallel across N servers, enforcing compatible chunk versions for queries
@@ -177,13 +138,13 @@ namespace mongo {
      * There is a deprecated legacy mode as well which effectively does a merge-sort across a number
      * of servers, but does not correctly enforce versioning (used only in mapreduce).
      */
-    class MONGO_CLIENT_API ParallelSortClusteredCursor {
+    class ParallelSortClusteredCursor {
     public:
 
         ParallelSortClusteredCursor( const QuerySpec& qSpec, const CommandInfo& cInfo = CommandInfo() );
 
         // DEPRECATED legacy constructor for pure mergesort functionality - do not use
-        ParallelSortClusteredCursor( const std::set<ServerAndQuery>& servers , const std::string& ns ,
+        ParallelSortClusteredCursor( const std::set<std::string>& servers , const std::string& ns ,
                                      const Query& q , int options=0, const BSONObj& fields=BSONObj() );
 
         ~ParallelSortClusteredCursor();
@@ -205,6 +166,11 @@ namespace mongo {
         bool isExplain(){ return _qSpec.isExplain(); }
 
         /**
+         * Sets the batch size on all underlying cursors to 'newBatchSize'.
+         */
+        void setBatchSize(int newBatchSize);
+
+        /**
          * Returns whether the collection was sharded when the cursors were established.
          */
         bool isSharded();
@@ -223,13 +189,13 @@ namespace mongo {
          * Returns the single shard with an open cursor.
          * It is an error to call this if getNumQueryShards() > 1
          */
-        ShardPtr getQueryShard();
+        boost::shared_ptr<Shard> getQueryShard();
 
         /**
          * Returns primary shard with an open cursor.
          * It is an error to call this if the collection is sharded.
          */
-        ShardPtr getPrimary();
+        boost::shared_ptr<Shard> getPrimary();
 
         ChunkManagerPtr getChunkManager( const Shard& shard );
         DBClientCursorPtr getShardCursor( const Shard& shard );
@@ -262,7 +228,7 @@ namespace mongo {
         // LEGACY BELOW
         int _numServers;
         int _lastFrom;
-        std::set<ServerAndQuery> _servers;
+        std::set<std::string> _servers;
         BSONObj _sortKey;
 
         DBClientCursorHolder * _cursors;
@@ -275,7 +241,7 @@ namespace mongo {
          */
         void setupVersionAndHandleSlaveOk( PCStatePtr state /* in & out */,
                            const Shard& shard,
-                           ShardPtr primary /* in */,
+                           boost::shared_ptr<Shard> primary /* in */,
                            const NamespaceString& ns,
                            const std::string& vinfo,
                            ChunkManagerPtr manager /* in */ );
@@ -298,7 +264,7 @@ namespace mongo {
      * TODO:  Choose one set of ownership semantics so that this isn't needed - merge sort via
      * mapreduce is the main issue since it has no metadata and this holder owns the cursors.
      */
-    class MONGO_CLIENT_API DBClientCursorHolder {
+    class DBClientCursorHolder {
     public:
 
         DBClientCursorHolder() {}
@@ -331,7 +297,7 @@ namespace mongo {
      * right now uses underlying sync network ops and uses another thread
      * should be changed to use non-blocking io
      */
-    class MONGO_CLIENT_API Future {
+    class Future {
     public:
         class CommandResult {
         public:
@@ -371,10 +337,10 @@ namespace mongo {
             int _options;
             BSONObj _cmd;
             DBClientBase * _conn;
-            scoped_ptr<AScopedConnection> _connHolder; // used if not provided a connection
+            boost::scoped_ptr<AScopedConnection> _connHolder; // used if not provided a connection
             bool _useShardConn;
 
-            scoped_ptr<DBClientCursor> _cursor;
+            boost::scoped_ptr<DBClientCursor> _cursor;
 
             BSONObj _res;
             bool _ok;
@@ -391,14 +357,13 @@ namespace mongo {
          * @param conn optional connection to use.  will use standard pooled if non-specified
          * @param useShardConn use ShardConnection
          */
-        static shared_ptr<CommandResult> spawnCommand( const std::string& server,
+        static boost::shared_ptr<CommandResult> spawnCommand( const std::string& server,
                                                        const std::string& db,
                                                        const BSONObj& cmd,
                                                        int options,
                                                        DBClientBase * conn = 0,
                                                        bool useShardConn = false );
     };
-
 
 }
 

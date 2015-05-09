@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -29,7 +30,7 @@ __rename_file(
 		return (EINVAL);
 
 	/* Close any btree handles in the file. */
-	WT_WITH_DHANDLE_LOCK(session,
+	WT_WITH_HANDLE_LIST_LOCK(session,
 	    ret = __wt_conn_dhandle_close_all(session, uri, 0));
 	WT_ERR(ret);
 
@@ -163,10 +164,10 @@ __rename_tree(WT_SESSION_IMPL *session,
 	/* Rename the file. */
 	WT_ERR(__wt_schema_rename(session, os->data, ns->data, cfg));
 
-err:	__wt_scr_free(&nn);
-	__wt_scr_free(&ns);
-	__wt_scr_free(&nv);
-	__wt_scr_free(&os);
+err:	__wt_scr_free(session, &nn);
+	__wt_scr_free(session, &ns);
+	__wt_scr_free(session, &nv);
+	__wt_scr_free(session, &os);
 	__wt_free(session, value);
 	table->name = olduri;
 	return (ret);
@@ -273,7 +274,7 @@ __wt_schema_rename(WT_SESSION_IMPL *session,
 	/* Bump the schema generation so that stale data is ignored. */
 	++S2C(session)->schema_gen;
 
-	WT_TRET(__wt_meta_track_off(session, ret != 0));
+	WT_TRET(__wt_meta_track_off(session, 1, ret != 0));
 
 	/* If we didn't find a metadata entry, map that error to ENOENT. */
 	return (ret == WT_NOTFOUND ? ENOENT : ret);

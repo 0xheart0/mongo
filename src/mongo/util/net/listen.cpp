@@ -34,8 +34,13 @@
 
 #include "mongo/util/net/listen.h"
 
+#include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
+
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/message_port.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -43,7 +48,7 @@
 
 #ifndef _WIN32
 
-# ifndef __sunos__
+# ifndef __sun
 #  include <ifaddrs.h>
 # endif
 # include <sys/resource.h>
@@ -57,7 +62,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
-#ifdef __openbsd__
+#ifdef __OpenBSD__
 # include <sys/uio.h>
 #endif
 
@@ -70,6 +75,11 @@
 #endif
 
 namespace mongo {
+
+    using boost::shared_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     // ----- Listener -------
 
@@ -117,7 +127,7 @@ namespace mongo {
     Listener::Listener(const string& name, const string &ip, int port, bool logConnect ) 
         : _port(port), _name(name), _ip(ip), _setupSocketsSuccessful(false),
           _logConnect(logConnect), _elapsedTime(0) {
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         _ssl = getSSLManager();
 #endif
     }
@@ -155,10 +165,10 @@ namespace mongo {
             if (me.getType() == AF_UNIX) {
 #if !defined(_WIN32)
                 if (unlink(me.getAddr().c_str()) == -1) {
-                    int x = errno;
-                    if (x != ENOENT) {
-                        log() << "couldn't unlink socket file " << me << errnoWithDescription(x) << " skipping" << endl;
-                        continue;
+                    if (errno != ENOENT) {
+                        error() << "Failed to unlink socket file " << me << " "
+                                << errnoWithDescription(errno);
+                        fassertFailedNoTrace(28578);
                     }
                 }
 #endif
@@ -189,7 +199,9 @@ namespace mongo {
 #if !defined(_WIN32)
             if (me.getType() == AF_UNIX) {
                 if (chmod(me.getAddr().c_str(), serverGlobalParams.unixSocketPermissions) == -1) {
-                    error() << "couldn't chmod socket file " << me << errnoWithDescription() << endl;
+                    error() << "Failed to chmod socket file " << me << " "
+                            << errnoWithDescription(errno);
+                    fassertFailedNoTrace(28582);
                 }
                 ListeningSockets::get()->addPath( me.getAddr() );
             }
@@ -229,7 +241,7 @@ namespace mongo {
             return;
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         _logListen(_port, _ssl);
 #else
         _logListen(_port, false);
@@ -278,7 +290,7 @@ namespace mongo {
             }
 
 #if defined(__linux__)
-            _elapsedTime += max(ret, (int)(( 10000 - maxSelectTime.tv_usec ) / 1000));
+            _elapsedTime += std::max(ret, (int)(( 10000 - maxSelectTime.tv_usec ) / 1000));
 #else
             _elapsedTime += ret; // assume 1ms to grab connection. very rough
 #endif
@@ -329,7 +341,7 @@ namespace mongo {
                 }
                 
                 boost::shared_ptr<Socket> pnewSock( new Socket(s, from) );
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
                 if (_ssl) {
                     pnewSock->secureAccepted(_ssl);
                 }
@@ -404,7 +416,7 @@ namespace mongo {
             ListeningSockets::get()->add(_socks[i]);
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         _logListen(_port, _ssl);
 #else
         _logListen(_port, false);
@@ -546,7 +558,7 @@ namespace mongo {
             }
             
             boost::shared_ptr<Socket> pnewSock( new Socket(s, from) );
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
             if (_ssl) {
                 pnewSock->secureAccepted(_ssl);
             }
@@ -632,7 +644,7 @@ namespace mongo {
         std::set<std::string>* paths;
 
         {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             sockets = _sockets;
             _sockets = new std::set<int>();
             paths = _socketPaths;

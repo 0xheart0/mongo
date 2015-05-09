@@ -30,7 +30,10 @@
 
 #include "mongo/db/pipeline/document_source.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
@@ -39,8 +42,11 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/s/d_state.h"
 
-
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::shared_ptr;
+    using std::string;
 
     DocumentSourceCursor::~DocumentSourceCursor() {
         dispose();
@@ -120,7 +126,7 @@ namespace mongo {
                 state != PlanExecutor::DEAD);
 
         uassert(17285, "cursor encountered an error: " + WorkingSetCommon::toStatusString(obj),
-                state != PlanExecutor::EXEC_ERROR);
+                state != PlanExecutor::FAILURE);
 
         massert(17286, str::stream() << "Unexpected return from PlanExecutor::getNext: " << state,
                 state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);

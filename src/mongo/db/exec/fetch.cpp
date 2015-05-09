@@ -26,9 +26,12 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/exec/fetch.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -37,6 +40,9 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::vector;
 
     // static
     const char* FetchStage::kStageType = "FETCH";
@@ -51,13 +57,13 @@ namespace mongo {
           _ws(ws),
           _child(child),
           _filter(filter),
-          _idBeingPagedIn(WorkingSet::INVALID_ID),
+          _idRetrying(WorkingSet::INVALID_ID),
           _commonStats(kStageType) { }
 
     FetchStage::~FetchStage() { }
 
     bool FetchStage::isEOF() {
-        if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
+        if (WorkingSet::INVALID_ID != _idRetrying) {
             // We asked the parent for a page-in, but still haven't had a chance to return the
             // paged in document
             return false;
@@ -74,21 +80,17 @@ namespace mongo {
 
         if (isEOF()) { return PlanStage::IS_EOF; }
 
-        // We might have a fetched result to return.
-        if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-            WorkingSetID id = _idBeingPagedIn;
-            _idBeingPagedIn = WorkingSet::INVALID_ID;
-            WorkingSetMember* member = _ws->get(id);
-
-            WorkingSetCommon::completeFetch(_txn, member, _collection);
-
-            return returnIfMatches(member, id, out);
+        // Either retry the last WSM we worked on or get a new one from our child.
+        WorkingSetID id;
+        StageState status;
+        if (_idRetrying == WorkingSet::INVALID_ID) {
+            status = _child->work(&id);
         }
-
-        // If we're here, we're not waiting for a RecordId to be fetched.  Get another to-be-fetched
-        // result from our child.
-        WorkingSetID id = WorkingSet::INVALID_ID;
-        StageState status = _child->work(&id);
+        else {
+            status = ADVANCED;
+            id = _idRetrying;
+            _idRetrying = WorkingSet::INVALID_ID;
+        }
 
         if (PlanStage::ADVANCED == status) {
             WorkingSetMember* member = _ws->get(id);
@@ -103,26 +105,34 @@ namespace mongo {
                 verify(member->hasLoc());
 
                 // We might need to retrieve 'nextLoc' from secondary storage, in which case we send
-                // a NEED_FETCH request up to the PlanExecutor.
-                if (!member->loc.isNull()) {
-                    std::auto_ptr<RecordFetcher> fetcher(
-                        _collection->documentNeedsFetch(_txn, member->loc));
-                    if (NULL != fetcher.get()) {
-                        // There's something to fetch. Hand the fetcher off to the WSM, and pass up
-                        // a fetch request.
-                        _idBeingPagedIn = id;
-                        member->setFetcher(fetcher.release());
-                        *out = id;
-                        _commonStats.needFetch++;
-                        return NEED_FETCH;
-                    }
+                // a NEED_YIELD request up to the PlanExecutor.
+                std::auto_ptr<RecordFetcher> fetcher(_collection->documentNeedsFetch(_txn,
+                                                                                     member->loc));
+                if (NULL != fetcher.get()) {
+                    // There's something to fetch. Hand the fetcher off to the WSM, and pass up
+                    // a fetch request.
+                    _idRetrying = id;
+                    member->setFetcher(fetcher.release());
+                    *out = id;
+                    _commonStats.needYield++;
+                    return NEED_YIELD;
                 }
 
                 // The doc is already in memory, so go ahead and grab it. Now we have a RecordId
                 // as well as an unowned object
-                member->obj = _collection->docFor(_txn, member->loc);
-                member->keyData.clear();
-                member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
+                try {
+                    if (!WorkingSetCommon::fetch(_txn, member, _collection)) {
+                        _ws->free(id);
+                        _commonStats.needTime++;
+                        return NEED_TIME;
+                    }
+                }
+                catch (const WriteConflictException& wce) {
+                    _idRetrying = id;
+                    *out = WorkingSet::INVALID_ID;
+                    _commonStats.needYield++;
+                    return NEED_YIELD;
+                }
             }
 
             return returnIfMatches(member, id, out);
@@ -143,8 +153,8 @@ namespace mongo {
         else if (PlanStage::NEED_TIME == status) {
             ++_commonStats.needTime;
         }
-        else if (PlanStage::NEED_FETCH == status) {
-            ++_commonStats.needFetch;
+        else if (PlanStage::NEED_YIELD == status) {
+            ++_commonStats.needYield;
             *out = id;
         }
 
@@ -171,8 +181,8 @@ namespace mongo {
 
         // It's possible that the loc getting invalidated is the one we're about to
         // fetch. In this case we do a "forced fetch" and put the WSM in owned object state.
-        if (WorkingSet::INVALID_ID != _idBeingPagedIn) {
-            WorkingSetMember* member = _ws->get(_idBeingPagedIn);
+        if (WorkingSet::INVALID_ID != _idRetrying) {
+            WorkingSetMember* member = _ws->get(_idRetrying);
             if (member->hasLoc() && (member->loc == dl)) {
                 // Fetch it now and kill the diskloc.
                 WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
@@ -183,6 +193,20 @@ namespace mongo {
     PlanStage::StageState FetchStage::returnIfMatches(WorkingSetMember* member,
                                                       WorkingSetID memberID,
                                                       WorkingSetID* out) {
+        // We consider "examining a document" to be every time that we pass a document through
+        // a filter by calling Filter::passes(...) below. Therefore, the 'docsExamined' metric
+        // is not always equal to the number of documents that were fetched from the collection.
+        // In particular, we can sometimes generate plans which have two fetch stages. The first
+        // one actually grabs the document from the collection, and the second passes the
+        // document through a second filter.
+        //
+        // One common example of this is geoNear. Suppose that a geoNear plan is searching an
+        // annulus to find 2dsphere-indexed documents near some point (x, y) on the globe.
+        // After fetching documents within geo hashes that intersect this annulus, the docs are
+        // fetched and filtered to make sure that they really do fall into this annulus. However,
+        // the user might also want to find only those documents for which accommodationType==
+        // "restaurant". The planner will add a second fetch stage to filter by this non-geo
+        // predicate.
         ++_specificStats.docsExamined;
 
         if (Filter::passes(member, _filter)) {
@@ -225,11 +249,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* FetchStage::getCommonStats() {
+    const CommonStats* FetchStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* FetchStage::getSpecificStats() {
+    const SpecificStats* FetchStage::getSpecificStats() const {
         return &_specificStats;
     }
 

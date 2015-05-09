@@ -27,6 +27,8 @@ var b_conn = conns[1];
 var AID = replTest.getNodeId(a_conn);
 var BID = replTest.getNodeId(b_conn);
 
+replTest.waitForState(replTest.nodes[0], replTest.PRIMARY, 60 * 1000);
+
 // get master and do an initial write
 var master = replTest.getMaster();
 assert(master === conns[0], "conns[0] assumed to be master");
@@ -62,7 +64,7 @@ assert.writeOK(a_conn.getDB(name).foo.insert({x: 2}, options));
 // restart B, which should rollback and log a message about not rolling back the nonexistent cmd
 clearRawMongoProgramOutput();
 replTest.restart(BID);
-var msg = RegExp("replSet warning rollback no such command ");
+var msg = RegExp("rollback no such command ");
 assert.soon(function() {
     return rawMongoProgramOutput().match(msg);
 }, "Did not see a log entry about skipping the nonexistent command during rollback");

@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -127,8 +128,9 @@ __session_close(WT_SESSION *wt_session, const char *config)
 	/* Discard metadata tracking. */
 	__wt_meta_track_discard(session);
 
-	/* Discard scratch buffers. */
+	/* Discard scratch buffers, error memory. */
 	__wt_scr_discard(session);
+	__wt_buf_free(session, &session->err);
 
 	/* Free transaction information. */
 	__wt_txn_destroy(session);
@@ -141,9 +143,6 @@ __session_close(WT_SESSION *wt_session, const char *config)
 		WT_TRET(session->block_manager_cleanup(session));
 	if (session->reconcile_cleanup != NULL)
 		WT_TRET(session->reconcile_cleanup(session));
-
-	/* Free the eviction exclusive-lock information. */
-	__wt_free(session, session->excl);
 
 	/* Destroy the thread's mutex. */
 	WT_TRET(__wt_cond_destroy(session, &session->cond));
@@ -247,7 +246,7 @@ __wt_open_cursor(WT_SESSION_IMPL *session,
 			 * the underlying data source.
 			 */
 			WT_RET(__wt_schema_get_colgroup(
-			    session, uri, NULL, &colgroup));
+			    session, uri, 0, NULL, &colgroup));
 			WT_RET(__wt_open_cursor(
 			    session, colgroup->source, owner, cfg, cursorp));
 		} else if (WT_PREFIX_MATCH(uri, "config:"))
@@ -386,7 +385,7 @@ __wt_session_create_strip(WT_SESSION *wt_session,
 {
 	WT_SESSION_IMPL *session = (WT_SESSION_IMPL *)wt_session;
 	const char *cfg[] =
-	    { WT_CONFIG_BASE(session, session_create), v1, v2, NULL };
+	    { WT_CONFIG_BASE(session, WT_SESSION_create), v1, v2, NULL };
 
 	return (__wt_config_collapse(session, cfg, value_ret));
 }
@@ -547,9 +546,12 @@ __session_salvage(WT_SESSION *wt_session, const char *uri, const char *config)
 	session = (WT_SESSION_IMPL *)wt_session;
 
 	SESSION_API_CALL(session, salvage, config, cfg);
-	WT_WITH_SCHEMA_LOCK(session,
-	    ret = __wt_schema_worker(session, uri, __wt_salvage,
-	    NULL, cfg, WT_DHANDLE_EXCLUSIVE | WT_BTREE_SALVAGE));
+
+	/* Block out checkpoints to avoid spurious EBUSY errors. */
+	WT_WITH_CHECKPOINT_LOCK(session,
+	    WT_WITH_SCHEMA_LOCK(session, ret =
+		__wt_schema_worker(session, uri, __wt_salvage,
+		NULL, cfg, WT_DHANDLE_EXCLUSIVE | WT_BTREE_SALVAGE)));
 
 err:	API_END_RET_NOTFOUND_MAP(session, ret);
 }
@@ -565,7 +567,9 @@ __session_truncate(WT_SESSION *wt_session,
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
 	WT_CURSOR *cursor;
-	int cmp;
+	int cmp, local_start;
+
+	local_start = 0;
 
 	session = (WT_SESSION_IMPL *)wt_session;
 	SESSION_TXN_API_CALL(session, truncate, config, cfg);
@@ -602,8 +606,10 @@ __session_truncate(WT_SESSION *wt_session,
 				    "target after the log: URI prefix.");
 			ret = __wt_log_truncate_files(session, start, cfg);
 		} else
-			WT_WITH_SCHEMA_LOCK(session,
-			    ret = __wt_schema_truncate(session, uri, cfg));
+			/* Wait for checkpoints to avoid EBUSY errors. */
+			WT_WITH_CHECKPOINT_LOCK(session,
+			    WT_WITH_SCHEMA_LOCK(session,
+				ret = __wt_schema_truncate(session, uri, cfg)));
 		goto done;
 	}
 
@@ -637,9 +643,7 @@ __session_truncate(WT_SESSION *wt_session,
 	 * what records currently appear in the object.  For this reason, do a
 	 * search-near, rather than a search.  Additionally, we have to correct
 	 * after calling search-near, to position the start/stop cursors on the
-	 * next record greater than/less than the original key.  If the cursors
-	 * hit the beginning/end of the object, or the start/stop keys cross,
-	 * we're done, the range must be empty.
+	 * next record greater than/less than the original key.
 	 */
 	if (start != NULL) {
 		WT_ERR(start->search_near(start, &cmp));
@@ -654,19 +658,45 @@ __session_truncate(WT_SESSION *wt_session,
 			WT_ERR_NOTFOUND_OK(ret);
 			goto done;
 		}
+	}
 
-		if (start != NULL) {
-			WT_ERR(start->compare(start, stop, &cmp));
-			if (cmp > 0)
-				goto done;
-		}
+	/*
+	 * We always truncate in the forward direction because the underlying
+	 * data structures can move through pages faster forward than backward.
+	 * If we don't have a start cursor, create one and position it at the
+	 * first record.
+	 */
+	if (start == NULL) {
+		WT_ERR(__session_open_cursor(
+		    wt_session, stop->uri, NULL, NULL, &start));
+		local_start = 1;
+		WT_ERR(start->next(start));
+	}
+
+	/*
+	 * If the start/stop keys cross, we're done, the range must be empty.
+	 */
+	if (stop != NULL) {
+		WT_ERR(start->compare(start, stop, &cmp));
+		if (cmp > 0)
+			goto done;
 	}
 
 	WT_ERR(__wt_schema_range_truncate(session, start, stop));
 
 done:
 err:	TXN_API_END_RETRY(session, ret, 0);
-	return ((ret) == WT_NOTFOUND ? ENOENT : (ret));
+
+	/*
+	 * Close any locally-opened start cursor.
+	 */
+	if (local_start)
+		WT_TRET(start->close(start));
+
+	/*
+	 * Only map WT_NOTFOUND to ENOENT if a URI was specified.
+	 */
+	return (ret == WT_NOTFOUND && uri != NULL ? ENOENT : ret);
 }
 
 /*
@@ -682,9 +712,11 @@ __session_upgrade(WT_SESSION *wt_session, const char *uri, const char *config)
 	session = (WT_SESSION_IMPL *)wt_session;
 
 	SESSION_API_CALL(session, upgrade, config, cfg);
-	WT_WITH_SCHEMA_LOCK(session,
-	    ret = __wt_schema_worker(session, uri, __wt_upgrade,
-	    NULL, cfg, WT_DHANDLE_EXCLUSIVE | WT_BTREE_UPGRADE));
+	/* Block out checkpoints to avoid spurious EBUSY errors. */
+	WT_WITH_CHECKPOINT_LOCK(session,
+	    WT_WITH_SCHEMA_LOCK(session,
+		ret = __wt_schema_worker(session, uri, __wt_upgrade,
+		NULL, cfg, WT_DHANDLE_EXCLUSIVE | WT_BTREE_UPGRADE)));
 
 err:	API_END_RET_NOTFOUND_MAP(session, ret);
 }
@@ -702,9 +734,11 @@ __session_verify(WT_SESSION *wt_session, const char *uri, const char *config)
 	session = (WT_SESSION_IMPL *)wt_session;
 
 	SESSION_API_CALL(session, verify, config, cfg);
-	WT_WITH_SCHEMA_LOCK(session,
-	    ret = __wt_schema_worker(session, uri, __wt_verify,
-	    NULL, cfg, WT_DHANDLE_EXCLUSIVE | WT_BTREE_VERIFY));
+	/* Block out checkpoints to avoid spurious EBUSY errors. */
+	WT_WITH_CHECKPOINT_LOCK(session,
+	    WT_WITH_SCHEMA_LOCK(session,
+		ret = __wt_schema_worker(session, uri, __wt_verify,
+		NULL, cfg, WT_DHANDLE_EXCLUSIVE | WT_BTREE_VERIFY)));
 
 err:	API_END_RET_NOTFOUND_MAP(session, ret);
 }
@@ -725,13 +759,6 @@ __session_begin_transaction(WT_SESSION *wt_session, const char *config)
 
 	if (F_ISSET(&session->txn, TXN_RUNNING))
 		WT_ERR_MSG(session, EINVAL, "Transaction already running");
-
-	/*
-	 * There is no transaction active in this thread; check if the cache is
-	 * full, if we have to block for eviction, this is the best time to do
-	 * it.
-	 */
-	WT_ERR(__wt_cache_full_check(session));
 
 	ret = __wt_txn_begin(session, cfg);
 
@@ -881,17 +908,29 @@ __session_checkpoint(WT_SESSION *wt_session, const char *config)
 	 * here to ensure we don't get into trouble.
 	 */
 	WT_STAT_FAST_CONN_SET(session, txn_checkpoint_running, 1);
-	__wt_spin_lock(session, &S2C(session)->checkpoint_lock);
 
-	ret = __wt_txn_checkpoint(session, cfg);
+	WT_WITH_CHECKPOINT_LOCK(session,
+	    ret = __wt_txn_checkpoint(session, cfg));
 
 	WT_STAT_FAST_CONN_SET(session, txn_checkpoint_running, 0);
-
-	__wt_spin_unlock(session, &S2C(session)->checkpoint_lock);
 
 err:	F_CLR(session, WT_SESSION_CAN_WAIT | WT_SESSION_NO_CACHE_CHECK);
 
 	API_END_RET_NOTFOUND_MAP(session, ret);
+}
+
+/*
+ * __session_strerror --
+ *	WT_SESSION->strerror method.
+ */
+static const char *
+__session_strerror(WT_SESSION *wt_session, int error)
+{
+	WT_SESSION_IMPL *session;
+
+	session = (WT_SESSION_IMPL *)wt_session;
+
+	return (__wt_strerror(session, error, NULL, 0));
 }
 
 /*
@@ -906,7 +945,7 @@ __wt_open_internal_session(WT_CONNECTION_IMPL *conn, const char *name,
 
 	*sessionp = NULL;
 
-	WT_RET(__wt_open_session(conn, NULL, NULL, &session));
+	WT_RET(__wt_open_session(conn, NULL, NULL, open_metadata, &session));
 	session->name = name;
 
 	/*
@@ -924,19 +963,6 @@ __wt_open_internal_session(WT_CONNECTION_IMPL *conn, const char *name,
 	if (!uses_dhandles)
 		F_SET(session, WT_SESSION_NO_DATA_HANDLES);
 
-	/*
-	 * Acquiring the metadata handle requires the schema lock; we've seen
-	 * problems in the past where a worker thread has acquired the schema
-	 * lock unexpectedly, relatively late in the run, and deadlocked. Be
-	 * defensive, get it now.  The metadata file may not exist when the
-	 * connection first creates its default session or the shared cache
-	 * pool creates its sessions, let our caller decline this work.
-	 */
-	if (open_metadata) {
-		WT_ASSERT(session, !F_ISSET(session, WT_SESSION_SCHEMA_LOCKED));
-		WT_RET(__wt_metadata_open(session));
-	}
-
 	*sessionp = session;
 	return (0);
 }
@@ -948,13 +974,15 @@ __wt_open_internal_session(WT_CONNECTION_IMPL *conn, const char *name,
  */
 int
 __wt_open_session(WT_CONNECTION_IMPL *conn,
-    WT_EVENT_HANDLER *event_handler, const char *config,
+    WT_EVENT_HANDLER *event_handler, const char *config, int open_metadata,
     WT_SESSION_IMPL **sessionp)
 {
 	static const WT_SESSION stds = {
 		NULL,
+		NULL,
 		__session_close,
 		__session_reconfigure,
+		__session_strerror,
 		__session_open_cursor,
 		__session_create,
 		__session_compact,
@@ -1022,6 +1050,20 @@ __wt_open_session(WT_CONNECTION_IMPL *conn,
 
 	TAILQ_INIT(&session_ret->cursors);
 	SLIST_INIT(&session_ret->dhandles);
+	/*
+	 * If we don't have one, allocate the dhandle hash array.
+	 * Allocate the table hash array as well.
+	 */
+	if (session_ret->dhhash == NULL)
+		WT_ERR(__wt_calloc(session_ret, WT_HASH_ARRAY_SIZE,
+		    sizeof(struct __dhandles_hash), &session_ret->dhhash));
+	if (session_ret->tablehash == NULL)
+		WT_ERR(__wt_calloc(session_ret, WT_HASH_ARRAY_SIZE,
+		    sizeof(struct __tables_hash), &session_ret->tablehash));
+	for (i = 0; i < WT_HASH_ARRAY_SIZE; i++) {
+		SLIST_INIT(&session_ret->dhhash[i]);
+		SLIST_INIT(&session_ret->tablehash[i]);
+	}
 
 	/* Initialize transaction support: default to read-committed. */
 	session_ret->isolation = TXN_ISO_READ_COMMITTED;
@@ -1068,5 +1110,20 @@ __wt_open_session(WT_CONNECTION_IMPL *conn,
 	WT_STAT_FAST_CONN_INCR(session, session_open);
 
 err:	__wt_spin_unlock(session, &conn->api_lock);
-	return (ret);
+	WT_RET(ret);
+
+	/*
+	 * Acquiring the metadata handle requires the schema lock; we've seen
+	 * problems in the past where a session has acquired the schema lock
+	 * unexpectedly, relatively late in the run, and deadlocked. Be
+	 * defensive, get it now.  The metadata file may not exist when the
+	 * connection first creates its default session or the shared cache
+	 * pool creates its sessions, let our caller decline this work.
+	 */
+	if (open_metadata) {
+		WT_ASSERT(session, !F_ISSET(session, WT_SESSION_LOCKED_SCHEMA));
+		WT_RET(__wt_metadata_open(session_ret));
+	}
+
+	return (0);
 }

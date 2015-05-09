@@ -34,12 +34,13 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/record_id.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/platform/unordered_set.h"
 
 namespace mongo {
 
+    class IndexAccessMethod;
     class RecordFetcher;
-
     class WorkingSetMember;
 
     typedef size_t WorkingSetID;
@@ -108,6 +109,58 @@ namespace mongo {
          */
         void clear();
 
+        //
+        // Iteration
+        //
+
+        /**
+         * Forward iterates over the list of working set members, skipping any entries
+         * that are on the free list.
+         */
+        class iterator {
+        public:
+            iterator(WorkingSet* ws, size_t index);
+
+            void operator++();
+
+            bool operator==(const WorkingSet::iterator& other) const;
+            bool operator!=(const WorkingSet::iterator& other) const;
+
+            WorkingSetMember& operator*();
+
+            WorkingSetMember* operator->();
+
+            /**
+             * Free the WSM we are currently pointing to. Does not advance the iterator.
+             *
+             * It is invalid to dereference the iterator after calling free until the iterator is
+             * next incremented.
+             */
+            void free();
+
+        private:
+            /**
+             * Move the iterator forward to the next allocated WSM.
+             */
+            void advance();
+
+            /**
+             * Returns true if the MemberHolder currently pointed at by the iterator is free, and
+             * false if it contains an allocated working set member.
+             */
+            bool isFree() const;
+
+            // The working set we're iterating over. Not owned here.
+            WorkingSet* _ws;
+
+            // The index of the member we're currently pointing at.
+            size_t _index;
+        };
+
+        WorkingSet::iterator begin();
+
+        WorkingSet::iterator end();
+
     private:
         struct MemberHolder {
             MemberHolder();
@@ -139,14 +192,18 @@ namespace mongo {
      * the key.
      */
     struct IndexKeyDatum {
-        IndexKeyDatum(const BSONObj& keyPattern, const BSONObj& key) : indexKeyPattern(keyPattern),
-                                                                       keyData(key) { }
+        IndexKeyDatum(const BSONObj& keyPattern, const BSONObj& key, const IndexAccessMethod* index)
+            : indexKeyPattern(keyPattern),
+              keyData(key),
+              index(index) { }
 
         // This is not owned and points into the IndexDescriptor's data.
         BSONObj indexKeyPattern;
 
         // This is the BSONObj for the key that we put into the index.  Owned by us.
         BSONObj keyData;
+
+        const IndexAccessMethod* index;
     };
 
     /**
@@ -220,6 +277,13 @@ namespace mongo {
             // RecordId has been invalidated, or the obj doesn't correspond to an on-disk document
             // anymore (e.g. is a computed expression).
             OWNED_OBJ,
+
+            // Due to a yield, RecordId is no longer protected by the storage engine's transaction
+            // and may have been invalidated. The object is either identical to the object keyed
+            // by RecordId, or is an old version of the document stored at RecordId.
+            //
+            // Only used by doc-level locking storage engines (not used by MMAP v1).
+            LOC_AND_OWNED_OBJ,
         };
 
         //
@@ -227,9 +291,13 @@ namespace mongo {
         //
 
         RecordId loc;
-        BSONObj obj;
+        Snapshotted<BSONObj> obj;
         std::vector<IndexKeyDatum> keyData;
         MemberState state;
+
+        // True if this WSM has survived a yield in LOC_AND_IDX state.
+        // TODO consider replacing by tracking SnapshotIds for IndexKeyDatums.
+        bool isSuspicious;
 
         bool hasLoc() const;
         bool hasObj() const;

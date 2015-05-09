@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -20,14 +21,7 @@
 #define	WT_GIGABYTE	(1073741824)
 #define	WT_TERABYTE	((uint64_t)1099511627776)
 #define	WT_PETABYTE	((uint64_t)1125899906842624)
-
-/*
- * Number of directory entries can grow dynamically.
- */
-#define	WT_DIR_ENTRY	32
-
-#define	WT_DIRLIST_EXCLUDE	0x1	/* Exclude files matching prefix */
-#define	WT_DIRLIST_INCLUDE	0x2	/* Include files matching prefix */
+#define	WT_EXABYTE	((uint64_t)1152921504606846976)
 
 /*
  * Sizes that cannot be larger than 2**32 are stored in uint32_t fields in
@@ -65,11 +59,13 @@
 #define	WT_SKIP_PROBABILITY	(UINT32_MAX >> 2)
 
 /*
- * __wt_calloc_def --
- *	Simple calls don't need separate sizeof arguments.
+ * __wt_calloc_def, __wt_calloc_one --
+ *	Most calloc calls don't need separate count or sizeof arguments.
  */
 #define	__wt_calloc_def(session, number, addr)				\
 	__wt_calloc(session, (size_t)(number), sizeof(**(addr)), addr)
+#define	__wt_calloc_one(session, addr)					\
+	__wt_calloc(session, (size_t)1, sizeof(**(addr)), addr)
 
 /*
  * __wt_realloc_def --
@@ -130,6 +126,33 @@
 #define	FLD_ISSET(field, mask)	((field) & ((uint32_t)(mask)))
 #define	FLD_SET(field, mask)	((field) |= ((uint32_t)(mask)))
 
+/*
+ * Insertion sort, for sorting small sets of values.
+ *
+ * The "compare_lt" argument is a function or macro that returns true when
+ * its first argument is less than its second argument.
+ */
+#define	WT_INSERTION_SORT(arrayp, n, value_type, compare_lt) do {	\
+	value_type __v;							\
+	int __i, __j, __n = (int)(n);					\
+	if (__n == 2) {							\
+		__v = (arrayp)[1];					\
+		if (compare_lt(__v, (arrayp)[0])) {			\
+			(arrayp)[1] = (arrayp)[0];			\
+			(arrayp)[0] = __v;				\
+		}							\
+	}								\
+	if (__n > 2) {							\
+		for (__i = 1; __i < __n; ++__i) {			\
+			__v = (arrayp)[__i];				\
+			for (__j = __i - 1; __j >= 0 &&			\
+			    compare_lt(__v, (arrayp)[__j]); --__j)	\
+				(arrayp)[__j + 1] = (arrayp)[__j];	\
+			(arrayp)[__j + 1] = __v;			\
+		}							\
+	}								\
+} while (0)
+
 /* Verbose messages. */
 #ifdef HAVE_VERBOSE
 #define	WT_VERBOSE_ISSET(session, f)					\
@@ -138,17 +161,6 @@
 #define	WT_VERBOSE_ISSET(session, f)	0
 #endif
 
-/*
- * Clear a structure, two flavors: inline when we want to guarantee there's
- * no function call or setup/tear-down of a loop, and the default where the
- * compiler presumably chooses.  Gcc 4.3 is supposed to get this right, but
- * we've seen problems when calling memset to clear structures in performance
- * critical paths.
- */
-#define	WT_CLEAR_INLINE(type, s) do {					\
-	static const type __clear;					\
-	s = __clear;							\
-} while (0)
 #define	WT_CLEAR(s)							\
 	memset(&(s), 0, sizeof(s))
 

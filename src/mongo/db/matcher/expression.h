@@ -48,13 +48,16 @@ namespace mongo {
     public:
         enum MatchType {
             // tree types
-            AND, OR, NOR, NOT,
+            AND, OR,
 
             // array types
-            ALL, ELEM_MATCH_OBJECT, ELEM_MATCH_VALUE, SIZE,
+            ELEM_MATCH_OBJECT, ELEM_MATCH_VALUE, SIZE,
 
             // leaf types
-            LTE, LT, EQ, GT, GTE, REGEX, MOD, EXISTS, MATCH_IN, NIN,
+            EQ, LTE, LT, GT, GTE, REGEX, MOD, EXISTS, MATCH_IN,
+
+            // Negations.
+            NOT, NIN, NOR,
 
             // special types
             TYPE_OPERATOR, GEO, WHERE,
@@ -125,11 +128,11 @@ namespace mongo {
          * Is this node an array operator?  Array operators have multiple clauses but operate on one
          * field.
          *
-         * ALL (AllElemMatchOp)
          * ELEM_MATCH_VALUE, ELEM_MATCH_OBJECT, SIZE (ArrayMatchingMatchExpression)
          */
         bool isArray() const {
-            return SIZE == _matchType || ALL == _matchType || ELEM_MATCH_VALUE == _matchType
+            return SIZE == _matchType
+                   || ELEM_MATCH_VALUE == _matchType
                    || ELEM_MATCH_OBJECT == _matchType;
         }
 

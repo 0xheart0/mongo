@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -40,6 +41,16 @@ __wt_struct_check(WT_SESSION_IMPL *session,
 	}
 
 	return (0);
+}
+
+/*
+ * __wt_struct_confchk --
+ *	Check that the specified packing format is valid, configuration version.
+ */
+int
+__wt_struct_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *v)
+{
+	return (__wt_struct_check(session, v->str, v->len, NULL, NULL));
 }
 
 /*

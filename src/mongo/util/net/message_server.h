@@ -34,11 +34,9 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
-
-    struct LastError;
 
     class MessageHandler {
     public:
@@ -53,12 +51,7 @@ namespace mongo {
          * called every time a message comes in
          * handler is responsible for responding to client
          */
-        virtual void process( Message& m , AbstractMessagingPort* p , LastError * err ) = 0;
-
-        /**
-         * called once when a socket is disconnected
-         */
-        virtual void disconnected( AbstractMessagingPort* p ) = 0;
+        virtual void process(Message& m, AbstractMessagingPort* p) = 0;
     };
 
     class MessageServer {

@@ -49,7 +49,7 @@ namespace mongo {
         MONGO_DISALLOW_COPYING(AuthzManagerExternalStateLocal);
 
     public:
-        virtual ~AuthzManagerExternalStateLocal();
+        virtual ~AuthzManagerExternalStateLocal() = default;
 
         virtual Status initialize(OperationContext* txn);
 
@@ -65,15 +65,21 @@ namespace mongo {
                                                 std::vector<BSONObj>* result);
 
         virtual void logOp(
+                OperationContext* txn,
                 const char* op,
                 const char* ns,
                 const BSONObj& o,
-                BSONObj* o2,
-                bool* b);
+                BSONObj* o2);
 
     protected:
-        AuthzManagerExternalStateLocal();
+        AuthzManagerExternalStateLocal() = default;
 
+        /**
+         * Fetches the user document for "userName" from local storage, and stores it into "result".
+         */
+        virtual Status _getUserDocument(OperationContext* txn,
+                                        const UserName& userName,
+                                        BSONObj* result);
     private:
         enum RoleGraphState {
             roleGraphStateInitial = 0,
@@ -82,16 +88,14 @@ namespace mongo {
         };
 
         /**
+         * RecoveryUnit::Change subclass used to commit work for AuthzManager logOp listener.
+         */
+        class AuthzManagerLogOpHandler;
+
+        /**
          * Initializes the role graph from the contents of the admin.system.roles collection.
          */
         Status _initializeRoleGraph(OperationContext* txn);
-
-        /**
-         * Fetches the user document for "userName" from local storage, and stores it into "result".
-         */
-        Status _getUserDocument(OperationContext* txn,
-                                const UserName& userName,
-                                BSONObj* result);
 
         Status _getRoleDescription_inlock(const RoleName& roleName,
                                           bool showPrivileges,
@@ -106,7 +110,7 @@ namespace mongo {
          * State of _roleGraph, one of "initial", "consistent" and "has cycle".  Synchronized via
          * _roleGraphMutex.
          */
-        RoleGraphState _roleGraphState;
+        RoleGraphState _roleGraphState = roleGraphStateInitial;
 
         /**
          * Guards _roleGraphState and _roleGraph.

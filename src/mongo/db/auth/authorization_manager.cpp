@@ -43,9 +43,9 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/auth_helpers.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_documents_update_guard.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
 #include "mongo/db/auth/privilege.h"
@@ -58,12 +58,16 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/platform/unordered_map.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     AuthInfo internalSecurity;
 
@@ -248,9 +252,11 @@ namespace mongo {
         boost::unique_lock<boost::mutex> _lock;
     };
 
-    AuthorizationManager::AuthorizationManager(AuthzManagerExternalState* externalState) :
+    AuthorizationManager::AuthorizationManager(
+        std::unique_ptr<AuthzManagerExternalState> externalState) :
             _authEnabled(false),
-            _externalState(externalState),
+            _privilegeDocsExist(false),
+            _externalState(std::move(externalState)),
             _version(schemaVersionInvalid),
             _isFetchPhaseBusy(false) {
         _updateCacheGeneration_inlock();
@@ -262,6 +268,11 @@ namespace mongo {
             fassert(17265, it->second != internalSecurity.user);
             delete it->second ;
         }
+    }
+
+    std::unique_ptr<AuthorizationSession> AuthorizationManager::makeAuthorizationSession() {
+        return stdx::make_unique<AuthorizationSession>(
+                _externalState->makeAuthzSessionExternalState(this));
     }
 
     Status AuthorizationManager::getAuthorizationVersion(OperationContext* txn, int* version) {
@@ -301,8 +312,22 @@ namespace mongo {
         return _authEnabled;
     }
 
-    bool AuthorizationManager::hasAnyPrivilegeDocuments(OperationContext* txn) const {
-        return _externalState->hasAnyPrivilegeDocuments(txn);
+    bool AuthorizationManager::hasAnyPrivilegeDocuments(OperationContext* txn) {
+        boost::unique_lock<boost::mutex> lk(_privilegeDocsExistMutex);
+        if (_privilegeDocsExist) {
+            // If we know that a user exists, don't re-check.
+            return true;
+        }
+
+        lk.unlock();
+        bool privDocsExist = _externalState->hasAnyPrivilegeDocuments(txn);
+        lk.lock();
+
+        if (privDocsExist) {
+            _privilegeDocsExist = true;
+        }
+
+        return _privilegeDocsExist;
     }
 
     Status AuthorizationManager::writeAuthSchemaVersionIfNeeded(OperationContext* txn,
@@ -617,7 +642,7 @@ namespace mongo {
         user->incrementRefCount();
         // NOTE: It is not safe to throw an exception from here to the end of the method.
         if (guard.isSameCacheGeneration()) {
-            _userCache.insert(make_pair(userName, user.get()));
+            _userCache.insert(std::make_pair(userName, user.get()));
             if (_version == schemaVersionInvalid)
                 _version = authzVersion;
         }
@@ -725,7 +750,7 @@ namespace mongo {
         return Status::OK();
     }
 
-    bool AuthorizationManager::tryAcquireAuthzUpdateLock(const StringData& why) {
+    bool AuthorizationManager::tryAcquireAuthzUpdateLock(StringData why) {
         return _externalState->tryAcquireAuthzUpdateLock(why);
     }
 
@@ -750,13 +775,13 @@ namespace {
      */
     void updateUserCredentials(OperationContext* txn,
                                AuthzManagerExternalState* externalState,
-                               const StringData& sourceDB,
+                               StringData sourceDB,
                                const BSONObj& userDoc,
                                const BSONObj& writeConcern) {
         BSONElement credentialsElement = userDoc["credentials"];
         uassert(18806,
                 mongoutils::str::stream() << "While preparing to upgrade user doc from "
-                        "2.6/2.8 user data schema to the 2.8 SCRAM only schema, found a user doc "
+                        "2.6/3.0 user data schema to the 3.0 SCRAM only schema, found a user doc "
                         "with missing or incorrectly formatted credentials: "
                         << userDoc.toString(),
                         credentialsElement.type() == Object);
@@ -765,15 +790,17 @@ namespace {
         BSONElement mongoCRElement = credentialsObj["MONGODB-CR"];
         BSONElement scramElement = credentialsObj["SCRAM-SHA-1"];
 
-        // Ignore any user documents that already have SCRAM credentials. This should only
-        // occur if a previous authSchemaUpgrade was interrupted halfway.
-        if (!scramElement.eoo()) {
-            return;
-        }
+        // Ignore any user documents that already have SCRAM credentials.
+        uassert(28613,
+                mongoutils::str::stream() << "While preparing to upgrade user doc from "
+                        "2.6/3.0 user data schema to the 3.0 SCRAM only schema, found a user doc "
+                        "with existing SCRAM credentials :"
+                        << userDoc.toString(),
+                scramElement.eoo());
 
         uassert(18744,
                 mongoutils::str::stream() << "While preparing to upgrade user doc from "
-                        "2.6/2.8 user data schema to the 2.8 SCRAM only schema, found a user doc "
+                        "2.6/3.0 user data schema to the 3.0 SCRAM only schema, found a user doc "
                         "missing MONGODB-CR credentials :"
                         << userDoc.toString(),
                 !mongoCRElement.eoo());
@@ -877,13 +904,13 @@ namespace {
     }
 
 namespace {
-    bool isAuthzNamespace(const StringData& ns) {
+    bool isAuthzNamespace(StringData ns) {
         return (ns == AuthorizationManager::rolesCollectionNamespace.ns() ||
                 ns == AuthorizationManager::usersCollectionNamespace.ns() ||
                 ns == AuthorizationManager::versionCollectionNamespace.ns());
     }
 
-    bool isAuthzCollection(const StringData& coll) {
+    bool isAuthzCollection(StringData coll) {
         return (coll == AuthorizationManager::rolesCollectionNamespace.coll() ||
                 coll == AuthorizationManager::usersCollectionNamespace.coll() ||
                 coll == AuthorizationManager::versionCollectionNamespace.coll());
@@ -937,7 +964,7 @@ namespace {
 
     // Updates to users in the oplog are done by matching on the _id, which will always have the
     // form "<dbname>.<username>".  This function extracts the UserName from that string.
-    StatusWith<UserName> extractUserNameFromIdString(const StringData& idstr) {
+    StatusWith<UserName> extractUserNameFromIdString(StringData idstr) {
         size_t splitPoint = idstr.find('.');
         if (splitPoint == string::npos) {
             return StatusWith<UserName>(
@@ -945,7 +972,7 @@ namespace {
                     mongoutils::str::stream() << "_id entries for user documents must be of "
                             "the form <dbname>.<username>.  Found: " << idstr);
         }
-        return StatusWith<UserName>(UserName(idstr.substr(splitPoint),
+        return StatusWith<UserName>(UserName(idstr.substr(splitPoint + 1),
                                              idstr.substr(0, splitPoint)));
     }
 
@@ -989,13 +1016,13 @@ namespace {
     }
 
     void AuthorizationManager::logOp(
+            OperationContext* txn,
             const char* op,
             const char* ns,
             const BSONObj& o,
-            BSONObj* o2,
-            bool* b) {
+            BSONObj* o2) {
 
-        _externalState->logOp(op, ns, o, o2, b);
+        _externalState->logOp(txn, op, ns, o, o2);
         if (appliesToAuthzData(op, ns, o)) {
             _invalidateRelevantCacheData(op, ns, o, o2);
         }

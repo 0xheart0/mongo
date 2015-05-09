@@ -31,13 +31,13 @@
 #include "mongo/db/mongod_options.h"
 
 #include <boost/filesystem.hpp>
+#include <iostream>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/config.h"
 #include "mongo/db/db.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -51,9 +51,12 @@
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/version.h"
-#include "mongo/util/version_reporting.h"
 
 namespace mongo {
+
+    using std::cout;
+    using std::endl;
+    using std::string;
 
     MongodGlobalParams mongodGlobalParams;
 
@@ -77,7 +80,7 @@ namespace mongo {
         }
 #endif
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         moe::OptionSection ssl_options("SSL options");
 
         ret = addSSLServerOptions(&ssl_options);
@@ -182,10 +185,9 @@ namespace mongo {
                 + storageGlobalParams.kDefaultDbPath);
 
 #endif
-        storage_options.addOptionChaining("storage.mmapv1.directoryPerDB", "directoryperdb",
-                moe::Switch,
-                "each database will be stored in a separate directory",
-                "storage.directoryPerDB");
+        storage_options.addOptionChaining("storage.directoryPerDB", "directoryperdb",
+                                          moe::Switch,
+                                          "each database will be stored in a separate directory");
 
         general_options.addOptionChaining("noIndexBuildRetry", "noIndexBuildRetry", moe::Switch,
                 "don't retry any index builds that were interrupted by shutdown")
@@ -223,11 +225,9 @@ namespace mongo {
                 "use a smaller default file size",
                 "storage.smallFiles");
 
-        storage_options.addOptionChaining("storage.mmapv1.syncPeriodSecs", "syncdelay",
-                moe::Double,
-                "seconds between disk syncs (0=never, but not recommended)",
-                "storage.syncPeriodSecs")
-                                         .setDefault(moe::Value(60.0));
+        storage_options.addOptionChaining("storage.syncPeriodSecs", "syncdelay", moe::Double,
+                "seconds between disk syncs (0=never, but not recommended)")
+            .setDefault(moe::Value(60.0));
 
         // Upgrade and repair are disallowed in JSON configs since they trigger very heavyweight
         // actions rather than specify configuration data
@@ -416,7 +416,7 @@ namespace mongo {
         options->addSection(ms_options);
         options->addSection(rs_options);
         options->addSection(sharding_options);
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         options->addSection(ssl_options);
 #endif
         options->addSection(storage_options);
@@ -469,7 +469,6 @@ namespace mongo {
 
     namespace {
         void sysRuntimeInfo() {
-            log() << "sysinfo:" << endl;
 #if defined(_SC_PAGE_SIZE)
             log() << "  page size: " << (int) sysconf(_SC_PAGE_SIZE) << endl;
 #endif
@@ -626,7 +625,7 @@ namespace mongo {
             return ret;
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         ret = canonicalizeSSLServerOptions(params);
         if (!ret.isOK()) {
             return ret;
@@ -940,23 +939,23 @@ namespace mongo {
             serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
         }
 
-        if ( params.count("storage.mmapv1.syncPeriodSecs")) {
-            mmapv1GlobalOptions.syncdelay = params["storage.mmapv1.syncPeriodSecs"].as<double>();
+        if ( params.count("storage.syncPeriodSecs")) {
+            storageGlobalParams.syncdelay = params["storage.syncPeriodSecs"].as<double>();
         }
 
-        if (params.count("storage.mmapv1.directoryPerDB")) {
-            mmapv1GlobalOptions.directoryperdb = params["storage.mmapv1.directoryPerDB"].as<bool>();
+        if (params.count("storage.directoryPerDB")) {
+            storageGlobalParams.directoryperdb = params["storage.directoryPerDB"].as<bool>();
         }
         if (params.count("cpu")) {
             serverGlobalParams.cpu = params["cpu"].as<bool>();
         }
         if (params.count("security.authorization") &&
             params["security.authorization"].as<std::string>() == "disabled") {
-            getGlobalAuthorizationManager()->setAuthEnabled(false);
+            serverGlobalParams.isAuthEnabled = false;
         }
         if (params.count("security.authorization") &&
             params["security.authorization"].as<std::string>() == "enabled") {
-            getGlobalAuthorizationManager()->setAuthEnabled(true);
+            serverGlobalParams.isAuthEnabled = true;
         }
         if (params.count("storage.mmapv1.quota.enforced")) {
             mmapv1GlobalOptions.quota = params["storage.mmapv1.quota.enforced"].as<bool>();
@@ -1046,6 +1045,10 @@ namespace mongo {
             replSettings.slavedelay = params["slavedelay"].as<int>();
         }
         if (params.count("fastsync")) {
+            if (replSettings.slave != repl::SimpleSlave) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "--fastsync must only be used with --slave");
+            }
             replSettings.fastsync = params["fastsync"].as<bool>();
         }
         if (params.count("autoresync")) {
@@ -1135,12 +1138,6 @@ namespace mongo {
             params["sharding.clusterRole"].as<std::string>() == "configsvr") {
             serverGlobalParams.configsvr = true;
             mmapv1GlobalOptions.smallfiles = true; // config server implies small files
-            if (replSettings.usingReplSets()
-                    || replSettings.master
-                    || replSettings.slave) {
-                return Status(ErrorCodes::BadValue,
-                              "replication should not be enabled on a config server");
-            }
 
             // If we haven't explicitly specified a journal option, default journaling to true for
             // the config server role

@@ -1,9 +1,21 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
+
+/*
+ * __wt_strdup --
+ *	ANSI strdup function.
+ */
+static inline int
+__wt_strdup(WT_SESSION_IMPL *session, const char *str, void *retp)
+{
+	return (__wt_strndup(
+	    session, str, (str == NULL) ? 0 : strlen(str), retp));
+}
 
 /*
  * __wt_verbose --

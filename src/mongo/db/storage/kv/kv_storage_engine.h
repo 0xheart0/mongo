@@ -46,39 +46,48 @@ namespace mongo {
     class KVEngine;
     class KVDatabaseCatalogEntry;
 
+    struct KVStorageEngineOptions {
+        KVStorageEngineOptions() :
+            directoryPerDB(false),
+            directoryForIndexes(false),
+            forRepair(false) {}
+
+        bool directoryPerDB;
+        bool directoryForIndexes;
+        bool forRepair;
+    };
+
     class KVStorageEngine : public StorageEngine {
     public:
         /**
          * @param engine - owneership passes to me
          */
-        KVStorageEngine( KVEngine* engine );
+        KVStorageEngine( KVEngine* engine,
+                         const KVStorageEngineOptions& options = KVStorageEngineOptions() );
         virtual ~KVStorageEngine();
 
         virtual void finishInit();
 
-        virtual RecoveryUnit* newRecoveryUnit( OperationContext* opCtx );
+        virtual RecoveryUnit* newRecoveryUnit();
 
         virtual void listDatabases( std::vector<std::string>* out ) const;
 
         virtual DatabaseCatalogEntry* getDatabaseCatalogEntry( OperationContext* opCtx,
-                                                               const StringData& db );
+                                                               StringData db );
 
         virtual bool supportsDocLocking() const { return _supportsDocLocking; }
 
-        virtual Status closeDatabase( OperationContext* txn, const StringData& db );
+        virtual Status closeDatabase( OperationContext* txn, StringData db );
 
-        virtual Status dropDatabase( OperationContext* txn, const StringData& db );
+        virtual Status dropDatabase( OperationContext* txn, StringData db );
 
         virtual int flushAllFiles( bool sync );
 
         virtual bool isDurable() const;
 
-        virtual Status repairDatabase( OperationContext* txn,
-                                       const std::string& dbName,
-                                       bool preserveClonedFilesOnFailure = false,
-                                       bool backupOriginalFiles = false );
+        virtual Status repairRecordStore(OperationContext* txn, const std::string& ns);
 
-        virtual void cleanShutdown(OperationContext* txn);
+        virtual void cleanShutdown();
 
         // ------ kv ------
 
@@ -90,6 +99,8 @@ namespace mongo {
 
     private:
         class RemoveDBChange;
+
+        KVStorageEngineOptions _options;
 
         // This must be the first member so it is destroyed last.
         boost::scoped_ptr<KVEngine> _engine;

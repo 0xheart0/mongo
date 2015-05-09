@@ -1,4 +1,3 @@
-if (0) { // TODO SERVER-15614 reenable
 // Check debug information recorded for a query.
 
 // special db so that it can be run in parallel tests
@@ -48,28 +47,22 @@ try {
                   [ "nscanned", 0 ],
                   [ "keyUpdates", 0 ],
                   [ "nreturned", 0 ],
+                  [ "cursorExhausted", true],
                   [ "responseLength", 20 ] ] );
     
-    t.save( {} );
-
     // check write lock stats are set
+    t.save( {} );
     o = lastOp();
     assert.eq('insert', o.op);
-
-    printjson( o );
-    assert.eq( 0, o.lockStats.timeLockedMicros.r );
-    assert.lt( 0, o.lockStats.timeLockedMicros.w );
-    assert.eq( 0, o.lockStats.timeAcquiringMicros.r );
-    assert.lte( 0, o.lockStats.timeAcquiringMicros.w );
+    printjson(o.locks);
+    assert.lt( 0, Object.keys(o.locks).length );
 
     // check read lock stats are set
     t.find();
     o = lastOp();
     assert.eq('query', o.op);
-    assert.lt( 0, o.lockStats.timeLockedMicros.r );
-    assert.eq( 0, o.lockStats.timeLockedMicros.w );
-    assert.lte( 0, o.lockStats.timeAcquiringMicros.r );
-    assert.lte( 0, o.lockStats.timeAcquiringMicros.w );
+    printjson(o.locks);
+    assert.lt( 0, Object.keys(o.locks).length );
 
     t.save( {} );
     t.save( {} );
@@ -112,11 +105,30 @@ try {
     o = lastOp();
     assert.neq( undefined, o.execStats.summary, tojson( o.execStats ) );
 
+    // Confirm "cursorExhausted" not set when cursor is open.
+    t.drop();
+    t.insert([{_id:0},{_id:1},{_id:2},{_id:3},{_id:4}]);
+    t.find().batchSize(2).next(); // Query performed leaving open cursor
+    var operation = lastOp();
+    assert.eq("query", operation.op);
+    assert(!("cursorExhausted" in operation));
+
+    var cursor = t.find().batchSize(2);
+    cursor.next(); // Perform initial query and consume first of 2 docs returned.
+    cursor.next(); // Consume second of 2 docs from initial query.
+    cursor.next(); // getMore performed, leaving open cursor.
+    operation = lastOp();
+    assert.eq("getmore", operation.op);
+    assert(!("cursorExhausted" in operation));
+
+    // Exhaust cursor and confirm getMore has "cursorExhausted:true".
+    cursor.itcount();
+    checkLastOp( [ [ "cursorExhausted", true] ] );
+
     db.setProfilingLevel(0);
     db.system.profile.drop();    
 }
 finally {
     db.setProfilingLevel(0);
     db = stddb;
-}
 }

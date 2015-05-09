@@ -34,6 +34,8 @@
 
 namespace mongo {
 
+    using std::vector;
+
     // static
     const char* EOFStage::kStageType = "EOF";
 
@@ -74,12 +76,12 @@ namespace mongo {
         return new PlanStageStats(_commonStats, STAGE_EOF);
     }
 
-    const CommonStats* EOFStage::getCommonStats() {
+    const CommonStats* EOFStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* EOFStage::getSpecificStats() {
-        return NULL;
+    const SpecificStats* EOFStage::getSpecificStats() const {
+        return nullptr;
     }
 
 }  // namespace mongo

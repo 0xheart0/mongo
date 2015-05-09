@@ -31,10 +31,8 @@
 #include <climits> // For UINT_MAX
 #include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/concurrency/lock_mgr_new.h"
+#include "mongo/db/concurrency/lock_manager.h"
+#include "mongo/db/concurrency/lock_stats.h"
 
 namespace mongo {
     
@@ -77,16 +75,18 @@ namespace mongo {
         virtual LockResult lockGlobal(LockMode mode, unsigned timeoutMs = UINT_MAX) = 0;
 
         /**
-         * Requests *only* the global lock to be acquired in the specified mode. Does not do the
-         * full MMAP V1 concurrency control functionality, which acquires the flush lock as well.
-         *
-         * Should only be used for cases, where no data reads or writes will be performed, such as
-         * replication step-down.
+         * Requests the global lock to be acquired in the specified mode.
          *
          * See the comments for lockBegin/Complete for more information on the semantics.
          */
         virtual LockResult lockGlobalBegin(LockMode mode) = 0;
         virtual LockResult lockGlobalComplete(unsigned timeoutMs) = 0;
+
+        /**
+         * This method is used only in the MMAP V1 storage engine, otherwise it is a no-op. See the
+         * comments in the implementation for more details on how MMAP V1 journaling works.
+         */
+        virtual void lockMMAPV1Flush() = 0;
 
         /**
          * Decrements the reference count on the global lock.  If the reference count on the
@@ -172,8 +172,8 @@ namespace mongo {
         // These are shortcut methods for the above calls. They however check that the entire
         // hierarchy is properly locked and because of this they are very expensive to call.
         // Do not use them in performance critical code paths.
-        virtual bool isDbLockedForMode(const StringData& dbName, LockMode mode) const = 0;
-        virtual bool isCollectionLockedForMode(const StringData& ns, LockMode mode) const = 0;
+        virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const = 0;
+        virtual bool isCollectionLockedForMode(StringData ns, LockMode mode) const = 0;
 
         /**
          * Returns the resource that this locker is waiting/blocked on (if any). If the locker is
@@ -190,6 +190,11 @@ namespace mongo {
 
             // In what mode is it held?
             LockMode mode;
+
+            // Reporting/serialization order is by resourceId, which is the canonical locking order
+            bool operator<(const OneLock& rhs) const {
+                return resourceId < rhs.resourceId;
+            }
         };
 
         /**
@@ -199,12 +204,14 @@ namespace mongo {
          * reused.
          */
         struct LockerInfo {
-            // List of high-level locks held by this locker, sorted by hierarchy in the order
-            // Global, Flush (MMAP V1 only), Database, Collection.
+            // List of high-level locks held by this locker, sorted by ResourceId
             std::vector<OneLock> locks;
 
             // If isValid(), then what lock this particular locker is sleeping on
             ResourceId waitingResource;
+
+            // Lock timing statistics
+            SingleThreadedLockStats stats;
         };
 
         virtual void getLockerInfo(LockerInfo* lockerInfo) const = 0;
@@ -252,20 +259,19 @@ namespace mongo {
 
         virtual void dump() const = 0;
 
-        virtual unsigned recursiveCount() const = 0;
-
         virtual bool isW() const = 0;
         virtual bool isR() const = 0;
-        virtual bool hasAnyReadLock() const = 0; // explicitly r or R
 
         virtual bool isLocked() const = 0;
         virtual bool isWriteLocked() const = 0;
-        virtual bool isWriteLocked(const StringData& ns) const = 0;
-        
+        virtual bool isReadLocked() const = 0;
 
-        virtual bool isRecursive() const = 0;
-
-        virtual void assertWriteLocked(const StringData& ns) const = 0;
+        /**
+         * Asserts that the Locker is effectively not in use and resets the locking statistics.
+         * This means, there should be no locks on it, no WUOW, etc, so it would be safe to call
+         * the destructor or reuse the Locker.
+         */
+        virtual void assertEmptyAndReset() = 0;
 
         /**
          * Pending means we are currently trying to get a lock (could be the parallel batch writer
@@ -273,17 +279,15 @@ namespace mongo {
          */
         virtual bool hasLockPending() const = 0;
 
-        // ----
-
-        // Those are only used for TempRelease. Eventually they should be removed.
-        virtual void enterScopedLock(Lock::ScopedLock* lock) = 0;
-        virtual Lock::ScopedLock* getCurrentScopedLock() const = 0;
-        virtual void leaveScopedLock(Lock::ScopedLock* lock) = 0;
-
         // Used for the replication parallel log op application threads
         virtual void setIsBatchWriter(bool newValue) = 0;
         virtual bool isBatchWriter() const = 0;
-        virtual void setLockPendingParallelWriter(bool newValue) = 0;
+
+        /**
+         * A string lock is MODE_X or MODE_S.
+         * These are incompatible with other locks and therefore are strong.
+         */
+        virtual bool hasStrongLocks() const = 0;
 
     protected:
         Locker() { }

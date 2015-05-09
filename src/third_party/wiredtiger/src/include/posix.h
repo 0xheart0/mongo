@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -25,3 +26,15 @@
 typedef pthread_cond_t		wt_cond_t;
 typedef pthread_mutex_t		wt_mutex_t;
 typedef pthread_t		wt_thread_t;
+
+/*
+ * Thread callbacks need to match the platform specific callback types
+ */
+#define	WT_THREAD_CALLBACK(x)	void* (x)
+#define	WT_THREAD_RET		void*
+#define	WT_THREAD_RET_VALUE	NULL
+
+/*
+ * WT declaration for calling convention type
+ */
+#define	WT_CDECL

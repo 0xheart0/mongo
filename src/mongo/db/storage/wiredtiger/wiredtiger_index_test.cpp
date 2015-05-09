@@ -28,38 +28,47 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
+#include <boost/scoped_ptr.hpp>
+
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-    class MyHarnessHelper : public HarnessHelper {
+    using std::string;
+
+    class MyHarnessHelper final : public HarnessHelper {
     public:
         MyHarnessHelper() : _dbpath( "wt_test" ), _conn( NULL ) {
 
-            const char* config = "create,cache_size=1G,extensions=[local=(entry=index_collator_extension)],";
+            const char* config = "create,cache_size=1G,";
             int ret = wiredtiger_open( _dbpath.path().c_str(), NULL, config, &_conn);
             invariantWTOK( ret );
 
             _sessionCache = new WiredTigerSessionCache( _conn );
         }
 
-        ~MyHarnessHelper() {
+        ~MyHarnessHelper() final {
             delete _sessionCache;
             _conn->close(_conn, NULL);
         }
 
-        virtual SortedDataInterface* newSortedDataInterface( bool unique ) {
+        std::unique_ptr<SortedDataInterface> newSortedDataInterface( bool unique ) final {
             std::string ns = "test.wt";
-            OperationContextNoop txn( newRecoveryUnit() );
+            OperationContextNoop txn( newRecoveryUnit().release() );
 
             BSONObj spec = BSON( "key" << BSON( "a" << 1 ) <<
                                  "name" << "testIndex" <<
@@ -67,16 +76,19 @@ namespace mongo {
 
             IndexDescriptor desc( NULL, "", spec );
 
+            StatusWith<std::string> result = WiredTigerIndex::generateCreateString("", desc);
+            ASSERT_OK(result.getStatus());
+
             string uri = "table:" + ns;
-            invariantWTOK( WiredTigerIndex::Create( &txn, uri, "", &desc ) );
+            invariantWTOK( WiredTigerIndex::Create(&txn, uri, result.getValue()));
 
             if ( unique )
-                return new WiredTigerIndexUnique( uri, &desc );
-            return new WiredTigerIndexStandard( uri, &desc );
+                return stdx::make_unique<WiredTigerIndexUnique>( &txn, uri, &desc );
+            return stdx::make_unique<WiredTigerIndexStandard>( &txn, uri, &desc );
         }
 
-        virtual RecoveryUnit* newRecoveryUnit() {
-            return new WiredTigerRecoveryUnit( _sessionCache );
+        std::unique_ptr<RecoveryUnit> newRecoveryUnit() final {
+            return stdx::make_unique<WiredTigerRecoveryUnit>( _sessionCache );
         }
 
     private:
@@ -85,8 +97,47 @@ namespace mongo {
         WiredTigerSessionCache* _sessionCache;
     };
 
-    HarnessHelper* newHarnessHelper() {
-        return new MyHarnessHelper();
+    std::unique_ptr<HarnessHelper> newHarnessHelper() {
+        return stdx::make_unique<MyHarnessHelper>();
     }
 
-}
+    TEST(WiredTigerIndexTest, GenerateCreateStringEmptyDocument) {
+        BSONObj spec = fromjson("{}");
+        StatusWith<std::string> result = WiredTigerIndex::parseIndexOptions(spec);
+        ASSERT_OK(result.getStatus());
+        ASSERT_EQ(result.getValue(), ""); // "," would also be valid.
+    }
+
+    TEST(WiredTigerIndexTest, GenerateCreateStringUnknownField) {
+        BSONObj spec = fromjson("{unknownField: 1}");
+        StatusWith<std::string> result = WiredTigerIndex::parseIndexOptions(spec);
+        const Status& status = result.getStatus();
+        ASSERT_NOT_OK(status);
+        ASSERT_EQUALS(ErrorCodes::InvalidOptions, status);
+    }
+
+    TEST(WiredTigerIndexTest, GenerateCreateStringNonStringConfig) {
+        BSONObj spec = fromjson("{configString: 12345}");
+        StatusWith<std::string> result = WiredTigerIndex::parseIndexOptions(spec);
+        const Status& status = result.getStatus();
+        ASSERT_NOT_OK(status);
+        ASSERT_EQUALS(ErrorCodes::TypeMismatch, status);
+    }
+
+    TEST(WiredTigerIndexTest, GenerateCreateStringEmptyConfigString) {
+        BSONObj spec = fromjson("{configString: ''}");
+        StatusWith<std::string> result = WiredTigerIndex::parseIndexOptions(spec);
+        ASSERT_OK(result.getStatus());
+        ASSERT_EQ(result.getValue(), ","); // "" would also be valid.
+    }
+
+    TEST(WiredTigerIndexTest, GenerateCreateStringValidConfigFormat) {
+        // TODO eventually this should fail since "abc" is not a valid WT option.
+        BSONObj spec = fromjson("{configString: 'abc=def'}");
+        StatusWith<std::string> result = WiredTigerIndex::parseIndexOptions(spec);
+        const Status& status = result.getStatus();
+        ASSERT_OK(status);
+        ASSERT_EQ(result.getValue(), "abc=def,");
+    }
+
+}  // namespace mongo

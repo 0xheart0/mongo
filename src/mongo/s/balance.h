@@ -30,7 +30,8 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/s/balancer_policy.h"
@@ -41,13 +42,14 @@ namespace mongo {
     struct WriteConcernOptions;
 
     /**
-     * The balancer is a background task that tries to keep the number of chunks across all servers of the cluster even. Although
-     * every mongos will have one balancer running, only one of them will be active at the any given point in time. The balancer
-     * uses a 'DistributedLock' for that coordination.
+     * The balancer is a background task that tries to keep the number of chunks across all
+     * servers of the cluster even. Although every mongos will have one balancer running, only one
+     * of them will be active at the any given point in time. The balancer uses a distributed lock
+     * for that coordination.
      *
-     * The balancer does act continuously but in "rounds". At a given round, it would decide if there is an imbalance by
-     * checking the difference in chunks between the most and least loaded shards. It would issue a request for a chunk
-     * migration per round, if it found so.
+     * The balancer does act continuously but in "rounds". At a given round, it would decide if
+     * there is an imbalance by checking the difference in chunks between the most and least
+     * loaded shards. It would issue a request for a chunk migration per round, if it found so.
      */
     class Balancer : public BackgroundJob {
     public:
@@ -62,7 +64,7 @@ namespace mongo {
 
     private:
         typedef MigrateInfo CandidateChunk;
-        typedef shared_ptr<CandidateChunk> CandidateChunkPtr;
+        typedef boost::shared_ptr<CandidateChunk> CandidateChunkPtr;
 
         // hostname:port of my mongos
         std::string _myid;
@@ -74,7 +76,7 @@ namespace mongo {
         int _balancedLastTime;
 
         // decide which chunks to move; owned here.
-        scoped_ptr<BalancerPolicy> _policy;
+        boost::scoped_ptr<BalancerPolicy> _policy;
         
         /**
          * Checks that the balancer can connect to all servers it needs to do its job.
@@ -92,7 +94,7 @@ namespace mongo {
          * @param conn is the connection with the config server(s)
          * @param candidateChunks (IN/OUT) filled with candidate chunks, one per collection, that could possibly be moved
          */
-        void _doBalanceRound( DBClientBase& conn, std::vector<CandidateChunkPtr>* candidateChunks );
+        void _doBalanceRound(DBClientBase& conn, std::vector<CandidateChunkPtr>* candidateChunks);
 
         /**
          * Issues chunk migration request, one at a time.

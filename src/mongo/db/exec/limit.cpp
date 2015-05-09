@@ -34,6 +34,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* LimitStage::kStageType = "LIMIT";
 
@@ -80,8 +83,8 @@ namespace mongo {
         else if (PlanStage::NEED_TIME == status) {
             ++_commonStats.needTime;
         }
-        else if (PlanStage::NEED_FETCH == status) {
-            ++_commonStats.needFetch;
+        else if (PlanStage::NEED_YIELD == status) {
+            ++_commonStats.needYield;
             *out = id;
         }
 
@@ -118,11 +121,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* LimitStage::getCommonStats() {
+    const CommonStats* LimitStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* LimitStage::getSpecificStats() {
+    const SpecificStats* LimitStage::getSpecificStats() const {
         return &_specificStats;
     }
 

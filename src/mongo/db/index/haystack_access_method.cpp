@@ -32,6 +32,8 @@
 
 #include "mongo/db/index/haystack_access_method.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/db/geo/hash.h"
 #include "mongo/db/index/expression_keys_private.h"
@@ -43,8 +45,10 @@
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+
     HaystackAccessMethod::HaystackAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree)
-        : BtreeBasedAccessMethod(btreeState, btree) {
+        : IndexAccessMethod(btreeState, btree) {
 
         const IndexDescriptor* descriptor = btreeState->descriptor();
 
@@ -57,7 +61,7 @@ namespace mongo {
         uassert(16774, "no non-geo fields specified", _otherFields.size());
     }
 
-    void HaystackAccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) {
+    void HaystackAccessMethod::getKeys(const BSONObj& obj, BSONObjSet* keys) const {
         ExpressionKeysPrivate::getHaystackKeys(obj, _geoField, _otherFields, _bucketSize, keys);
     }
 

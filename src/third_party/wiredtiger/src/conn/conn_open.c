@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -24,7 +25,7 @@ __wt_connection_open(WT_CONNECTION_IMPL *conn, const char *cfg[])
 	 * Tell internal server threads to run: this must be set before opening
 	 * any sessions.
 	 */
-	F_SET(conn, WT_CONN_SERVER_RUN);
+	F_SET(conn, WT_CONN_SERVER_RUN | WT_CONN_LOG_SERVER_RUN);
 
 	/* WT_SESSION_IMPL array. */
 	WT_RET(__wt_calloc(session,
@@ -53,9 +54,6 @@ __wt_connection_open(WT_CONNECTION_IMPL *conn, const char *cfg[])
 	 * fields are set before other threads read from the pointer.
 	 */
 	WT_WRITE_BARRIER();
-
-	/* Connect to a cache pool. */
-	WT_RET(__wt_cache_pool_config(session, cfg));
 
 	/* Create the cache. */
 	WT_RET(__wt_cache_create(session, cfg));
@@ -94,7 +92,7 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	 * transaction ID will catch up with the current ID.
 	 */
 	for (;;) {
-		__wt_txn_update_oldest(session);
+		__wt_txn_update_oldest(session, 1);
 		if (txn_global->oldest_id == txn_global->current)
 			break;
 		__wt_yield();
@@ -112,9 +110,13 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	F_CLR(conn, WT_CONN_SERVER_RUN);
 	WT_TRET(__wt_async_destroy(session));
 	WT_TRET(__wt_lsm_manager_destroy(session));
+
+	F_SET(conn, WT_CONN_CLOSING);
+
 	WT_TRET(__wt_checkpoint_server_destroy(session));
 	WT_TRET(__wt_statlog_destroy(session, 1));
 	WT_TRET(__wt_sweep_destroy(session));
+	WT_TRET(__wt_evict_destroy(session));
 
 	/* Close open data handles. */
 	WT_TRET(__wt_conn_dhandle_discard(session));
@@ -122,13 +124,15 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	/*
 	 * Now that all data handles are closed, tell logging that a checkpoint
 	 * has completed then shut down the log manager (only after closing
-	 * data handles).
+	 * data handles).  The call to destroy the log manager is outside the
+	 * conditional because we allocate the log path so that printlog can
+	 * run without running logging or recovery.
 	 */
-	if (conn->logging) {
+	if (FLD_ISSET(conn->log_flags, WT_CONN_LOG_ENABLED))
 		WT_TRET(__wt_txn_checkpoint_log(
 		    session, 1, WT_TXN_LOG_CKPT_STOP, NULL));
-		WT_TRET(__wt_logmgr_destroy(session));
-	}
+	F_CLR(conn, WT_CONN_LOG_SERVER_RUN);
+	WT_TRET(__wt_logmgr_destroy(session));
 
 	/* Free memory for collators, compressors, data sources. */
 	WT_TRET(__wt_conn_remove_collator(session));
@@ -140,18 +144,15 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	 * Complain if files weren't closed, ignoring the lock file, we'll
 	 * close it in a minute.
 	 */
-	TAILQ_FOREACH(fh, &conn->fhqh, q) {
+	SLIST_FOREACH(fh, &conn->fhlh, l) {
 		if (fh == conn->lock_fh)
 			continue;
 
 		__wt_errx(session,
 		    "Connection has open file handles: %s", fh->name);
-		WT_TRET(__wt_close(session, fh));
-		fh = TAILQ_FIRST(&conn->fhqh);
+		WT_TRET(__wt_close(session, &fh));
+		fh = SLIST_FIRST(&conn->fhlh);
 	}
-
-	/* Shut down the eviction server thread. */
-	WT_TRET(__wt_evict_destroy(session));
 
 	/* Disconnect from shared cache - must be before cache destroy. */
 	WT_TRET(__wt_conn_cache_pool_destroy(session));
@@ -196,8 +197,17 @@ __wt_connection_close(WT_CONNECTION_IMPL *conn)
 	 */
 	if ((s = conn->sessions) != NULL)
 		for (i = 0; i < conn->session_size; ++s, ++i)
-			if (s != session)
+			if (s != session) {
+				/*
+				 * If hash arrays were allocated,
+				 * free them now.
+				 */
+				if (s->dhhash != NULL)
+					__wt_free(session, s->dhhash);
+				if (s->tablehash != NULL)
+					__wt_free(session, s->tablehash);
 				__wt_free(session, s->hazard);
+			}
 
 	/* Destroy the handle. */
 	WT_TRET(__wt_connection_destroy(conn));
@@ -218,15 +228,19 @@ __wt_connection_workers(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_RET(__wt_evict_create(session));
 
 	/*
-	 * Start the handle sweep thread.
-	 */
-	WT_RET(__wt_sweep_create(session));
-
-	/*
 	 * Start the optional statistics thread.  Start statistics first so that
 	 * other optional threads can know if statistics are enabled or not.
 	 */
 	WT_RET(__wt_statlog_create(session, cfg));
+	WT_RET(__wt_logmgr_create(session, cfg));
+
+	/* Run recovery. */
+	WT_RET(__wt_txn_recover(session));
+
+	/*
+	 * Start the handle sweep thread.
+	 */
+	WT_RET(__wt_sweep_create(session));
 
 	/* Start the optional async threads. */
 	WT_RET(__wt_async_create(session, cfg));
@@ -236,7 +250,7 @@ __wt_connection_workers(WT_SESSION_IMPL *session, const char *cfg[])
 	 * NOTE: The log manager must be started before checkpoints so that the
 	 * checkpoint server knows if logging is enabled.
 	 */
-	WT_RET(__wt_logmgr_create(session, cfg));
+	WT_RET(__wt_logmgr_open(session));
 
 	/* Start the optional checkpoint thread. */
 	WT_RET(__wt_checkpoint_server_create(session, cfg));

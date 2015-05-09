@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,7 +14,7 @@
  */
 int
 __wt_thread_create(WT_SESSION_IMPL *session,
-    wt_thread_t *tidret, void *(*func)(void *), void *arg)
+    wt_thread_t *tidret, WT_THREAD_CALLBACK(*func)(void *), void *arg)
 {
 	WT_DECL_RET;
 

@@ -1,6 +1,3 @@
-/* threadpool.cpp
-*/
-
 /*    Copyright 2009 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
@@ -30,13 +27,14 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/concurrency/thread_pool.h"
 
 #include <boost/thread/thread.hpp>
 
 #include "mongo/util/concurrency/mvar.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -44,7 +42,7 @@ namespace mongo {
     namespace threadpool {
 
         // Worker thread
-        class Worker : boost::noncopyable {
+        class Worker {
         public:
             explicit Worker(ThreadPool& owner, const std::string& threadName)
                 : _owner(owner)
@@ -60,8 +58,8 @@ namespace mongo {
             }
 
             void set_task(Task& func) {
-                verify(func);
-                verify(_is_done);
+                invariant(func);
+                invariant(_is_done);
                 _is_done = false;
 
                 _task.put(func);
@@ -84,13 +82,13 @@ namespace mongo {
                         task();
                     }
                     catch (DBException& e) {
-                        log() << "Unhandled DBException: " << e.toString() << endl;
+                        log() << "Unhandled DBException: " << e.toString();
                     }
                     catch (std::exception& e) {
-                        log() << "Unhandled std::exception in worker thread: " << e.what() << endl;;
+                        log() << "Unhandled std::exception in worker thread: " << e.what();
                     }
                     catch (...) {
-                        log() << "Unhandled non-exception in worker thread" << endl;
+                        log() << "Unhandled non-exception in worker thread";
                     }
                     _is_done = true;
                     _owner.task_done(this);
@@ -99,22 +97,20 @@ namespace mongo {
         };
 
         ThreadPool::ThreadPool(int nThreads, const std::string& threadNamePrefix)
-            : _mutex("ThreadPool"), _tasksRemaining(0)
-            , _nThreads(nThreads)
-            , _threadNamePrefix(threadNamePrefix) {
+            : ThreadPool(DoNotStartThreadsTag(), nThreads, threadNamePrefix) {
             startThreads();
         }
 
         ThreadPool::ThreadPool(const DoNotStartThreadsTag&,
                                int nThreads,
                                const std::string& threadNamePrefix)
-            : _mutex("ThreadPool"), _tasksRemaining(0)
+            : _tasksRemaining(0)
             , _nThreads(nThreads)
             , _threadNamePrefix(threadNamePrefix) {
         }
 
         void ThreadPool::startThreads() {
-            scoped_lock lock(_mutex);
+            boost::lock_guard<boost::mutex> lock(_mutex);
             for (int i = 0; i < _nThreads; ++i) {
                 const std::string threadName(_threadNamePrefix.empty() ?
                                                         _threadNamePrefix :
@@ -133,7 +129,7 @@ namespace mongo {
         ThreadPool::~ThreadPool() {
             join();
 
-            verify(_tasksRemaining == 0);
+            invariant(_tasksRemaining == 0);
 
             while(!_freeWorkers.empty()) {
                 delete _freeWorkers.front();
@@ -142,14 +138,14 @@ namespace mongo {
         }
 
         void ThreadPool::join() {
-            scoped_lock lock(_mutex);
+            boost::unique_lock<boost::mutex> lock(_mutex);
             while(_tasksRemaining) {
-                _condition.wait(lock.boost());
+                _condition.wait(lock);
             }
         }
 
         void ThreadPool::schedule(Task task) {
-            scoped_lock lock(_mutex);
+            boost::lock_guard<boost::mutex> lock(_mutex);
 
             _tasksRemaining++;
 
@@ -164,7 +160,7 @@ namespace mongo {
 
         // should only be called by a worker from the worker thread
         void ThreadPool::task_done(Worker* worker) {
-            scoped_lock lock(_mutex);
+            boost::lock_guard<boost::mutex> lock(_mutex);
 
             if (!_tasks.empty()) {
                 worker->set_task(_tasks.front());

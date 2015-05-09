@@ -32,9 +32,11 @@
 
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/s/config.h"
-#include "mongo/s/shard.h"
+#include "mongo/s/client/shard.h"
 
 namespace mongo {
+
+    using std::string;
 
     Status DBClientShardResolver::chooseWriteHost( const string& shardName,
                                                    ConnectionString* shardHost ) const {
@@ -42,8 +44,8 @@ namespace mongo {
         // Declare up here for parsing later
         string errMsg;
 
-        // Special-case for config and admin
-        if ( shardName == "config" || shardName == "admin" ) {
+        // Special-case for config
+        if (shardName == "config") {
             *shardHost = ConnectionString::parse( configServer.modelServer(), errMsg );
             dassert( errMsg == "" );
             return Status::OK();

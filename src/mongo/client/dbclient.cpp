@@ -34,16 +34,19 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/constants.h"
-#include "mongo/client/dbclient_rs.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/client/syncclusterconnection.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
 #include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
@@ -51,206 +54,17 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::endl;
+    using std::list;
+    using std::map;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     AtomicInt64 DBClientBase::ConnectionIdSequence;
 
     const char* const saslCommandUserSourceFieldName = "userSource";
-
-    void ConnectionString::_fillServers( string s ) {
-        
-        //
-        // Custom-handled servers/replica sets start with '$'
-        // According to RFC-1123/952, this will not overlap with valid hostnames
-        // (also disallows $replicaSetName hosts)
-        //
-
-        if( s.find( '$' ) == 0 ) _type = CUSTOM;
-
-        {
-            string::size_type idx = s.find( '/' );
-            if ( idx != string::npos ) {
-                _setName = s.substr( 0 , idx );
-                s = s.substr( idx + 1 );
-                if( _type != CUSTOM ) _type = SET;
-            }
-        }
-
-        string::size_type idx;
-        while ( ( idx = s.find( ',' ) ) != string::npos ) {
-            _servers.push_back(HostAndPort(s.substr(0, idx)));
-            s = s.substr( idx + 1 );
-        }
-        _servers.push_back(HostAndPort(s));
-
-    }
-    
-    void ConnectionString::_finishInit() {
-
-        // Needed here as well b/c the parsing logic isn't used in all constructors
-        // TODO: Refactor so that the parsing logic *is* used in all constructors
-        if ( _type == MASTER && _servers.size() > 0 ){
-            if( _servers[0].host().find( '$' ) == 0 ){
-                _type = CUSTOM;
-            }
-        }
-
-        stringstream ss;
-        if ( _type == SET )
-            ss << _setName << "/";
-        for ( unsigned i=0; i<_servers.size(); i++ ) {
-            if ( i > 0 )
-                ss << ",";
-            ss << _servers[i].toString();
-        }
-        _string = ss.str();
-    }
-
-    mutex ConnectionString::_connectHookMutex( "ConnectionString::_connectHook" );
-    ConnectionString::ConnectionHook* ConnectionString::_connectHook = NULL;
-
-    DBClientBase* ConnectionString::connect( string& errmsg, double socketTimeout ) const {
-
-        switch ( _type ) {
-        case MASTER: {
-            DBClientConnection * c = new DBClientConnection(true);
-            c->setSoTimeout( socketTimeout );
-            LOG(1) << "creating new connection to:" << _servers[0] << endl;
-            if ( ! c->connect( _servers[0] , errmsg ) ) {
-                delete c;
-                return 0;
-            }
-            LOG(1) << "connected connection!" << endl;
-            return c;
-        }
-
-        case PAIR:
-        case SET: {
-            DBClientReplicaSet * set = new DBClientReplicaSet( _setName , _servers , socketTimeout );
-            if( ! set->connect() ) {
-                delete set;
-                errmsg = "connect failed to replica set ";
-                errmsg += toString();
-                return 0;
-            }
-            return set;
-        }
-
-        case SYNC: {
-            // TODO , don't copy
-            list<HostAndPort> l;
-            for ( unsigned i=0; i<_servers.size(); i++ )
-                l.push_back( _servers[i] );
-            SyncClusterConnection* c = new SyncClusterConnection( l, socketTimeout );
-            return c;
-        }
-
-        case CUSTOM: {
-
-            // Lock in case other things are modifying this at the same time
-            scoped_lock lk( _connectHookMutex );
-
-            // Allow the replacement of connections with other connections - useful for testing.
-
-            uassert( 16335, "custom connection to " + this->toString() +
-                        " specified with no connection hook", _connectHook );
-
-            // Double-checked lock, since this will never be active during normal operation
-            DBClientBase* replacementConn = _connectHook->connect( *this, errmsg, socketTimeout );
-
-            log() << "replacing connection to " << this->toString() << " with "
-                  << ( replacementConn ? replacementConn->getServerAddress() : "(empty)" ) << endl;
-
-            return replacementConn;
-        }
-
-        case INVALID:
-            throw UserException( 13421 , "trying to connect to invalid ConnectionString" );
-            break;
-        }
-
-        verify( 0 );
-        return 0;
-    }
-
-    bool ConnectionString::sameLogicalEndpoint( const ConnectionString& other ) const {
-        if ( _type != other._type )
-            return false;
-
-        switch ( _type ) {
-        case INVALID:
-            return true;
-        case MASTER:
-            return _servers[0] == other._servers[0];
-        case PAIR:
-            if ( _servers[0] == other._servers[0] )
-                return _servers[1] == other._servers[1];
-            return
-                ( _servers[0] == other._servers[1] ) &&
-                ( _servers[1] == other._servers[0] );
-        case SET:
-            return _setName == other._setName;
-        case SYNC:
-            // The servers all have to be the same in each, but not in the same order.
-            if ( _servers.size() != other._servers.size() )
-                return false;
-            for ( unsigned i = 0; i < _servers.size(); i++ ) {
-                bool found = false;
-                for ( unsigned j = 0; j < other._servers.size(); j++ ) {
-                    if ( _servers[i] == other._servers[j] ) {
-                        found = true;
-                        break;
-                    }
-                }
-                if ( ! found )
-                    return false;
-            }
-            return true;
-        case CUSTOM:
-            return _string == other._string;
-        }
-        verify( false );
-    }
-
-    ConnectionString ConnectionString::parse( const string& host , string& errmsg ) {
-
-        string::size_type i = host.find( '/' );
-        if ( i != string::npos && i != 0) {
-            // replica set
-            return ConnectionString( SET , host.substr( i + 1 ) , host.substr( 0 , i ) );
-        }
-
-        int numCommas = str::count( host , ',' );
-
-        if( numCommas == 0 )
-            return ConnectionString( HostAndPort( host ) );
-
-        if ( numCommas == 1 )
-            return ConnectionString( PAIR , host );
-
-        if ( numCommas == 2 )
-            return ConnectionString( SYNC , host );
-
-        errmsg = (string)"invalid hostname [" + host + "]";
-        return ConnectionString(); // INVALID
-    }
-
-    string ConnectionString::typeToString( ConnectionType type ) {
-        switch ( type ) {
-        case INVALID:
-            return "invalid";
-        case MASTER:
-            return "master";
-        case PAIR:
-            return "pair";
-        case SET:
-            return "set";
-        case SYNC:
-            return "sync";
-        case CUSTOM:
-            return "custom";
-        }
-        verify(0);
-        return "";
-    }
 
     const BSONField<BSONObj> Query::ReadPrefField("$readPreference");
     const BSONField<string> Query::ReadPrefModeField("mode");
@@ -468,6 +282,41 @@ namespace mongo {
         return runCommand(dbname, b.done(), *info);
     }
 
+    bool DBClientWithCommands::runPseudoCommand(StringData db,
+                                                StringData realCommandName,
+                                                StringData pseudoCommandCol,
+                                                const BSONObj& cmdArgs,
+                                                BSONObj& info,
+                                                int options) {
+
+        BSONObjBuilder bob;
+        bob.append(realCommandName, 1);
+        bob.appendElements(cmdArgs);
+        auto cmdObj = bob.done();
+
+        bool success = false;
+
+        if (!(success = runCommand(db.toString(), cmdObj, info, options))) {
+
+            auto status = getStatusFromCommandResult(info);
+            verify(!status.isOK());
+
+            if (status == ErrorCodes::CommandResultSchemaViolation) {
+                msgasserted(28624, str::stream() << "Received bad "
+                                                 << realCommandName
+                                                 << " response from server: "
+                                                 << info);
+            } else if (status == ErrorCodes::CommandNotFound) {
+                NamespaceString pseudoCommandNss(db, pseudoCommandCol);
+                // if this throws we just let it escape as that's how runCommand works.
+                info = findOne(pseudoCommandNss.ns(), cmdArgs, nullptr, options);
+                return true;
+            }
+        }
+
+        return success;
+    }
+
     unsigned long long DBClientWithCommands::count(const string &myns, const BSONObj& query, int options, int limit, int skip ) {
         BSONObj cmd = _countCmd( myns , query , options , limit , skip );
         BSONObj res;
@@ -622,7 +471,7 @@ namespace mongo {
                     result.toString(),
                     _authMongoCR(db, user, password, &result, digestPassword));
         }
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         else if (mechanism == StringData("MONGODB-X509", StringData::LiteralTag())){
             std::string db;
             if (params.hasField(saslCommandUserSourceFieldName)) {
@@ -895,22 +744,35 @@ namespace mongo {
         list<BSONObj> infos;
 
         // first we're going to try the command
-        // it was only added in 2.8, so if we're talking to an older server
+        // it was only added in 3.0, so if we're talking to an older server
         // we'll fail back to querying system.namespaces
-        // TODO(spencer): remove fallback behavior after 2.8
+        // TODO(spencer): remove fallback behavior after 3.0 
 
         {
             BSONObj res;
             if (runCommand(db,
-                           BSON("listCollections" << 1 << "filter" << filter),
+                           BSON("listCollections" << 1 << "filter" << filter
+                                                       << "cursor" << BSONObj()),
                            res,
                            QueryOption_SlaveOk)) {
-                BSONObj collections = res["collections"].Obj();
+                BSONObj cursorObj = res["cursor"].Obj();
+                BSONObj collections = cursorObj["firstBatch"].Obj();
                 BSONObjIterator it( collections );
                 while ( it.more() ) {
                     BSONElement e = it.next();
                     infos.push_back( e.Obj().getOwned() );
                 }
+
+                const long long id = cursorObj["id"].Long();
+
+                if ( id != 0 ) {
+                    const std::string ns = cursorObj["ns"].String();
+                    auto_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
+                    while ( cursor->more() ) {
+                        infos.push_back(cursor->nextSafe().getOwned());
+                    }
+                }
+
                 return infos;
             }
 
@@ -938,6 +800,8 @@ namespace mongo {
         string ns = db + ".system.namespaces";
         auto_ptr<DBClientCursor> c = query(
                 ns.c_str(), fallbackFilter.obj(), 0, 0, 0, QueryOption_SlaveOk);
+        uassert(28611, str::stream() << "listCollections failed querying " << ns, c.get());
+
         while ( c->more() ) {
             BSONObj obj = c->nextSafe();
             string ns = obj["name"].valuestr();
@@ -1049,10 +913,10 @@ namespace mongo {
             LOG( 1 ) << "connected to server " << toString() << endl;
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         int sslModeVal = sslGlobalParams.sslMode.load();
-        if (sslModeVal == SSLGlobalParams::SSLMode_preferSSL ||
-            sslModeVal == SSLGlobalParams::SSLMode_requireSSL) {
+        if (sslModeVal == SSLParams::SSLMode_preferSSL ||
+            sslModeVal == SSLParams::SSLMode_requireSSL) {
             return p->secure( sslManager(), _server.host() );
         }
 #endif
@@ -1071,14 +935,13 @@ namespace mongo {
                                         int options) {
         if (DBClientWithCommands::runCommand(dbname, cmd, info, options))
             return true;
-        
-        if ( clientSet && isNotMasterErrorString( info["errmsg"] ) ) {
-            clientSet->isntMaster();
+
+        if (!_parentReplSetName.empty()) {
+            handleNotMasterResponse(info["errmsg"]);
         }
 
         return false;
     }
-
 
     void DBClientConnection::_checkConnection() {
         if ( !_failed )
@@ -1187,10 +1050,6 @@ namespace mongo {
             n += i.n();
         }
         return n;
-    }
-
-    void DBClientConnection::setReplSetClientCallback(DBClientReplicaSet* rsClient) {
-        clientSet = rsClient;
     }
 
     unsigned long long DBClientConnection::query(
@@ -1346,13 +1205,29 @@ namespace mongo {
         list<BSONObj> specs;
 
         {
-            BSONObj cmd = BSON( "listIndexes" << nsToCollectionSubstring( ns ) );
+            BSONObj cmd = BSON(
+                "listIndexes" << nsToCollectionSubstring( ns ) <<
+                "cursor" << BSONObj()
+            );
+
             BSONObj res;
             if ( runCommand( nsToDatabase( ns ), cmd, res, options ) ) {
-                BSONObjIterator i( res["indexes"].Obj() );
+                BSONObj cursorObj = res["cursor"].Obj();
+                BSONObjIterator i( cursorObj["firstBatch"].Obj() );
                 while ( i.more() ) {
                     specs.push_back( i.next().Obj().getOwned() );
                 }
+
+                const long long id = cursorObj["id"].Long();
+
+                if ( id != 0 ) {
+                    const std::string ns = cursorObj["ns"].String();
+                    auto_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
+                    while ( cursor->more() ) {
+                        specs.push_back(cursor->nextSafe().getOwned());
+                    }
+                }
+
                 return specs;
             }
             int code = res["code"].numberInt();
@@ -1370,9 +1245,11 @@ namespace mongo {
         }
 
         // fallback to querying system.indexes
-        // TODO(spencer): Remove fallback behavior after 2.8
+        // TODO(spencer): Remove fallback behavior after 3.0
         auto_ptr<DBClientCursor> cursor = query(NamespaceString(ns).getSystemIndexesCollection(),
                                                 BSON("ns" << ns), 0, 0, 0, options);
+        uassert(28612, str::stream() << "listIndexes failed querying " << ns, cursor.get());
+
         while ( cursor->more() ) {
             BSONObj spec = cursor->nextSafe();
             specs.push_back( spec.getOwned() );
@@ -1493,15 +1370,11 @@ namespace mongo {
     }
 
     /* -- DBClientCursor ---------------------------------------------- */
-
-#ifdef _DEBUG
-#define CHECK_OBJECT( o , msg ) massert( 10337 ,  (string)"object not valid" + (msg) , (o).isValid() )
-#else
-#define CHECK_OBJECT( o , msg )
-#endif
-
     void assembleRequest( const string &ns, BSONObj query, int nToReturn, int nToSkip, const BSONObj *fieldsToReturn, int queryOptions, Message &toSend ) {
-        CHECK_OBJECT( query , "assembleRequest query" );
+        if (kDebugBuild) {
+            massert( 10337 ,  (string)"object not valid assembleRequest query" , query.isValid() );
+        }
+
         // see query.h for the protocol we are using here.
         BufBuilder b;
         int opts = queryOptions;
@@ -1513,6 +1386,14 @@ namespace mongo {
         if ( fieldsToReturn )
             fieldsToReturn->appendSelfToBufBuilder(b);
         toSend.setData(dbQuery, b.buf(), b.len());
+    }
+
+    DBClientConnection::DBClientConnection(bool _autoReconnect, double so_timeout):
+                    _failed(false),
+                    autoReconnect(_autoReconnect),
+                    autoReconnectBackoff(1000, 2000),
+                    _so_timeout(so_timeout) {
+        _numConnections.fetchAndAdd(1);
     }
 
     void DBClientConnection::say( Message &toSend, bool isRetry , string * actualServer ) {
@@ -1591,12 +1472,10 @@ namespace mongo {
         *retry = false;
         *host = _serverString;
 
-        if ( clientSet && nReturned ) {
+        if (!_parentReplSetName.empty() && nReturned) {
             verify(data);
-            BSONObj o(data);
-            if ( isNotMasterErrorString( getErrField(o) ) ) {
-                clientSet->isntMaster();
-            }
+            BSONObj bsonView(data);
+            handleNotMasterResponse(getErrField(bsonView));
         }
     }
 
@@ -1615,7 +1494,28 @@ namespace mongo {
             say(m);
     }
 
-#ifdef MONGO_SSL
+    void DBClientConnection::setParentReplSetName(const string& replSetName) {
+        _parentReplSetName = replSetName;
+    }
+
+    void DBClientConnection::handleNotMasterResponse(const BSONElement& elemToCheck) {
+        if (!isNotMasterErrorString(elemToCheck)) {
+            return;
+        }
+
+        MONGO_LOG_COMPONENT(1, logger::LogComponent::kReplication)
+            << "got not master from: " << _serverString
+            << " of repl set: " << _parentReplSetName;
+
+        ReplicaSetMonitorPtr monitor = ReplicaSetMonitor::get(_parentReplSetName);
+        if (monitor) {
+            monitor->failedHost(_server);
+        }
+
+        _failed = true;
+    }
+
+#ifdef MONGO_CONFIG_SSL
     static SimpleMutex s_mtx("SSLManager");
     static SSLManagerInterface* s_sslMgr(NULL);
 
@@ -1634,7 +1534,7 @@ namespace mongo {
 
 
     bool serverAlive( const string &uri ) {
-        DBClientConnection c( false, 0, 20 ); // potentially the connection to server could fail while we're checking if it's alive - so use timeouts
+        DBClientConnection c(false, 20); // potentially the connection to server could fail while we're checking if it's alive - so use timeouts
         string err;
         if ( !c.connect( HostAndPort(uri), err ) )
             return false;

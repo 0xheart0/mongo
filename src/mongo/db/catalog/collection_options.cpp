@@ -30,6 +30,7 @@
 
 #include "mongo/db/catalog/collection_options.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -56,17 +57,24 @@ namespace mongo {
         initialNumExtents = 0;
         initialExtentSizes.clear();
         autoIndexId = DEFAULT;
-        flags = 0;
+        // For compatibility with previous versions if the user sets no flags,
+        // we set Flag_UsePowerOf2Sizes in case the user downgrades.
+        flags = Flag_UsePowerOf2Sizes;
         flagsSet = false;
         temp = false;
         storageEngine = BSONObj();
+        validator = BSONObj();
     }
 
-    Status CollectionOptions::parse( const BSONObj& options ) {
-        return parse(options, "");
+    bool CollectionOptions::isValid() const {
+        return validate().isOK();
     }
 
-    Status CollectionOptions::parse(const BSONObj& options, const std::string& storageEngineName) {
+    Status CollectionOptions::validate() const {
+        return CollectionOptions().parse(toBSON());
+    }
+
+    Status CollectionOptions::parse(const BSONObj& options) {
         reset();
 
         // During parsing, ignore some validation errors in order to accept options objects that
@@ -127,8 +135,8 @@ namespace mongo {
             }
             else if (fieldName == "storageEngine") {
                 // Storage engine-specific collection options.
-                // Exactly one document field under "storageEngine".
-                // Every field under "storageEngine" has to be a document.
+                // "storageEngine" field must be of type "document".
+                // Every field inside "storageEngine" has to be a document.
                 // Format:
                 // {
                 //     ...
@@ -136,44 +144,32 @@ namespace mongo {
                 //         storageEngine1: {
                 //             ...
                 //         },
+                //         storageEngine2: {
+                //             ...
+                //         }
                 //     },
                 //     ...
                 // }
                 if (e.type() != mongo::Object) {
                     return Status(ErrorCodes::BadValue, "'storageEngine' has to be a document.");
                 }
-                BSONObjIterator j(e.Obj());
-                if (!j.more()) {
-                    return Status(ErrorCodes::BadValue,
-                                  "Empty 'storageEngine' options are invalid. "
-                                  "Please remove, or include valid options.");
-                }
-                else {
-                    BSONElement storageEngineElement = j.next();
+
+                BSONForEach(storageEngineElement, e.Obj()) {
+                    StringData storageEngineName = storageEngineElement.fieldNameStringData();
                     if (storageEngineElement.type() != mongo::Object) {
-                        return Status(ErrorCodes::BadValue, str::stream()
-                            << "'storageEngine." << storageEngineElement.fieldNameStringData()
-                            << "' has to be an embedded document.");
-                    }
-                    // If 'storageEngineName' is provided, ensure that current field name
-                    // matches 'storageEngineName'.
-                    if (!storageEngineName.empty() &&
-                        storageEngineElement.fieldNameStringData() != storageEngineName) {
-                        return Status(ErrorCodes::BadValue, str::stream()
-                            << "'storageEngine." << storageEngineElement.fieldNameStringData()
-                            << "' options do not match, and cannot be used, "
-                            << "for the currently enabled storage engine of '" + storageEngineName + "'");
+                        return Status(ErrorCodes::BadValue, str::stream() << "'storageEngine." <<
+                                      storageEngineName << "' has to be an embedded document.");
                     }
                 }
-                if (j.more()) {
-                    BSONElement storageEngineElement = j.next();
-                    return Status(ErrorCodes::BadValue, str::stream()
-                        << "The 'storageEngine' options must only include the current storage "
-                        << "engine ('" << e.Obj().firstElementFieldName()
-                        << "'), not the additional options for '"
-                        << storageEngineElement.fieldNameStringData() << "'.");
-                }
+
                 storageEngine = e.Obj().getOwned();
+            }
+            else if (fieldName == "validator") {
+                if (e.type() != mongo::Object) {
+                    return Status(ErrorCodes::BadValue, "'validator' has to be a document.");
+                }
+
+                validator = e.Obj().getOwned();
             }
         }
 
@@ -206,6 +202,10 @@ namespace mongo {
 
         if (!storageEngine.isEmpty()) {
             b.append("storageEngine", storageEngine);
+        }
+
+        if (!validator.isEmpty()) {
+            b.append("validator", validator);
         }
 
         return b.obj();

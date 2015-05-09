@@ -34,6 +34,8 @@
 
 namespace mongo {
 
+    using std::vector;
+
     const char* ClusterExplain::kSingleShard = "SINGLE_SHARD";
     const char* ClusterExplain::kMergeFromShards = "SHARD_MERGE";
     const char* ClusterExplain::kMergeSortFromShards = "SHARD_MERGE_SORT";
@@ -49,7 +51,7 @@ namespace mongo {
 
         bool appendIfRoom(BSONObjBuilder* bob,
                           const BSONObj& toAppend,
-                          const StringData& fieldName) {
+                          StringData fieldName) {
             if ((bob->len() + toAppend.objsize()) < BSONObjMaxUserSize) {
                 bob->append(fieldName, toAppend);
                 return true;

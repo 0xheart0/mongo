@@ -30,6 +30,8 @@
 
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 
+#include <memory>
+
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
 
@@ -38,16 +40,16 @@ namespace mongo {
     // Insert multiple keys and verify that omitting the commit()
     // on the WriteUnitOfWork causes the changes to not become visible.
     TEST( SortedDataInterface, InsertWithoutCommit ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+        const std::unique_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
+        const std::unique_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT( sorted->isEmpty( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, false ) );
@@ -56,12 +58,12 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT( sorted->isEmpty( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 ASSERT_OK( sorted->insert( opCtx.get(), key2, loc1, false ) );
@@ -71,7 +73,7 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT( sorted->isEmpty( opCtx.get() ) );
         }
     }
@@ -80,16 +82,16 @@ namespace mongo {
     // omitting the commit() on the WriteUnitOfWork causes the changes to
     // not become visible.
     TEST( SortedDataInterface, UnindexWithoutCommit ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+        const std::unique_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
+        const std::unique_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT( sorted->isEmpty( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
@@ -99,12 +101,12 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT_EQUALS( 2, sorted->numEntries( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 sorted->unindex( opCtx.get(), key2, loc2, true );
@@ -114,12 +116,12 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT_EQUALS( 2, sorted->numEntries( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 ASSERT_OK( sorted->insert( opCtx.get(), key3, loc3, true ) );
@@ -128,12 +130,12 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
                 sorted->unindex( opCtx.get(), key1, loc1, true );
@@ -145,7 +147,7 @@ namespace mongo {
         }
 
         {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
+            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
         }
     }

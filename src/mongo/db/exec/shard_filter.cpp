@@ -38,6 +38,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 
@@ -94,7 +97,8 @@ namespace mongo {
 
                     // Skip this document with a warning - no shard key should not be possible
                     // unless manually inserting data into a shard
-                    warning() << "no shard key found in document " << member->obj.toString() << " "
+                    warning() << "no shard key found in document "
+                              << member->obj.value().toString() << " "
                               << "for shard key pattern " << _metadata->getKeyPattern() << ", "
                               << "document may have been inserted manually into shard";
                 }
@@ -114,8 +118,8 @@ namespace mongo {
         else if (PlanStage::NEED_TIME == status) {
             ++_commonStats.needTime;
         }
-        else if (PlanStage::NEED_FETCH == status) {
-            ++_commonStats.needFetch;
+        else if (PlanStage::NEED_YIELD == status) {
+            ++_commonStats.needYield;
         }
 
         return status;
@@ -152,11 +156,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* ShardFilterStage::getCommonStats() {
+    const CommonStats* ShardFilterStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* ShardFilterStage::getSpecificStats() {
+    const SpecificStats* ShardFilterStage::getSpecificStats() const {
         return &_specificStats;
     }
 

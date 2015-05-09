@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <queue>
 
 #include "mongo/base/string_data.h"
@@ -87,12 +88,12 @@ namespace mongo {
         virtual void restoreState(OperationContext* opCtx);
         virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
-        virtual vector<PlanStage*> getChildren() const;
+        virtual std::vector<PlanStage*> getChildren() const;
 
         virtual StageType stageType() const;
         virtual PlanStageStats* getStats();
-        virtual const CommonStats* getCommonStats();
-        virtual const SpecificStats* getSpecificStats();
+        virtual const CommonStats* getCommonStats() const;
+        virtual const SpecificStats* getSpecificStats() const;
 
     protected:
 
@@ -143,15 +144,28 @@ namespace mongo {
          */
         virtual StageState initialize(OperationContext* txn,
                                       WorkingSet* workingSet,
-                                      Collection* collection);
+                                      Collection* collection,
+                                      WorkingSetID* out) = 0;
 
     private:
+
+        //
+        // Save/restore/invalidate work specific to the search type.
+        //
+
+        virtual void finishSaveState() = 0;
+
+        virtual void finishRestoreState(OperationContext* txn) = 0;
+
+        virtual void finishInvalidate(OperationContext* txn,
+                                      const RecordId& dl,
+                                      InvalidationType type) = 0;
 
         //
         // Generic methods for progressive search functionality
         //
 
-        StageState initNext();
+        StageState initNext(WorkingSetID* out);
         StageState bufferNext(WorkingSetID* toReturn, Status* error);
         StageState advanceNext(WorkingSetID* toReturn);
 
@@ -179,14 +193,14 @@ namespace mongo {
         unordered_map<RecordId, WorkingSetID, RecordId::Hasher> _nextIntervalSeen;
 
         // Stats for the stage covering this interval
-        scoped_ptr<IntervalStats> _nextIntervalStats;
+        boost::scoped_ptr<IntervalStats> _nextIntervalStats;
 
         // Sorted buffered results to be returned - the current interval
         struct SearchResult;
         std::priority_queue<SearchResult> _resultBuffer;
 
         // Stats
-        scoped_ptr<PlanStageStats> _stats;
+        boost::scoped_ptr<PlanStageStats> _stats;
 
         // The current stage from which this stage should buffer results
         // Pointer to the last interval in _childrenIntervals. Owned by _childrenIntervals.
@@ -211,7 +225,7 @@ namespace mongo {
                         bool inclusiveMax);
 
         // Owned by NearStage
-        scoped_ptr<PlanStage> const covering;
+        boost::scoped_ptr<PlanStage> const covering;
         const bool dedupCovering;
 
         const double minDistance;

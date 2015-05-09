@@ -1,5 +1,3 @@
-// devnull_kv_engine.cpp
-
 /**
  *    Copyright (C) 2014 MongoDB Inc.
  *
@@ -28,8 +26,12 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 
+#include "mongo/base/disallow_copying.h"
+#include "mongo/db/storage/in_memory/in_memory_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 
@@ -50,7 +52,7 @@ namespace mongo {
 
     class DevNullRecordStore : public RecordStore {
     public:
-        DevNullRecordStore( const StringData& ns, const CollectionOptions& options )
+        DevNullRecordStore( StringData ns, const CollectionOptions& options )
             : RecordStore( ns ), _options( options ) {
             _numInserts = 0;
             _dummy = BSON( "_id" << 1 );
@@ -102,8 +104,12 @@ namespace mongo {
                                                   const char* data,
                                                   int len,
                                                   bool enforceQuota,
-                                                  UpdateMoveNotifier* notifier ) {
+                                                  UpdateNotifier* notifier ) {
             return StatusWith<RecordId>( oldLocation );
+        }
+
+        virtual bool updateWithDamagesSupported() const {
+            return false;
         }
 
         virtual Status updateWithDamages( OperationContext* txn,
@@ -111,7 +117,7 @@ namespace mongo {
                                           const RecordData& oldRec,
                                           const char* damageSource,
                                           const mutablebson::DamageVector& damages ) {
-            return Status::OK();
+            invariant(false);
         }
 
         virtual RecordIterator* getIterator( OperationContext* txn,
@@ -136,16 +142,10 @@ namespace mongo {
                                               RecordId end,
                                               bool inclusive) { }
 
-        virtual bool compactSupported() const { return false; }
-        virtual Status compact( OperationContext* txn,
-                                RecordStoreCompactAdaptor* adaptor,
-                                const CompactOptions* options,
-                                CompactStats* stats ) { return Status::OK(); }
-
         virtual Status validate( OperationContext* txn,
                                  bool full, bool scanData,
                                  ValidateAdaptor* adaptor,
-                                 ValidateResults* results, BSONObjBuilder* output ) const {
+                                 ValidateResults* results, BSONObjBuilder* output ) {
             return Status::OK();
         }
 
@@ -159,10 +159,9 @@ namespace mongo {
             return Status::OK();
         }
 
-        virtual Status setCustomOption( OperationContext* txn,
-                                        const BSONElement& option,
-                                        BSONObjBuilder* info = NULL ) {
-            return Status::OK();
+        virtual void updateStatsAfterRepair(OperationContext* txn,
+                                            long long numRecords,
+                                            long long dataSize) {
         }
 
     private:
@@ -171,17 +170,75 @@ namespace mongo {
         BSONObj _dummy;
     };
 
+    class DevNullSortedDataBuilderInterface : public SortedDataBuilderInterface {
+        MONGO_DISALLOW_COPYING(DevNullSortedDataBuilderInterface);
+
+    public:
+        DevNullSortedDataBuilderInterface() { }
+
+        virtual Status addKey(const BSONObj& key, const RecordId& loc) {
+            return Status::OK();
+        }
+    };
+
+    class DevNullSortedDataInterface : public SortedDataInterface {
+    public:
+        virtual ~DevNullSortedDataInterface() { }
+
+        virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* txn,
+                                                           bool dupsAllowed) {
+            return new DevNullSortedDataBuilderInterface();
+        }
+
+        virtual Status insert(OperationContext* txn,
+                              const BSONObj& key,
+                              const RecordId& loc,
+                              bool dupsAllowed) { return Status::OK(); }
+
+        virtual void unindex(OperationContext* txn,
+                             const BSONObj& key,
+                             const RecordId& loc,
+                             bool dupsAllowed) { }
+
+        virtual Status dupKeyCheck(OperationContext* txn,
+                                   const BSONObj& key,
+                                   const RecordId& loc) { return Status::OK(); }
+
+        virtual void fullValidate(OperationContext* txn, bool full, long long* numKeysOut,
+                                  BSONObjBuilder* output) const { }
+
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const {
+            return false;
+        }
+
+        virtual long long getSpaceUsedBytes( OperationContext* txn ) const { return 0; }
+
+        virtual bool isEmpty(OperationContext* txn) { return true; }
+
+        virtual std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* txn,
+                                                                       bool isForward) const {
+            return {};
+        }
+
+        virtual Status initAsEmpty(OperationContext* txn) { return Status::OK(); }
+    };
+
+
     RecordStore* DevNullKVEngine::getRecordStore( OperationContext* opCtx,
-                                                  const StringData& ns,
-                                                  const StringData& ident,
+                                                  StringData ns,
+                                                  StringData ident,
                                                   const CollectionOptions& options ) {
+        if ( ident == "_mdb_catalog" ) {
+            return new InMemoryRecordStore( ns, &_catalogInfo );
+        }
         return new DevNullRecordStore( ns, options );
     }
 
     SortedDataInterface* DevNullKVEngine::getSortedDataInterface( OperationContext* opCtx,
-                                                                  const StringData& ident,
+                                                                  StringData ident,
                                                                   const IndexDescriptor* desc ) {
-        return NULL;
+        return new DevNullSortedDataInterface();
     }
 
 }

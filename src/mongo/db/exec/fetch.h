@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
@@ -66,9 +68,9 @@ namespace mongo {
 
         PlanStageStats* getStats();
 
-        virtual const CommonStats* getCommonStats();
+        virtual const CommonStats* getCommonStats() const;
 
-        virtual const SpecificStats* getSpecificStats();
+        virtual const SpecificStats* getSpecificStats() const;
 
         static const char* kStageType;
 
@@ -89,24 +91,13 @@ namespace mongo {
 
         // _ws is not owned by us.
         WorkingSet* _ws;
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         // The filter is not owned by us.
         const MatchExpression* _filter;
 
-        // If we want to return a RecordId and it points to something that's not in memory,
-        // we return a "please page this in" result. We add a RecordFetcher given back to us by the
-        // storage engine to the WSM. The RecordFetcher is used by the PlanExecutor when it handles
-        // the fetch request.
-        //
-        // Some stages which request fetches don't need to use '_idBeingPagedIn' (e.g.,
-        // CollectionScan) because they are implemented with an underlying iterator which keeps
-        // track of the next WSM to be returned. A FetchStage has no such iterator, but rather
-        // streams its results from the child. Therefore, when it requests a yield via NEED_FETCH,
-        // the current WSM must be saved so that the fetched result can be returned on the next
-        // call to work(). This also requires special invalidation handling not found in stages like
-        // CollectionScan for when '_idBeingPagedIn' is invalidated before it can be returned.
-        WorkingSetID _idBeingPagedIn;
+        // If not Null, we use this rather than asking our child what to do next.
+        WorkingSetID _idRetrying;
 
         // Stats
         CommonStats _commonStats;

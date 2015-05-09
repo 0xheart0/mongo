@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -68,7 +69,7 @@ __cursor_enter(WT_SESSION_IMPL *session)
  * __cursor_leave --
  *	Deactivate a cursor.
  */
-static inline int
+static inline void
 __cursor_leave(WT_SESSION_IMPL *session)
 {
 	/*
@@ -79,8 +80,6 @@ __cursor_leave(WT_SESSION_IMPL *session)
 	WT_ASSERT(session, session->ncursors > 0);
 	if (--session->ncursors == 0)
 		__wt_txn_read_last(session);
-
-	return (0);
 }
 
 /*
@@ -112,9 +111,18 @@ __curfile_leave(WT_CURSOR_BTREE *cbt)
 
 	/* If the cursor was active, deactivate it. */
 	if (F_ISSET(cbt, WT_CBT_ACTIVE)) {
-		WT_RET(__cursor_leave(session));
+		__cursor_leave(session);
 		F_CLR(cbt, WT_CBT_ACTIVE);
 	}
+
+	/*
+	 * If we were scanning and saw a lot of deleted records on this page,
+	 * try to evict the page when we release it.
+	 */
+	if (cbt->ref != NULL &&
+	    cbt->page_deleted_count > WT_BTREE_DELETE_THRESHOLD)
+		__wt_page_evict_soon(cbt->ref->page);
+	cbt->page_deleted_count = 0;
 
 	/*
 	 * Release any page references we're holding.  This can trigger
@@ -124,6 +132,41 @@ __curfile_leave(WT_CURSOR_BTREE *cbt)
 	WT_RET(__wt_page_release(session, cbt->ref, 0));
 	cbt->ref = NULL;
 	return (0);
+}
+
+/*
+ * __wt_cursor_dhandle_incr_use --
+ *	Increment the in-use counter in cursor's data source.
+ */
+static inline void
+__wt_cursor_dhandle_incr_use(WT_SESSION_IMPL *session)
+{
+	WT_DATA_HANDLE *dhandle;
+
+	dhandle = session->dhandle;
+
+	/* If we open a handle with a time of death set, clear it. */
+	if (WT_ATOMIC_ADD4(dhandle->session_inuse, 1) == 1 &&
+	    dhandle->timeofdeath != 0)
+		dhandle->timeofdeath = 0;
+}
+
+/*
+ * __wt_cursor_dhandle_decr_use --
+ *	Decrement the in-use counter in cursor's data source.
+ */
+static inline void
+__wt_cursor_dhandle_decr_use(WT_SESSION_IMPL *session)
+{
+	WT_DATA_HANDLE *dhandle;
+
+	dhandle = session->dhandle;
+
+	/* If we close a handle with a time of death set, clear it. */
+	WT_ASSERT(session, dhandle->session_inuse > 0);
+	if (WT_ATOMIC_SUB4(dhandle->session_inuse, 1) == 0 &&
+	    dhandle->timeofdeath != 0)
+		dhandle->timeofdeath = 0;
 }
 
 /*
@@ -139,6 +182,10 @@ __cursor_func_init(WT_CURSOR_BTREE *cbt, int reenter)
 
 	if (reenter)
 		WT_RET(__curfile_leave(cbt));
+
+	/* If the transaction is idle, check that the cache isn't full. */
+	WT_RET(__wt_txn_idle_cache_check(session));
+
 	if (!F_ISSET(cbt, WT_CBT_ACTIVE))
 		WT_RET(__curfile_enter(cbt));
 	__wt_txn_cursor_op(session);
@@ -217,7 +264,7 @@ __cursor_row_slot_return(WT_CURSOR_BTREE *cbt, WT_ROW *rip, WT_UPDATE *upd)
 	__wt_cell_unpack(cell, unpack);
 	if (unpack->type == WT_CELL_KEY &&
 	    cbt->rip_saved != NULL && cbt->rip_saved == rip - 1) {
-		WT_ASSERT(session, cbt->tmp.size >= unpack->prefix);
+		WT_ASSERT(session, cbt->row_key->size >= unpack->prefix);
 
 		/*
 		 * Grow the buffer as necessary as well as ensure data has been
@@ -227,22 +274,22 @@ __cursor_row_slot_return(WT_CURSOR_BTREE *cbt, WT_ROW *rip, WT_UPDATE *upd)
 		 * Don't grow the buffer unnecessarily or copy data we don't
 		 * need, truncate the item's data length to the prefix bytes.
 		 */
-		cbt->tmp.size = unpack->prefix;
+		cbt->row_key->size = unpack->prefix;
 		WT_RET(__wt_buf_grow(
-		    session, &cbt->tmp, cbt->tmp.size + unpack->size));
-		memcpy((uint8_t *)cbt->tmp.data + cbt->tmp.size,
+		    session, cbt->row_key, cbt->row_key->size + unpack->size));
+		memcpy((uint8_t *)cbt->row_key->data + cbt->row_key->size,
 		    unpack->data, unpack->size);
-		cbt->tmp.size += unpack->size;
+		cbt->row_key->size += unpack->size;
 	} else {
 		/*
 		 * Call __wt_row_leaf_key_work instead of __wt_row_leaf_key: we
 		 * already did __wt_row_leaf_key's fast-path checks inline.
 		 */
-slow:		WT_RET(
-		    __wt_row_leaf_key_work(session, page, rip, &cbt->tmp, 0));
+slow:		WT_RET(__wt_row_leaf_key_work(
+		    session, page, rip, cbt->row_key, 0));
 	}
-	kb->data = cbt->tmp.data;
-	kb->size = cbt->tmp.size;
+	kb->data = cbt->row_key->data;
+	kb->size = cbt->row_key->size;
 	cbt->rip_saved = rip;
 
 value:

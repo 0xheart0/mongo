@@ -31,16 +31,19 @@
 #include "mongo/db/write_concern.h"
 
 #include "mongo/base/counter.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern_options.h"
 
 namespace mongo {
+
+    using std::string;
 
     static TimerStats gleWtimeStats;
     static ServerStatusMetricField<TimerStats> displayGleLatency("getLastError.wtime",
@@ -50,8 +53,75 @@ namespace mongo {
     static ServerStatusMetricField<Counter64> gleWtimeoutsDisplay("getLastError.wtimeouts",
                                                                   &gleWtimeouts );
 
+    void setupSynchronousCommit(OperationContext* txn) {
+        const WriteConcernOptions& writeConcern = txn->getWriteConcern();
+
+        if ( writeConcern.syncMode == WriteConcernOptions::JOURNAL ||
+             writeConcern.syncMode == WriteConcernOptions::FSYNC ) {
+            txn->recoveryUnit()->goingToAwaitCommit();
+        }
+    }
+
+    namespace {
+        // The consensus protocol requires that w: majority implies j: true on all nodes.
+        void addJournalSyncForWMajority(WriteConcernOptions* writeConcern) {
+            if (repl::getGlobalReplicationCoordinator()->isV1ElectionProtocol()
+                && writeConcern->wMode == WriteConcernOptions::kMajority
+                && writeConcern->syncMode == WriteConcernOptions::NONE)
+            {
+                writeConcern->syncMode = WriteConcernOptions::JOURNAL;
+            }
+        }
+    } // namespace
+
+    StatusWith<WriteConcernOptions> extractWriteConcern(const BSONObj& cmdObj) {
+        // The default write concern if empty is w : 1
+        // Specifying w : 0 is/was allowed, but is interpreted identically to w : 1
+        WriteConcernOptions writeConcern = repl::getGlobalReplicationCoordinator()
+                ->getGetLastErrorDefault();
+        if (writeConcern.wNumNodes == 0 && writeConcern.wMode.empty()) {
+            writeConcern.wNumNodes = 1;
+        }
+        // Upgrade default write concern if necessary.
+        addJournalSyncForWMajority(&writeConcern);
+
+        BSONElement writeConcernElement;
+        Status wcStatus = bsonExtractTypedField(cmdObj,
+                                                "writeConcern",
+                                                Object,
+                                                &writeConcernElement);
+        if (!wcStatus.isOK()) {
+            if (wcStatus == ErrorCodes::NoSuchKey) {
+                // Return default write concern if no write concern is given.
+                return writeConcern;
+            }
+            return wcStatus;
+        }
+
+        BSONObj writeConcernObj = writeConcernElement.Obj();
+        // Empty write concern is interpreted to default.
+        if (writeConcernObj.isEmpty()) {
+            return writeConcern;
+        }
+
+        wcStatus = writeConcern.parse(writeConcernObj);
+        if (!wcStatus.isOK()) {
+            return wcStatus;
+        }
+
+        wcStatus = validateWriteConcern(writeConcern);
+        if (!wcStatus.isOK()) {
+            return wcStatus;
+        }
+
+        // Upgrade parsed write concern if necessary.
+        addJournalSyncForWMajority(&writeConcern);
+
+        return writeConcern;
+    }
+
     Status validateWriteConcern( const WriteConcernOptions& writeConcern ) {
-        const bool isJournalEnabled = getGlobalEnvironment()->getGlobalStorageEngine()->isDurable();
+        const bool isJournalEnabled = getGlobalServiceContext()->getGlobalStorageEngine()->isDurable();
 
         if ( writeConcern.syncMode == WriteConcernOptions::JOURNAL && !isJournalEnabled ) {
             return Status( ErrorCodes::BadValue,
@@ -77,7 +147,7 @@ namespace mongo {
 
         if ( replMode != repl::ReplicationCoordinator::modeReplSet &&
                 !writeConcern.wMode.empty() &&
-                writeConcern.wMode != "majority" ) {
+                writeConcern.wMode != WriteConcernOptions::kMajority ) {
             return Status( ErrorCodes::BadValue,
                            string( "cannot use non-majority 'w' mode " ) + writeConcern.wMode
                            + " when a host is not a member of a replica set" );
@@ -138,9 +208,10 @@ namespace mongo {
     }
 
     Status waitForWriteConcern( OperationContext* txn,
-                                const WriteConcernOptions& writeConcern,
-                                const OpTime& replOpTime,
+                                const Timestamp& replOpTime,
                                 WriteConcernResult* result ) {
+
+        const WriteConcernOptions& writeConcern = txn->getWriteConcern();
 
         // We assume all options have been validated earlier, if not, programming error
         dassert( validateWriteConcern( writeConcern ).isOK() );
@@ -153,7 +224,7 @@ namespace mongo {
         case WriteConcernOptions::NONE:
             break;
         case WriteConcernOptions::FSYNC: {
-            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+            StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
             if ( !storageEngine->isDurable() ) {
                 result->fsyncFiles = storageEngine->flushAllFiles( true );
             }

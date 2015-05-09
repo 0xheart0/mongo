@@ -27,19 +27,20 @@
  */
 
 #include "mongo/dbtests/config_server_fixture.h"
+#include "mongo/s/catalog/legacy/cluster_client_internal.h"
+#include "mongo/s/catalog/legacy/config_upgrade.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_settings.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/cluster_client_internal.h"
-#include "mongo/s/config_upgrade.h"
 #include "mongo/s/type_mongos.h"
-#include "mongo/s/type_collection.h"
-#include "mongo/s/type_chunk.h"
-#include "mongo/s/type_shard.h"
-#include "mongo/s/type_settings.h"
 #include "mongo/s/type_config_version.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
+
+    using std::string;
 
     /**
      * Specialization of the config server fixture with helpers for the tests below.
@@ -56,8 +57,9 @@ namespace mongo {
             // DBDirectClient
             DBDirectClient client(&_txn);
             client.update(SettingsType::ConfigNS,
-                          BSON(SettingsType::key("balancer")),
-                          BSON(SettingsType::key("balancer") << SettingsType::balancerStopped(true)),
+                          BSON(SettingsType::key(SettingsType::BalancerDocKey)),
+                          BSON(SettingsType::key(SettingsType::BalancerDocKey) <<
+                               SettingsType::balancerStopped(true)),
                           true, false);
         }
 

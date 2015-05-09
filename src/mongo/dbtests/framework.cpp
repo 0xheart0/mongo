@@ -34,33 +34,39 @@
 
 #include "mongo/dbtests/framework.h"
 
-#ifndef _WIN32
-#include <cxxabi.h>
-#include <sys/file.h>
-#endif
+#include <string>
+#include <vector>
 
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/global_environment_d.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/d_state.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/catalog/legacy/legacy_dist_lock_manager.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
-#include "mongo/util/version_reporting.h"
+#include "mongo/util/version.h"
 
 namespace moe = mongo::optionenvironment;
 
 namespace mongo {
 
+    using std::endl;
+    using std::string;
+
     namespace dbtests {
 
-        mutex globalCurrentTestNameMutex("globalCurrentTestNameMutex");
+        mutex globalCurrentTestNameMutex;
         std::string globalCurrentTestName;
 
         class TestWatchDog : public BackgroundJob {
@@ -72,7 +78,7 @@ namespace mongo {
                 std::string lastRunningTestName, currentTestName;
 
                 {
-                    scoped_lock lk( globalCurrentTestNameMutex );
+                    boost::lock_guard<boost::mutex> lk( globalCurrentTestNameMutex );
                     lastRunningTestName = globalCurrentTestName;
                 }
 
@@ -81,7 +87,7 @@ namespace mongo {
                     minutesRunning++;
 
                     {
-                        scoped_lock lk( globalCurrentTestNameMutex );
+                        boost::lock_guard<boost::mutex> lk( globalCurrentTestNameMutex );
                         currentTestName = globalCurrentTestName;
                     }
 
@@ -114,9 +120,18 @@ namespace mongo {
             srand( (unsigned) frameworkGlobalParams.seed );
             printGitVersion();
             printOpenSSLVersion();
-            printSysInfo();
 
-            getGlobalEnvironment()->setGlobalStorageEngine(storageGlobalParams.engine);
+            getGlobalServiceContext()->setGlobalStorageEngine(storageGlobalParams.engine);
+
+            // Initialize the sharding state so we can run starding tests in isolation
+            shardingState.initialize("$dummy:10000");
+
+            // Note: ShardingState::initialize also initializes the distLockMgr.
+            auto distLockMgr = dynamic_cast<LegacyDistLockManager*>(
+                    grid.catalogManager()->getDistLockManager());
+            if (distLockMgr) {
+                distLockMgr->enablePinger(false);
+            }
 
             TestWatchDog twd;
             twd.go();
@@ -126,15 +141,22 @@ namespace mongo {
                                                     frameworkGlobalParams.runsPerTest);
 
 
-            cc().shutdown();
             exitCleanly( (ExitCode)ret ); // so everything shuts down cleanly
             return ret;
         }
     }  // namespace dbtests
 
+#ifdef _WIN32
+namespace ntservice {
+    bool shouldStartService() {
+        return false;
+    }
+}
+#endif
+
 }  // namespace mongo
 
 void mongo::unittest::onCurrentTestNameChange( const std::string &testName ) {
-    scoped_lock lk( mongo::dbtests::globalCurrentTestNameMutex );
+    boost::lock_guard<boost::mutex> lk( mongo::dbtests::globalCurrentTestNameMutex );
     mongo::dbtests::globalCurrentTestName = testName;
 }

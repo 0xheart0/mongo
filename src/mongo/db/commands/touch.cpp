@@ -44,12 +44,16 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/touch_pages.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     class TouchCmd : public Command {
     public:
@@ -77,15 +81,10 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-            const std::string coll = cmdObj.firstElement().valuestrsafe();
-            if (coll.empty()) {
-                errmsg = "no collection name specified";
-                return false;
-            }
+                         BSONObjBuilder& result) {
+            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
 
-            const NamespaceString nss( dbname, coll );
+            const NamespaceString nss(ns);
             if ( ! nss.isNormal() ) {
                 errmsg = "bad namespace name";
                 return false;

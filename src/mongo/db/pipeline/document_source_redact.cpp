@@ -26,7 +26,7 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
 
@@ -38,6 +38,9 @@
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::vector;
 
     const char DocumentSourceRedact::redactName[] = "$redact";
 
@@ -94,7 +97,7 @@ namespace mongo {
                     newArr.push_back(arr[i]);
                 }
             }
-            return Value::consume(newArr);
+            return Value(std::move(newArr));
         }
         else {
             return in;
@@ -134,8 +137,9 @@ namespace mongo {
         }
     }
 
-    void DocumentSourceRedact::optimize() {
+    intrusive_ptr<DocumentSource> DocumentSourceRedact::optimize() {
         _expression = _expression->optimize();
+        return this;
     }
 
     Value DocumentSourceRedact::serialize(bool explain) const {

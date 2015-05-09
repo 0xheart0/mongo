@@ -30,7 +30,7 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <time.h>
 
@@ -51,72 +51,25 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/server.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
+#include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
-#include "mongo/util/version_reporting.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
 
-#if 0
-    namespace cloud {
-        SimpleMutex mtx("cloud");
-        Guarded< vector<string>, mtx > ips;
-        bool startedThread = false;
-
-        void thread() { 
-            bson::bo cmd;
-            while( 1 ) {
-                list<Target> L;
-                {
-                    SimpleMutex::scoped_lock lk(mtx);
-                    if( ips.ref(lk).empty() )
-                        continue;
-                    for( unsigned i = 0; i < ips.ref(lk).size(); i++ ) { 
-                        L.push_back( Target(ips.ref(lk)[i]) );
-                    }
-                }
-
-
-                /** repoll as machines might be down on the first lookup (only if not found previously) */
-                sleepsecs(6); 
-            }
-        }
-    }
-
-    class CmdCloud : public Command {
-    public:
-        CmdCloud() : Command( "cloud" ) { }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( stringstream &help ) const {
-            help << "internal command facilitating running in certain cloud computing environments";
-        }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& obj, int options, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            if( !obj.hasElement("servers") ) { 
-                vector<string> ips;
-                obj["servers"].Obj().Vals(ips);
-                {
-                    SimpleMutex::scoped_lock lk(cloud::mtx);
-                    cloud::ips.ref(lk).swap(ips);
-                    if( !cloud::startedThread ) {
-                        cloud::startedThread = true;
-                        boost::thread thr(cloud::thread);
-                    }
-                }
-            }
-            return true;
-        }
-    } cmdCloud;
-#endif
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     class CmdBuildInfo : public Command {
     public:
@@ -136,9 +89,9 @@ namespace mongo {
                  BSONObj& jsobj,
                  int, // options
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
         appendBuildInfo(result);
+        appendStorageEngineList(&result);
         return true;
 
         }
@@ -155,7 +108,12 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(OperationContext* txn, const string& badns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        virtual bool run(OperationContext* txn,
+                         const string& badns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             // IMPORTANT: Don't put anything in here that might lock db - including authentication
             return true;
         }
@@ -170,7 +128,12 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             if ( globalScriptEngine ) {
                 BSONObjBuilder bb( result.subobjStart( "js" ) );
                 result.append( "utf8" , globalScriptEngine->utf8Ok() );
@@ -205,7 +168,12 @@ namespace mongo {
             actions.addAction(ActionType::hostInfo);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             ProcessInfo p;
             BSONObjBuilder bSys, bOs;
 
@@ -242,7 +210,12 @@ namespace mongo {
             actions.addAction(ActionType::logRotate);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate);
             if (didRotate)
                 logProcessDetailsForLogRotate();
@@ -261,9 +234,14 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             BSONObjBuilder b( result.subobjStart( "commands" ) );
-            for ( map<string,Command*>::iterator i=_commands->begin(); i!=_commands->end(); ++i ) {
+            for ( CommandMap::const_iterator i=_commands->begin(); i!=_commands->end(); ++i ) {
                 Command * c = i->second;
 
                 // don't show oldnames
@@ -312,15 +290,26 @@ namespace mongo {
             }
             ::abort();
         }
-        Client * c = currentClient.get();
-        if ( c ) {
-            c->shutdown();
+
+        log() << "terminating, shutdown command received";
+
+#if defined(_WIN32)
+        // Signal the ServiceMain thread to shutdown.
+        if(ntservice::shouldStartService()) {
+            signalShutdown();
+
+            // Client expects us to abruptly close the socket as part of exiting
+            // so this function is not allowed to return.
+            // The ServiceMain thread will quit for us so just sleep until it does.
+            while (true)
+                sleepsecs(60); // Loop forever
         }
-
-        log() << "terminating, shutdown command received" << endl;
-
-        exitCleanly(EXIT_CLEAN); // this never returns
-        invariant(false);
+        else
+#endif
+        {
+            exitCleanly(EXIT_CLEAN); // this never returns
+            invariant(false);
+        }
     }
 
     /* for testing purposes only */
@@ -337,8 +326,13 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
         CmdForceError() : Command("forceerror") {}
-        bool run(OperationContext* txn, const string& dbnamne, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            setLastError(10038, "forced error");
+        bool run(OperationContext* txn,
+                 const string& dbnamne,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
+            LastError::get(cc()).setLastError(10038, "forced error");
             return false;
         }
     } cmdForceError;
@@ -361,8 +355,20 @@ namespace mongo {
             help << "{ getLog : '*' }  OR { getLog : 'global' }";
         }
 
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            string p = cmdObj.firstElement().String();
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
+            BSONElement val = cmdObj.firstElement();
+            if (val.type() != String) {
+                return appendCommandStatus(result, Status(ErrorCodes::TypeMismatch, str::stream()
+                    << "Argument to getLog must be of type String; found "
+                    << val.toString(false) << " of type " << typeName(val.type())));
+            }
+
+            string p = val.String();
             if ( p == "*" ) {
                 vector<string> names;
                 RamLog::getNames( names );
@@ -408,7 +414,12 @@ namespace mongo {
             actions.addAction(ActionType::getCmdLineOpts);
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
-        virtual bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        virtual bool run(OperationContext* txn,
+                         const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
             result.append("argv", serverGlobalParams.argvArray);
             result.append("parsed", serverGlobalParams.parsedOpts);
             return true;

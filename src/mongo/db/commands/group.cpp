@@ -30,17 +30,23 @@
 
 #include "mongo/db/commands/group.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/group.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/get_executor.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::string;
 
     static GroupCommand cmdGroup;
 
@@ -50,7 +56,7 @@ namespace mongo {
                                              const std::string& dbname,
                                              const BSONObj& cmdObj) {
         std::string ns = parseNs(dbname, cmdObj);
-        if (!client->getAuthorizationSession()->isAuthorizedForActionsOnNamespace(
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnNamespace(
                 NamespaceString(ns), ActionType::find)) {
             return Status(ErrorCodes::Unauthorized, "unauthorized");
         }
@@ -126,8 +132,7 @@ namespace mongo {
                            BSONObj& cmdObj,
                            int,
                            std::string& errmsg,
-                           BSONObjBuilder& out,
-                           bool fromRepl) {
+                           BSONObjBuilder& out) {
         GroupRequest groupRequest;
         Status parseRequestStatus = parseRequest(dbname, cmdObj, &groupRequest);
         if (!parseRequestStatus.isOK()) {
@@ -153,7 +158,7 @@ namespace mongo {
         BSONObj retval;
         PlanExecutor::ExecState state = planExecutor->getNext(&retval, NULL);
         if (PlanExecutor::ADVANCED != state) {
-            if (PlanExecutor::EXEC_ERROR == state &&
+            if (PlanExecutor::FAILURE == state &&
                 WorkingSetCommon::isValidStatusMemberObject(retval)) {
                 return appendCommandStatus(out, WorkingSetCommon::getMemberObjectStatus(retval));
             }

@@ -35,10 +35,12 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::string;
 
     static CmdExplain cmdExplain;
 
@@ -65,15 +67,7 @@ namespace mongo {
                          const string& dbname,
                          BSONObj& cmdObj, int options,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-        // Should never get explain commands issued from replication.
-        if (fromRepl) {
-            Status commandStat(ErrorCodes::IllegalOperation,
-                               "explain command should not be from repl");
-            appendCommandStatus(result, commandStat);
-            return false;
-        }
+                         BSONObjBuilder& result) {
 
         ExplainCommon::Verbosity verbosity;
         Status parseStatus = ExplainCommon::parseCmdBSON(cmdObj, &verbosity);
@@ -96,7 +90,7 @@ namespace mongo {
         // copied from Command::execCommand and should be abstracted. Until then, make
         // sure to keep it up to date.
         repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
-        bool canRunHere =
+        const bool canRunHere =
             replCoord->canAcceptWritesForDatabase(dbname) ||
             commToExplain->slaveOk() ||
             (commToExplain->slaveOverrideOk() && (options & QueryOption_SlaveOk));

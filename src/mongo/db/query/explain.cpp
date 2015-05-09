@@ -30,11 +30,14 @@
 
 #include "mongo/db/query/explain.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/server_options.h"
@@ -45,11 +48,15 @@
 namespace {
 
     using namespace mongo;
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::string;
+    using std::vector;
 
     /**
      * Traverse the tree rooted at 'root', and add all tree nodes into the list 'flattened'.
      */
-    void flattenStatsTree(PlanStageStats* root, vector<PlanStageStats*>* flattened) {
+    void flattenStatsTree(const PlanStageStats* root, vector<const PlanStageStats*>* flattened) {
         flattened->push_back(root);
         for (size_t i = 0; i < root->children.size(); ++i) {
             flattenStatsTree(root->children[i], flattened);
@@ -59,7 +66,7 @@ namespace {
     /**
      * Traverse the tree rooted at 'root', and add all nodes into the list 'flattened'.
      */
-    void flattenExecTree(PlanStage* root, vector<PlanStage*>* flattened) {
+    void flattenExecTree(const PlanStage* root, vector<const PlanStage*>* flattened) {
         flattened->push_back(root);
         vector<PlanStage*> children = root->getChildren();
         for (size_t i = 0; i < children.size(); ++i) {
@@ -114,7 +121,7 @@ namespace {
             const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
             return spec->keysExamined;
         }
-        else if (STAGE_DISTINCT == type) {
+        else if (STAGE_DISTINCT_SCAN == type) {
             const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
             return spec->keysExamined;
         }
@@ -155,7 +162,7 @@ namespace {
     /**
      * Adds to the plan summary string being built by 'ss' for the execution stage 'stage'.
      */
-    void addStageSummaryStr(PlanStage* stage, mongoutils::str::stream& ss) {
+    void addStageSummaryStr(const PlanStage* stage, mongoutils::str::stream& ss) {
         // First add the stage type string.
         const CommonStats* common = stage->getCommonStats();
         ss << common->stageTypeStr;
@@ -166,7 +173,7 @@ namespace {
             const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
             ss << " " << spec->keyPattern;
         }
-        else if (STAGE_DISTINCT == stage->stageType()) {
+        else if (STAGE_DISTINCT_SCAN == stage->stageType()) {
             const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
             ss << " " << spec->keyPattern;
         }
@@ -224,7 +231,7 @@ namespace mongo {
             bob->appendNumber("works", stats.common.works);
             bob->appendNumber("advanced", stats.common.advanced);
             bob->appendNumber("needTime", stats.common.needTime);
-            bob->appendNumber("needFetch", stats.common.needFetch);
+            bob->appendNumber("needYield", stats.common.needYield);
             bob->appendNumber("saveState", stats.common.yields);
             bob->appendNumber("restoreState", stats.common.unyields);
             bob->appendNumber("isEOF", stats.common.isEOF);
@@ -282,13 +289,16 @@ namespace mongo {
             }
 
             bob->append("keyPattern", spec->keyPattern);
+            bob->append("indexName", spec->indexName);
             bob->appendBool("isMultiKey", spec->isMultiKey);
+            bob->append("indexVersion", spec->indexVersion);
         }
         else if (STAGE_DELETE == stats.stageType) {
             DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
 
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("nWouldDelete", spec->docsDeleted);
+                bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
             }
         }
         else if (STAGE_FETCH == stats.stageType) {
@@ -301,6 +311,9 @@ namespace mongo {
         else if (STAGE_GEO_NEAR_2D == stats.stageType
                 || STAGE_GEO_NEAR_2DSPHERE == stats.stageType) {
             NearStats* spec = static_cast<NearStats*>(stats.specific.get());
+
+            bob->append("keyPattern", spec->keyPattern);
+            bob->append("indexName", spec->indexName);
 
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 BSONArrayBuilder intervalsBob(bob->subarrayStart("searchIntervals"));
@@ -331,7 +344,9 @@ namespace mongo {
             IndexScanStats* spec = static_cast<IndexScanStats*>(stats.specific.get());
 
             bob->append("keyPattern", spec->keyPattern);
+            bob->append("indexName", spec->indexName);
             bob->appendBool("isMultiKey", spec->isMultiKey);
+            bob->append("indexVersion", spec->indexVersion);
             bob->append("direction", spec->direction > 0 ? "forward" : "backward");
 
             if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxStatsBSONSize) {
@@ -412,6 +427,7 @@ namespace mongo {
             }
 
             bob->append("indexPrefix", spec->indexPrefix);
+            bob->append("indexName", spec->indexName);
             bob->append("parsedTextQuery", spec->parsedTextQuery);
         }
         else if (STAGE_UPDATE == stats.stageType) {
@@ -420,10 +436,8 @@ namespace mongo {
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("nMatched", spec->nMatched);
                 bob->appendNumber("nWouldModify", spec->nModified);
+                bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
                 bob->appendBool("wouldInsert", spec->inserted);
-            }
-
-            if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendBool("fastmod", spec->fastmod);
                 bob->appendBool("fastmodinsert", spec->fastmodinsert);
             }
@@ -471,13 +485,33 @@ namespace mongo {
     }
 
     // static
-    void Explain::generatePlannerInfo(CanonicalQuery* query,
+    void Explain::generatePlannerInfo(PlanExecutor* exec,
                                       PlanStageStats* winnerStats,
                                       const vector<PlanStageStats*>& rejectedStats,
                                       BSONObjBuilder* out) {
+        CanonicalQuery* query = exec->getCanonicalQuery();
+
         BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));;
 
         plannerBob.append("plannerVersion", QueryPlanner::kPlannerVersion);
+        plannerBob.append("namespace", exec->ns());
+
+        // Find whether there is an index filter set for the query shape. The 'indexFilterSet'
+        // field will always be false in the case of EOF or idhack plans.
+        bool indexFilterSet = false;
+        if (exec->collection() && exec->getCanonicalQuery()) {
+            const CollectionInfoCache* infoCache = exec->collection()->infoCache();
+            const QuerySettings* querySettings = infoCache->getQuerySettings();
+            PlanCacheKey planCacheKey =
+                infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
+            AllowedIndices* allowedIndicesRaw;
+            if (querySettings->getAllowedIndices(planCacheKey, &allowedIndicesRaw)) {
+                // Found an index filter set on the query shape.
+                boost::scoped_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
+                indexFilterSet = true;
+            }
+        }
+        plannerBob.append("indexFilterSet", indexFilterSet);
 
         // In general we should have a canonical query, but sometimes we may avoid
         // creating a canonical query as an optimization (specifically, the update system
@@ -520,7 +554,7 @@ namespace mongo {
         }
 
         // Flatten the stats tree into a list.
-        vector<PlanStageStats*> statsNodes;
+        vector<const PlanStageStats*> statsNodes;
         flattenStatsTree(stats, &statsNodes);
 
         // Iterate over all stages in the tree and get the total number of keys/docs examined.
@@ -596,9 +630,8 @@ namespace mongo {
         // Step 3: use the stats trees to produce explain BSON.
         //
 
-        CanonicalQuery* query = exec->getCanonicalQuery();
         if (verbosity >= ExplainCommon::QUERY_PLANNER) {
-            generatePlannerInfo(query, winningStats.get(), allPlansStats.vector(), out);
+            generatePlannerInfo(exec, winningStats.get(), allPlansStats.vector(), out);
         }
 
         if (verbosity >= ExplainCommon::EXEC_STATS) {
@@ -645,13 +678,13 @@ namespace mongo {
     }
 
     // static
-    string Explain::getPlanSummary(PlanExecutor* exec) {
+    std::string Explain::getPlanSummary(const PlanExecutor* exec) {
          return getPlanSummary(exec->getRootStage());
     }
 
     // static
-    string Explain::getPlanSummary(PlanStage* root) {
-        vector<PlanStage*> stages;
+    std::string Explain::getPlanSummary(const PlanStage* root) {
+        std::vector<const PlanStage*> stages;
         flattenExecTree(root, &stages);
 
         // Use this stream to build the plan summary string.
@@ -676,7 +709,7 @@ namespace mongo {
     }
 
     // static
-    void Explain::getSummaryStats(PlanExecutor* exec, PlanSummaryStats* statsOut) {
+    void Explain::getSummaryStats(const PlanExecutor* exec, PlanSummaryStats* statsOut) {
         invariant(NULL != statsOut);
 
         PlanStage* root = exec->getRootStage();
@@ -687,12 +720,9 @@ namespace mongo {
         statsOut->nReturned = common->advanced;
         statsOut->executionTimeMillis = common->executionTimeMillis;
 
-        // Generate the plan summary string.
-        statsOut->summaryStr = getPlanSummary(root);
-
         // The other fields are aggregations over the stages in the plan tree. We flatten
         // the tree into a list and then compute these aggregations.
-        vector<PlanStage*> stages;
+        std::vector<const PlanStage*> stages;
         flattenExecTree(root, &stages);
 
         for (size_t i = 0; i < stages.size(); i++) {

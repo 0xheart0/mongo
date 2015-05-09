@@ -39,6 +39,7 @@
 #include <string>
 #include <vector>
 
+#include <boost/config.hpp>
 #include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
@@ -151,6 +152,18 @@
                      " where " #PREDICATE                               \
                      "(ex) was true, but it was false.");               \
             }                                                           \
+        }                                                               \
+    } while (false)
+
+#define ASSERT_STRING_CONTAINS(BIG_STRING, CONTAINS ) do {              \
+        std::string myString( BIG_STRING );                             \
+        if ( myString.find(CONTAINS) == std::string::npos ) {           \
+            std::string err( "Expected " #BIG_STRING " (" );            \
+            err += myString;                                            \
+            err += std::string(") to contain " #CONTAINS );             \
+            ::mongo::unittest::TestAssertionFailure(__FILE__,           \
+                                                    __LINE__,           \
+                                                    err).stream();      \
         }                                                               \
     } while (false)
 
@@ -428,11 +441,7 @@ namespace mongo {
             TestAssertionFailure(
                     const std::string& file, unsigned line, const std::string& message);
             TestAssertionFailure(const TestAssertionFailure& other);
-#if __cplusplus < 201103
-            ~TestAssertionFailure();
-#else
-            ~TestAssertionFailure() noexcept(false);
-#endif
+            ~TestAssertionFailure() BOOST_NOEXCEPT_IF(false);
 
             TestAssertionFailure& operator=(const TestAssertionFailure& other);
 
@@ -451,8 +460,8 @@ namespace mongo {
             ComparisonAssertion_##NAME(                                 \
                     const std::string& theFile,                         \
                     unsigned theLine,                                   \
-                    const StringData& aExpression,                      \
-                    const StringData& bExpression,                      \
+                    StringData aExpression,                             \
+                    StringData bExpression,                             \
                     const A& a,                                         \
                     const B& b)  {                                      \
                 if (a OPERATOR b) {                                     \

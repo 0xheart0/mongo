@@ -32,13 +32,18 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/commands.h"
-#include "mongo/db/query/internal_plans.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/query/internal_plans.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
 
     class ValidateCmd : public Command {
     public:
@@ -61,7 +66,12 @@ namespace mongo {
         }
         //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
 
-        bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
 
             NamespaceString ns_string(ns);
@@ -77,9 +87,9 @@ namespace mongo {
                 LOG(0) << "CMD: validate " << ns << endl;
             }
 
-            AutoGetCollectionForRead ctx(txn, ns_string.ns());
-
-            Collection* collection = ctx.getCollection();
+            AutoGetDb ctx(txn, ns_string.db(), MODE_IX);
+            Lock::CollectionLock collLk(txn->lockState(), ns_string.ns(), MODE_X);
+            Collection* collection = ctx.getDb() ? ctx.getDb()->getCollection(ns_string) : NULL;
             if ( !collection ) {
                 errmsg = "ns not found";
                 return false;

@@ -29,22 +29,23 @@
 
 #pragma once
 
+#include <cmath>
 #include <string.h> // strlen
 #include <string>
 #include <vector>
 
+#include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
-#include "mongo/client/export_macros.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/platform/cstdint.h"
-#include "mongo/platform/float_utils.h"
 
 namespace mongo {
-    class OpTime;
     class BSONObj;
     class BSONElement;
     class BSONObjBuilder;
+    class Timestamp;
 
     typedef BSONElement be;
     typedef BSONObj bo;
@@ -67,7 +68,7 @@ namespace mongo {
         value()
         type()
     */
-    class MONGO_CLIENT_API BSONElement {
+    class BSONElement {
     public:
         /** These functions, which start with a capital letter, throw a MsgAssertionException if the
             element is not of the required type. Example:
@@ -114,6 +115,19 @@ namespace mongo {
         */
         bool ok() const { return !eoo(); }
 
+        /**
+         * True if this element has a value (ie not EOO).
+         *
+         * Makes it easier to check for a field's existence and use it:
+         * if (auto elem = myObj["foo"]) {
+         *     // Use elem
+         * }
+         * else {
+         *     // default behavior
+         * }
+         */
+        explicit operator bool() const { return ok(); }
+
         std::string toString( bool includeFieldName = true, bool full=false) const;
         void toString(StringBuilder& s, bool includeFieldName = true, bool full=false, int depth=0) const;
         std::string jsonString( JsonStringFormat format, bool includeFieldNames = true, int pretty = 0 ) const;
@@ -121,7 +135,7 @@ namespace mongo {
 
         /** Returns the type of the element */
         BSONType type() const {
-            const signed char typeByte = ConstDataView(data).readLE<signed char>();
+            const signed char typeByte = ConstDataView(data).read<signed char>();
             return static_cast<BSONType>(typeByte);
         }
 
@@ -148,7 +162,7 @@ namespace mongo {
         BSONObj wrap() const;
 
         /** Wrap this element up as a singleton object with a new name. */
-        BSONObj wrap( const StringData& newName) const;
+        BSONObj wrap( StringData newName) const;
 
         /** field name of the element.  e.g., for
             name : "Joe"
@@ -169,7 +183,7 @@ namespace mongo {
         }
 
         const StringData fieldNameStringData() const {
-            return StringData(fieldName(), fieldNameSize() - 1);
+            return StringData(fieldName(), eoo() ? 0 : fieldNameSize() - 1);
         }
 
         /** raw data of the element's value (so be careful). */
@@ -197,7 +211,7 @@ namespace mongo {
             @see Bool(), trueValue()
         */
         Date_t date() const {
-            return Date_t(ConstDataView(value()).readLE<unsigned long long>());
+            return Date_t(ConstDataView(value()).read<LittleEndian<unsigned long long>>());
         }
 
         /** Convert the value to boolean, regardless of its type, in a javascript-like fashion
@@ -213,17 +227,17 @@ namespace mongo {
 
         /** Return double value for this field. MUST be NumberDouble type. */
         double _numberDouble() const {
-            return ConstDataView(value()).readLE<double>();
+            return ConstDataView(value()).read<LittleEndian<double>>();
         }
 
         /** Return int value for this field. MUST be NumberInt type. */
         int _numberInt() const {
-            return ConstDataView(value()).readLE<int>();
+            return ConstDataView(value()).read<LittleEndian<int>>();
         }
 
         /** Return long long value for this field. MUST be NumberLong type. */
         long long _numberLong() const {
-            return ConstDataView(value()).readLE<long long>();
+            return ConstDataView(value()).read<LittleEndian<long long>>();
         }
 
         /** Retrieve int value for the element safely.  Zero returned if not a number. */
@@ -265,12 +279,12 @@ namespace mongo {
             @return std::string size including terminating null
         */
         int valuestrsize() const {
-            return ConstDataView(value()).readLE<int>();
+            return ConstDataView(value()).read<LittleEndian<int>>();
         }
 
         // for objects the size *includes* the size of the size field
         size_t objsize() const {
-            return ConstDataView(value()).readLE<uint32_t>();
+            return ConstDataView(value()).read<LittleEndian<uint32_t>>();
         }
 
         /** Get a string's value.  Also gives you start of the real data for an embedded object.
@@ -307,7 +321,7 @@ namespace mongo {
          *  This INCLUDES the null char at the end */
         int codeWScopeCodeLen() const {
             massert( 16178 , "not codeWScope" , type() == CodeWScope );
-            return ConstDataView(value() + 4).readLE<int>();
+            return ConstDataView(value() + 4).read<LittleEndian<int>>();
         }
 
         /** Get the scope SavedContext of a CodeWScope data element.
@@ -400,6 +414,15 @@ namespace mongo {
         */
         int woCompare( const BSONElement &e, bool considerFieldName = true ) const;
 
+        /**
+         * Functor compatible with std::hash for std::unordered_{map,set}
+         * Warning: The hash function is subject to change. Do not use in cases where hashes need
+         *          to be consistent across versions.
+         */
+        struct Hasher {
+            size_t operator() (const BSONElement& elem) const;
+        };
+
         const char * rawdata() const { return data; }
 
         /** 0 == Equality, just not defined yet */
@@ -431,16 +454,24 @@ namespace mongo {
             }
         }
 
+        Timestamp timestamp() const {
+            if( type() == mongo::Date || type() == bsonTimestamp ) {
+                return Timestamp(
+                    ConstDataView(value()).read<LittleEndian<unsigned long long>>().value);
+            }
+            return Timestamp();
+        }
+
         Date_t timestampTime() const {
-            unsigned long long t = ConstDataView(value() + 4).readLE<unsigned int>();
+            unsigned long long t = ConstDataView(value() + 4).read<LittleEndian<unsigned int>>();
             return t * 1000;
         }
         unsigned int timestampInc() const {
-            return ConstDataView(value()).readLE<unsigned int>();
+            return ConstDataView(value()).read<LittleEndian<unsigned int>>();
         }
 
         unsigned long long timestampValue() const {
-            return ConstDataView(value()).readLE<unsigned long long>();
+            return ConstDataView(value()).read<LittleEndian<unsigned long long>>();
         }
 
         const char * dbrefNS() const {
@@ -451,7 +482,7 @@ namespace mongo {
         const mongo::OID dbrefOID() const {
             uassert( 10064 ,  "not a dbref" , type() == DBRef );
             const char * start = value();
-            start += 4 + ConstDataView(start).readLE<int>();
+            start += 4 + ConstDataView(start).read<LittleEndian<int>>();
             return mongo::OID::from(start);
         }
 
@@ -473,8 +504,8 @@ namespace mongo {
                 totalSize = -1;
                 fieldNameSize_ = -1;
                 if ( maxLen != -1 ) {
-                    int size = (int) strnlen( fieldName(), maxLen - 1 );
-                    uassert( 10333 ,  "Invalid field name", size != -1 );
+                    size_t size = strnlen( fieldName(), maxLen - 1 );
+                    uassert( 10333 ,  "Invalid field name", size < size_t(maxLen - 1) );
                     fieldNameSize_ = size + 1;
                 }
             }
@@ -503,7 +534,6 @@ namespace mongo {
         }
 
         std::string _asCode() const;
-        OpTime _opTime() const;
 
         template<typename T> bool coerce( T* out ) const;
 
@@ -632,7 +662,7 @@ namespace mongo {
         switch( type() ) {
         case NumberDouble:
             d = numberDouble();
-            if ( isNaN( d ) ){
+            if ( std::isnan( d ) ){
                 return 0;
             }
             if ( d > (double) std::numeric_limits<long long>::max() ){
@@ -647,8 +677,8 @@ namespace mongo {
     }
 
     inline BSONElement::BSONElement() {
-        static char z = 0;
-        data = &z;
+        static const char kEooElement[] = "";
+        data = kEooElement;
         fieldNameSize_ = 0;
         totalSize = 1;
     }

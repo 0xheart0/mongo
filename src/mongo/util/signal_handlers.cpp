@@ -65,6 +65,8 @@ namespace {
 
 namespace mongo {
 
+    using std::endl;
+
     /*
      * WARNING: PLEASE READ BEFORE CHANGING THIS MODULE
      *
@@ -175,9 +177,6 @@ namespace {
                 fassert(16782, rotateLogs(serverGlobalParams.logRenameOnRotate));
                 logProcessDetailsForLogRotate();
                 break;
-            case SIGQUIT:
-                log() << "Received SIGQUIT; terminating.";
-                quickExit(EXIT_ABRUPT);
             default:
                 // interrupt/terminate signal
                 log() << "got signal " << actualSignal << " (" << strsignal( actualSignal )
@@ -207,7 +206,6 @@ namespace {
            sigaddset( &asyncSignals, SIGINT );
         }
         sigaddset( &asyncSignals, SIGTERM );
-        sigaddset( &asyncSignals, SIGQUIT );
         sigaddset( &asyncSignals, SIGUSR1 );
         sigaddset( &asyncSignals, SIGXCPU );
 #endif
@@ -223,5 +221,13 @@ namespace {
         boost::thread( signalProcessingThread ).detach();
 #endif
     }
+
+#ifdef _WIN32
+    void removeControlCHandler() {
+        massert(28600,
+            "Couldn't unregister Windows Ctrl-C handler",
+            SetConsoleCtrlHandler(static_cast<PHANDLER_ROUTINE>(CtrlHandler), FALSE));
+    }
+#endif
 
 } // namespace mongo

@@ -40,12 +40,15 @@
 #include "mongo/db/client.h"
 #include "mongo/db/instance.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/quick_exit.h"
+#include "mongo/util/signal_handlers.h"
 #include "mongo/util/text.h"
 #include "mongo/util/winutil.h"
 
+using std::string;
 using std::wstring;
 
 namespace mongo {
@@ -511,6 +514,34 @@ namespace {
         return SetServiceStatus( _statusHandle, &ssStatus );
     }
 
+    static void serviceStopWorker() {
+        Client::initThread("serviceStopWorker");
+
+        // Stop the process
+        // TODO: SERVER-5703, separate the "cleanup for shutdown" functionality from
+        // the "terminate process" functionality in exitCleanly.
+        exitCleanly(EXIT_WINDOWS_SERVICE_STOP);
+    }
+
+    // Minimum of time we tell Windows to wait before we are guilty of a hung shutdown
+    const int kStopWaitHintMillis = 30000;
+
+    // Run exitCleanly on a separate thread so we can report progress to Windows
+    // Note: Windows may still kill us for taking too long,
+    // On client OSes, SERVICE_CONTROL_SHUTDOWN has a 5 second timeout configured in
+    // HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control
+    static void serviceStop() {
+        boost::thread serviceWorkerThread(serviceStopWorker);
+
+        // We periodically check if we are done exiting by polling at half of each wait interval
+        //
+        while (!serviceWorkerThread.try_join_for(
+            boost::chrono::milliseconds(kStopWaitHintMillis / 2))) {
+            reportStatus(SERVICE_STOP_PENDING, kStopWaitHintMillis);
+            log() << "Service Stop is waiting for storage engine to finish shutdown";
+        }
+    }
+
     static void WINAPI initService( DWORD argc, LPTSTR *argv ) {
         _statusHandle = RegisterServiceCtrlHandler( _serviceName.c_str(), serviceCtrl );
         if ( !_statusHandle )
@@ -520,14 +551,11 @@ namespace {
 
         ExitCode exitCode = _serviceCallback();
 
-        // Stop the process
         // During clean shutdown, ie NT SCM signals us, _serviceCallback returns here
-        // as part of the listener loop terminating so we do not have to stop twice in this case
-        if ( ! inShutdown() ) {
-            // TODO: SERVER-5703, separate the "cleanup for shutdown" functionality from
-            // the "terminate process" functionality in exitCleanly.
-            exitCleanly( EXIT_WINDOWS_SERVICE_STOP );
-        }
+        // as part of the listener loop terminating.
+        // exitCleanly is supposed to return. If it blocks, some other thread must be exiting.
+        //
+        serviceStop();
 
         reportStatus(SERVICE_STOPPED, 0, exitCode);
     }
@@ -538,14 +566,11 @@ namespace {
         log() << "got " << controlCodeName << " request from Windows Service Control Manager, " <<
             ( inShutdown() ? "already in shutdown" : "will terminate after current cmd ends" );
 
-        reportStatus( SERVICE_STOP_PENDING );
+        reportStatus(SERVICE_STOP_PENDING, kStopWaitHintMillis);
 
-        if ( ! inShutdown() ) {
-            // TODO: SERVER-5703, separate the "cleanup for shutdown" functionality from
-            // the "terminate process" functionality in exitCleanly.
-            // Note: This triggers _serviceCallback to stop by setting inShutdown() == true
-            exitCleanly( EXIT_WINDOWS_SERVICE_STOP );
-        }
+        // Note: This triggers _serviceCallback, ie  ServiceMain,
+        // to stop by setting inShutdown() == true
+        signalShutdown();
 
         // Note: we will report exit status in initService
     }
@@ -564,6 +589,10 @@ namespace {
     void startService() {
 
         fassert(16454, _startService);
+
+        // Remove the Control-C handler so that we properly process SERVICE_CONTROL_SHUTDOWN
+        // via the service handler instead of CTRL_SHUTDOWN_EVENT via the Control-C Handler
+        removeControlCHandler();
 
         SERVICE_TABLE_ENTRYW dispTable[] = {
             { const_cast<LPWSTR>(_serviceName.c_str()), (LPSERVICE_MAIN_FUNCTION)initService },

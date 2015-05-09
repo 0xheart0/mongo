@@ -27,23 +27,26 @@ dd( "c" );
 /*
  * test createCollection
  */
- 
+
 db.getCollection( "test" ).drop();
 db.getCollectionNames().forEach( function(x) { assert(x != "test"); });
 
 dd( "d" );
- 
+
 db.createCollection("test");
 var found = false;
 db.getCollectionNames().forEach( function(x) { if (x == "test") found = true; });
-assert(found, "found test.test in system.namespaces");
+assert(found, "found test.test in collection infos");
 
 // storageEngine in collection options must:
 // - be a document
-// - contains a single field of document type with the name of the current storage engine.
+// - all fields of the document:
+// -- must have names that are registered storage engines
+// -- must be objects
 db.getCollection('test').drop();
 var storageEngineName = db.serverStatus().storageEngine.name;
-assert.commandFailed(db.createCollection('test', {storageEngine: {}}));
+assert.commandFailed(db.createCollection('test', {storageEngine: 'not a document'}));
+assert.commandWorked(db.createCollection('test', {storageEngine: {}}));
 assert.commandFailed(db.createCollection('test', {storageEngine: {unknownStorageEngine: {}}}));
 var invalidStorageEngineOptions = {}
 invalidStorageEngineOptions[storageEngineName] = 12345;
@@ -55,10 +58,10 @@ var validStorageEngineOptions = {}
 validStorageEngineOptions[storageEngineName] = {};
 db.getCollection('test').drop();
 assert.commandWorked(db.createCollection('test', {storageEngine: validStorageEngineOptions}));
-var result = assert.commandWorked(db.runCommand('listCollections'));
+var collections = db.getCollectionInfos();
 found  = false;
-for (var i = 0; i < result.collections.length; ++i) {
-    var collection = result.collections[i];
+for (var i = 0; i < collections.length; ++i) {
+    var collection = collections[i];
     if (collection.name != 'test') {
         continue;
     }

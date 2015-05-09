@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -31,8 +32,10 @@ int
 __wt_epoch(WT_SESSION_IMPL *session, struct timespec *tsp)
 {
 	uint64_t ns100;
-
 	FILETIME time;
+
+	WT_UNUSED(session);
+
 	GetSystemTimeAsFileTime(&time);
 
 	ns100 = (((int64_t)time.dwHighDateTime << 32) + time.dwLowDateTime)

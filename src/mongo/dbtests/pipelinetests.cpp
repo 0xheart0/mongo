@@ -28,7 +28,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -39,200 +39,75 @@
 
 namespace PipelineTests {
 
-    namespace FieldPath {
-
-        using mongo::FieldPath;
-
-        /** FieldPath constructed from empty string. */
-        class Empty {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( "" ), UserException );
-            }
-        };
-
-        /** FieldPath constructed from empty vector. */
-        class EmptyVector {
-        public:
-            void run() {
-                vector<string> vec;
-                ASSERT_THROWS( FieldPath path( vec ), MsgAssertionException );
-            }
-        };
-
-        /** FieldPath constructed from a simple string (without dots). */
-        class Simple {
-        public:
-            void run() {
-                FieldPath path( "foo" );
-                ASSERT_EQUALS( 1U, path.getPathLength() );
-                ASSERT_EQUALS( "foo", path.getFieldName( 0 ) );
-                ASSERT_EQUALS( "foo", path.getPath( false ) );
-                ASSERT_EQUALS( "$foo", path.getPath( true ) );
-            }
-        };
-
-        /** FieldPath constructed from a single element vector. */
-        class SimpleVector {
-        public:
-            void run() {
-                vector<string> vec( 1, "foo" );
-                FieldPath path( vec );
-                ASSERT_EQUALS( 1U, path.getPathLength() );
-                ASSERT_EQUALS( "foo", path.getFieldName( 0 ) );
-                ASSERT_EQUALS( "foo", path.getPath( false ) );
-            }
-        };
-        
-        /** FieldPath consisting of a '$' character. */
-        class DollarSign {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( "$" ), UserException );
-            }
-        };
-
-        /** FieldPath with a '$' prefix. */
-        class DollarSignPrefix {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( "$a" ), UserException );
-            }
-        };
-        
-        /** FieldPath constructed from a string with one dot. */
-        class Dotted {
-        public:
-            void run() {
-                FieldPath path( "foo.bar" );
-                ASSERT_EQUALS( 2U, path.getPathLength() );
-                ASSERT_EQUALS( "foo", path.getFieldName( 0 ) );
-                ASSERT_EQUALS( "bar", path.getFieldName( 1 ) );
-                ASSERT_EQUALS( "foo.bar", path.getPath( false ) );
-                ASSERT_EQUALS( "$foo.bar", path.getPath( true ) );
-            }
-        };
-
-        /** FieldPath constructed from a single element vector containing a dot. */
-        class VectorWithDot {
-        public:
-            void run() {
-                vector<string> vec( 1, "fo.o" );
-                ASSERT_THROWS( FieldPath path( vec ), UserException );
-            }
-        };
-
-        /** FieldPath constructed from a two element vector. */
-        class TwoFieldVector {
-        public:
-            void run() {
-                vector<string> vec;
-                vec.push_back( "foo" );
-                vec.push_back( "bar" );
-                FieldPath path( vec );
-                ASSERT_EQUALS( 2U, path.getPathLength() );
-                ASSERT_EQUALS( "foo.bar", path.getPath( false ) );
-            }
-        };
-
-        /** FieldPath with a '$' prefix in the second field. */
-        class DollarSignPrefixSecondField {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( "a.$b" ), UserException );
-            }
-        };
-
-        /** FieldPath constructed from a string with two dots. */
-        class TwoDotted {
-        public:
-            void run() {
-                FieldPath path( "foo.bar.baz" );
-                ASSERT_EQUALS( 3U, path.getPathLength() );
-                ASSERT_EQUALS( "foo", path.getFieldName( 0 ) );
-                ASSERT_EQUALS( "bar", path.getFieldName( 1 ) );
-                ASSERT_EQUALS( "baz", path.getFieldName( 2 ) );
-                ASSERT_EQUALS( "foo.bar.baz", path.getPath( false ) );
-            }
-        };
-
-        /** FieldPath constructed from a string ending in a dot. */
-        class TerminalDot {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( "foo." ), UserException );
-            }
-        };
-
-        /** FieldPath constructed from a string beginning with a dot. */
-        class PrefixDot {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( ".foo" ), UserException );
-            }
-        };
-
-        /** FieldPath constructed from a string with adjacent dots. */
-        class AdjacentDots {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( "foo..bar" ), UserException );
-            }
-        };
-
-        /** FieldPath constructed from a string with one letter between two dots. */
-        class LetterBetweenDots {
-        public:
-            void run() {
-                FieldPath path( "foo.a.bar" );
-                ASSERT_EQUALS( 3U, path.getPathLength() );
-                ASSERT_EQUALS( "foo.a.bar", path.getPath( false ) );                
-            }
-        };
-
-        /** FieldPath containing a null character. */
-        class NullCharacter {
-        public:
-            void run() {
-                ASSERT_THROWS( FieldPath path( string( "foo.b\0r", 7 ) ), UserException );                
-            }
-        };
-        
-        /** FieldPath constructed with a vector containing a null character. */
-        class VectorNullCharacter {
-        public:
-            void run() {
-                vector<string> vec;
-                vec.push_back( "foo" );
-                vec.push_back( string( "b\0r", 3 ) );
-                ASSERT_THROWS( FieldPath path( vec ), UserException );                
-            }
-        };
-
-        /** Tail of a FieldPath. */
-        class Tail {
-        public:
-            void run() {
-                FieldPath path = FieldPath( "foo.bar" ).tail();
-                ASSERT_EQUALS( 1U, path.getPathLength() );
-                ASSERT_EQUALS( "bar", path.getPath( false ) );                
-            }
-        };
-        
-        /** Tail of a FieldPath with three fields. */
-        class TailThreeFields {
-        public:
-            void run() {
-                FieldPath path = FieldPath( "foo.bar.baz" ).tail();
-                ASSERT_EQUALS( 2U, path.getPathLength() );
-                ASSERT_EQUALS( "bar.baz", path.getPath( false ) );                
-            }
-        };
-        
-    } // namespace FieldPath
+    using boost::intrusive_ptr;
+    using std::string;
 
     namespace Optimizations {
         using namespace mongo;
+
+        namespace Local {
+            class Base {
+            public:
+                // These both return json arrays of pipeline operators
+                virtual string inputPipeJson() = 0;
+                virtual string outputPipeJson() = 0;
+
+                BSONObj pipelineFromJsonArray(const string& array) {
+                    return fromjson("{pipeline: " + array + "}");
+                }
+                virtual void run() {
+                    const BSONObj inputBson = pipelineFromJsonArray(inputPipeJson());
+                    const BSONObj outputPipeExpected = pipelineFromJsonArray(outputPipeJson());
+
+                    intrusive_ptr<ExpressionContext> ctx =
+                        new ExpressionContext(&_opCtx, NamespaceString("a.collection"));
+                    string errmsg;
+                    intrusive_ptr<Pipeline> outputPipe =
+                        Pipeline::parseCommand(errmsg, inputBson, ctx);
+                    ASSERT_EQUALS(errmsg, "");
+                    ASSERT(outputPipe != NULL);
+
+                    ASSERT_EQUALS(outputPipe->serialize()["pipeline"],
+                                  Value(outputPipeExpected["pipeline"]));
+                }
+
+                virtual ~Base() {}
+
+            private:
+                OperationContextImpl _opCtx;
+            };
+
+            class RemoveSkipZero : public Base {
+                string inputPipeJson() override {
+                    return "[{$skip: 0}]";
+                }
+
+                string outputPipeJson() override {
+                    return "[]";
+                }
+            };
+
+            class DoNotRemoveSkipOne : public Base {
+                string inputPipeJson() override {
+                    return "[{$skip: 1}]";
+                }
+
+                string outputPipeJson() override {
+                    return "[{$skip: 1}]";
+                }
+            };
+
+            class RemoveSkipZeroKeepProject : public Base {
+                string inputPipeJson() override {
+                    return "[{$skip: 0}, {$project: {i: true}}]";
+                }
+
+                string outputPipeJson() override {
+                    return "[{$project: {i: true}}]";
+                }
+            };
+
+        } // namespace Local
 
         namespace Sharded {
             class Base {
@@ -267,7 +142,7 @@ namespace PipelineTests {
                                   Value(mergePipeExpected["pipeline"]));
                 }
 
-                virtual ~Base() {};
+                virtual ~Base() {}
 
             private:
                 OperationContextImpl _opCtx;
@@ -401,26 +276,9 @@ namespace PipelineTests {
         All() : Suite( "pipeline" ) {
         }
         void setupTests() {
-            add<FieldPath::Empty>();
-            add<FieldPath::EmptyVector>();
-            add<FieldPath::Simple>();
-            add<FieldPath::SimpleVector>();
-            add<FieldPath::DollarSign>();
-            add<FieldPath::DollarSignPrefix>();
-            add<FieldPath::Dotted>();
-            add<FieldPath::VectorWithDot>();
-            add<FieldPath::TwoFieldVector>();
-            add<FieldPath::DollarSignPrefixSecondField>();
-            add<FieldPath::TwoDotted>();
-            add<FieldPath::TerminalDot>();
-            add<FieldPath::PrefixDot>();
-            add<FieldPath::AdjacentDots>();
-            add<FieldPath::LetterBetweenDots>();
-            add<FieldPath::NullCharacter>();
-            add<FieldPath::VectorNullCharacter>();
-            add<FieldPath::Tail>();
-            add<FieldPath::TailThreeFields>();
-
+            add<Optimizations::Local::RemoveSkipZero>();
+            add<Optimizations::Local::DoNotRemoveSkipOne>();
+            add<Optimizations::Local::RemoveSkipZeroKeepProject>();
             add<Optimizations::Sharded::Empty>();
             add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::OneUnwind>();
             add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::TwoUnwind>();

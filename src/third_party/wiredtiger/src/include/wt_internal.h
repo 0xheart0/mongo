@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -35,11 +36,10 @@ extern "C" {
 #include <io.h>
 #endif
 #include <limits.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <pthread.h>
-#endif
-#ifdef HAVE_PTHREAD_NP_H
-#include <pthread_np.h>
 #endif
 #include <stddef.h>
 #include <stdio.h>
@@ -124,8 +124,6 @@ struct __wt_connection_impl;
     typedef struct __wt_connection_impl WT_CONNECTION_IMPL;
 struct __wt_connection_stats;
     typedef struct __wt_connection_stats WT_CONNECTION_STATS;
-struct __wt_connection_stats_spinlock;
-    typedef struct __wt_connection_stats_spinlock WT_CONNECTION_STATS_SPINLOCK;
 struct __wt_cursor_backup;
     typedef struct __wt_cursor_backup WT_CURSOR_BACKUP;
 struct __wt_cursor_backup_entry;
@@ -321,13 +319,14 @@ struct __wt_update;
 #include "misc.i"
 #include "intpack.i"			/* required by cell.i, packing.i */
 #include "packing.i"
+#include "cache.i"			/* required by txn.i */
 #include "cell.i"			/* required by btree.i */
 
 #include "mutex.i"			/* required by btree.i */
 #include "txn.i"			/* required by btree.i */
 
 #include "btree.i"			/* required by cursor.i */
-#include "cache.i"			/* required by cursor.i */
+#include "btree_cmp.i"
 #include "cursor.i"
 
 #include "bitstring.i"

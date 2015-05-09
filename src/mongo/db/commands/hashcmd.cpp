@@ -46,6 +46,9 @@
 
 namespace mongo {
 
+    using std::string;
+    using std::stringstream;
+
     // Testing only, enabled via command-line.
     class CmdHashElt : public Command {
     public:
@@ -75,8 +78,7 @@ namespace mongo {
         bool run(OperationContext* txn, const string& db,
                   BSONObj& cmdObj,
                   int options, string& errmsg,
-                  BSONObjBuilder& result,
-                  bool fromRepl = false ){
+                  BSONObjBuilder& result){
             result.appendAs(cmdObj.firstElement(),"key");
 
             int seed = 0;

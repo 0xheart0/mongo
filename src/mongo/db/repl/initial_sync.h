@@ -46,8 +46,15 @@ namespace repl {
         /**
          * applies up to endOpTime, fetching missing documents as needed.
          */
-        void oplogApplication(OperationContext* txn, const OpTime& endOpTime);
+        void oplogApplication(OperationContext* txn, const Timestamp& endOpTime);
+
+        // Initial sync will ignore all journal requirement flags and doesn't await commit
+        // before updating last OpTime.
+        virtual bool supportsAwaitingCommit() { return false; }
     };
+
+    // Used for ReplSetTest testing.
+    extern unsigned replSetForceInitialSyncFailure;
 
 } // namespace repl
 } // namespace mongo

@@ -43,13 +43,16 @@
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/text.h"
-#include "mongo/util/version_reporting.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
 
+    using std::set;
+    using std::map;
+    using std::string;
+
     namespace JSFiles {
         extern const JSFile servers;
-        extern const JSFile mongodtest;
         extern const JSFile shardingtest;
         extern const JSFile servers_misc;
         extern const JSFile replsettest;
@@ -210,6 +213,10 @@ namespace mongo {
             return BSON("" << shellGlobalParams.writeMode);
         }
 
+        BSONObj readMode(const BSONObj&, void*) {
+            return BSON("" << shellGlobalParams.readMode);
+        }
+
         BSONObj interpreterVersion(const BSONObj& a, void* data) {
             uassert( 16453, "interpreterVersion accepts no arguments", a.nFields() == 0 );
             return BSON( "" << globalScriptEngine->getInterpreterVersionString() );
@@ -239,10 +246,10 @@ namespace mongo {
             // Need to define this method before JSFiles::utils is executed.
             scope.injectNative("_useWriteCommandsDefault", useWriteCommandsDefault);
             scope.injectNative("_writeMode", writeMode);
+            scope.injectNative("_readMode", readMode);
             scope.externalSetup();
             mongo::shell_utils::installShellUtils( scope );
             scope.execSetup(JSFiles::servers);
-            scope.execSetup(JSFiles::mongodtest);
             scope.execSetup(JSFiles::shardingtest);
             scope.execSetup(JSFiles::servers_misc);
             scope.execSetup(JSFiles::replsettest);
@@ -282,22 +289,20 @@ namespace mongo {
             return _confirmed = matchedY;
         }
 
-        ConnectionRegistry::ConnectionRegistry() :
-            _mutex( "connectionRegistryMutex" ) {
-        }
-        
+        ConnectionRegistry::ConnectionRegistry() = default;
+
         void ConnectionRegistry::registerConnection( DBClientWithCommands &client ) {
             BSONObj info;
             if ( client.runCommand( "admin", BSON( "whatsmyuri" << 1 ), info ) ) {
                 string connstr = dynamic_cast<DBClientBase&>( client ).getServerAddress();
-                mongo::mutex::scoped_lock lk( _mutex );
+                boost::lock_guard<boost::mutex> lk( _mutex );
                 _connectionUris[ connstr ].insert( info[ "you" ].str() );
             }            
         }
 
         void ConnectionRegistry::killOperationsOnAllConnections( bool withPrompt ) const {
             Prompter prompter( "do you want to kill the current op(s) on the server?" );
-            mongo::mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             for( map<string,set<string> >::const_iterator i = _connectionUris.begin();
                 i != _connectionUris.end(); ++i ) {
                 string errmsg;
@@ -311,13 +316,21 @@ namespace mongo {
                 }
                 
                 const set<string>& uris = i->second;
-                
-                BSONObj inprog = conn->findOne( "admin.$cmd.sys.inprog", Query() )[ "inprog" ]
-                        .embeddedObject().getOwned();
+
+                BSONObj currentOpRes;
+                conn->runPseudoCommand("admin",
+                                       "currentOp",
+                                       "$cmd.sys.inprog", {}, currentOpRes);
+                auto inprog = currentOpRes["inprog"].embeddedObject();
                 BSONForEach( op, inprog ) {
                     if ( uris.count( op[ "client" ].String() ) ) {
                         if ( !withPrompt || prompter.confirm() ) {
-                            conn->findOne( "admin.$cmd.sys.killop", QUERY( "op"<< op[ "opid" ] ) );                        
+                            BSONObjBuilder cmdBob;
+                            BSONObj info;
+                            cmdBob.append("op", op["opid"]);
+                            auto cmdArgs = cmdBob.done();
+                            conn->runPseudoCommand("admin", "killOp", "$cmd.sys.killop",
+                                                   cmdArgs, info);
                         }
                         else {
                             return;
@@ -350,5 +363,8 @@ namespace mongo {
                 return false;
             }
         }
+
+
+        mongo::mutex &mongoProgramOutputMutex(*(new boost::mutex()));
     }
 }

@@ -33,6 +33,8 @@
 #include <string>
  
 #include "mongo/base/init.h"
+#include "mongo/db/fts/fts_basic_tokenizer.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/string_map.h"
@@ -49,7 +51,7 @@ namespace mongo {
              */
             struct LanguageStringCompare {
                 /** Returns true if lhs < rhs. */
-                bool operator()( const StringData& lhs, const StringData& rhs ) const {
+                bool operator()( std::string lhs, std::string rhs ) const {
                     size_t minSize = std::min( lhs.size(), rhs.size() );
 
                     for ( size_t x = 0; x < minSize; x++ ) {
@@ -70,13 +72,17 @@ namespace mongo {
             // Lookup table from user language string (case-insensitive) to FTSLanguage.  Populated
             // by initializers in group FTSAllLanguagesRegistered and initializer
             // FTSRegisterLanguageAliases.  For use with TEXT_INDEX_VERSION_2 text indexes only.
-            typedef std::map<StringData, const FTSLanguage*, LanguageStringCompare> LanguageMapV2;
+            typedef std::map<std::string, const FTSLanguage*, LanguageStringCompare> LanguageMapV2;
             LanguageMapV2 languageMapV2;
 
             // Like languageMapV2, but for use with TEXT_INDEX_VERSION_1 text indexes.
             // Case-sensitive by lookup key.
             typedef std::map<StringData, const FTSLanguage*> LanguageMapV1;
             LanguageMapV1 languageMapV1;
+        }
+
+        std::unique_ptr<FTSTokenizer> BasicFTSLanguage::createTokenizer() const {
+            return stdx::make_unique<BasicFTSTokenizer>(this);
         }
 
         MONGO_INITIALIZER_GROUP( FTSAllLanguagesRegistered, MONGO_NO_PREREQUISITES,
@@ -185,15 +191,14 @@ namespace mongo {
         }
 
         // static
-        void FTSLanguage::registerLanguage( const StringData& languageName,
+        void FTSLanguage::registerLanguage( StringData languageName,
                                             TextIndexVersion textIndexVersion,
                                             FTSLanguage* language ) {
             verify( !languageName.empty() );
             language->_canonicalName = languageName.toString();
             switch ( textIndexVersion ) {
             case TEXT_INDEX_VERSION_2:
-                verify( languageMapV2.find( languageName ) == languageMapV2.end() );
-                languageMapV2[ languageName ] = language;
+                languageMapV2[ languageName.toString() ] = language;
                 return; 
             case TEXT_INDEX_VERSION_1:
                 verify( languageMapV1.find( languageName ) == languageMapV1.end() );
@@ -205,12 +210,11 @@ namespace mongo {
 
         // static
         void FTSLanguage::registerLanguageAlias( const FTSLanguage* language,
-                                                 const StringData& alias,
+                                                 StringData alias,
                                                  TextIndexVersion textIndexVersion ) {
             switch ( textIndexVersion ) {
             case TEXT_INDEX_VERSION_2:
-                verify( languageMapV2.find( alias ) == languageMapV2.end() );
-                languageMapV2[ alias ] = language;
+                languageMapV2[ alias.toString() ] = language;
                 return;
             case TEXT_INDEX_VERSION_1:
                 verify( languageMapV1.find( alias ) == languageMapV1.end() );
@@ -229,11 +233,11 @@ namespace mongo {
         }
 
         // static
-        StatusWithFTSLanguage FTSLanguage::make( const StringData& langName,
+        StatusWithFTSLanguage FTSLanguage::make( StringData langName,
                                                  TextIndexVersion textIndexVersion ) {
             switch ( textIndexVersion ) {
                 case TEXT_INDEX_VERSION_2: {
-                    LanguageMapV2::const_iterator it = languageMapV2.find( langName );
+                    LanguageMapV2::const_iterator it = languageMapV2.find( langName.toString() );
                     if ( it == languageMapV2.end() ) {
                         // TEXT_INDEX_VERSION_2 rejects unrecognized language strings.
                         Status status = Status( ErrorCodes::BadValue,

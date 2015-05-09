@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -51,7 +52,8 @@ ext_collator_config(WT_EXTENSION_API *wt_api, WT_SESSION *wt_session,
 		return (0);
 
 	WT_CLEAR(cval);
-	WT_RET_NOTFOUND_OK(__wt_config_gets(session, cfg, "collator", &cval));
+	WT_RET_NOTFOUND_OK(
+	    __wt_config_gets_none(session, cfg, "collator", &cval));
 	if (cval.len == 0)
 		return (0);
 
@@ -60,6 +62,44 @@ ext_collator_config(WT_EXTENSION_API *wt_api, WT_SESSION *wt_session,
 	    __wt_config_gets(session, cfg, "app_metadata", &metadata));
 	return (__wt_collator_config(
 	    session, uri, &cval, &metadata, collatorp, ownp));
+}
+
+/*
+ * __collator_confchk --
+ *	Check for a valid custom collator.
+ */
+static int
+__collator_confchk(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname, WT_COLLATOR **collatorp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_NAMED_COLLATOR *ncoll;
+
+	if (collatorp != NULL)
+		*collatorp = NULL;
+
+	if (cname->len == 0 || WT_STRING_MATCH("none", cname->str, cname->len))
+		return (0);
+
+	conn = S2C(session);
+	TAILQ_FOREACH(ncoll, &conn->collqh, q)
+		if (WT_STRING_MATCH(ncoll->name, cname->str, cname->len)) {
+			if (collatorp != NULL)
+				*collatorp = ncoll->collator;
+			return (0);
+		}
+	WT_RET_MSG(session, EINVAL,
+	    "unknown collator '%.*s'", (int)cname->len, cname->str);
+}
+
+/*
+ * __wt_collator_confchk --
+ *	Check for a valid custom collator (public).
+ */
+int
+__wt_collator_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname)
+{
+	return (__collator_confchk(session, cname, NULL));
 }
 
 /*
@@ -72,23 +112,14 @@ __wt_collator_config(WT_SESSION_IMPL *session, const char *uri,
     WT_COLLATOR **collatorp, int *ownp)
 {
 	WT_COLLATOR *collator;
-	WT_CONNECTION_IMPL *conn;
-	WT_NAMED_COLLATOR *ncoll;
 
 	*collatorp = NULL;
 	*ownp = 0;
 
-	conn = S2C(session);
+	WT_RET(__collator_confchk(session, cname, &collator));
+	if (collator == NULL)
+		return (0);
 
-	TAILQ_FOREACH(ncoll, &conn->collqh, q)
-		if (WT_STRING_MATCH(ncoll->name, cname->str, cname->len))
-			break;
-
-	if (ncoll == NULL)
-		WT_RET_MSG(session, EINVAL,
-		    "unknown collator '%.*s'", (int)cname->len, cname->str);
-
-	collator = ncoll->collator;
 	if (collator->customize != NULL)
 		WT_RET(collator->customize(collator,
 		    &session->iface, uri, metadata, collatorp));
@@ -115,7 +146,7 @@ __conn_get_extension_api(WT_CONNECTION *wt_conn)
 	conn->extension_api.conn = wt_conn;
 	conn->extension_api.err_printf = __wt_ext_err_printf;
 	conn->extension_api.msg_printf = __wt_ext_msg_printf;
-	conn->extension_api.strerror = wiredtiger_strerror;
+	conn->extension_api.strerror = __wt_ext_strerror;
 	conn->extension_api.scr_alloc = __wt_ext_scr_alloc;
 	conn->extension_api.scr_free = __wt_ext_scr_free;
 	conn->extension_api.collator_config = ext_collator_config;
@@ -146,6 +177,9 @@ __conn_get_extension_api(WT_CONNECTION *wt_conn)
 #ifdef HAVE_BUILTIN_EXTENSION_ZLIB
 	extern int zlib_extension_init(WT_CONNECTION *, WT_CONFIG_ARG *);
 #endif
+#ifdef HAVE_BUILTIN_EXTENSION_LZ4
+	extern int lz4_extension_init(WT_CONNECTION *, WT_CONFIG_ARG *);
+#endif
 
 /*
  * __conn_load_default_extensions --
@@ -160,6 +194,9 @@ __conn_load_default_extensions(WT_CONNECTION_IMPL *conn)
 #endif
 #ifdef HAVE_BUILTIN_EXTENSION_ZLIB
 	WT_RET(zlib_extension_init(&conn->iface, NULL));
+#endif
+#ifdef HAVE_BUILTIN_EXTENSION_LZ4
+	WT_RET(lz4_extension_init(&conn->iface, NULL));
 #endif
 	return (0);
 }
@@ -262,8 +299,8 @@ __conn_load_extensions(WT_SESSION_IMPL *session, const char *cfg[])
 	}
 	WT_ERR_NOTFOUND_OK(ret);
 
-err:	__wt_scr_free(&expath);
-	__wt_scr_free(&exconfig);
+err:	__wt_scr_free(session, &expath);
+	__wt_scr_free(session, &exconfig);
 
 	return (ret);
 }
@@ -287,7 +324,11 @@ __conn_add_collator(WT_CONNECTION *wt_conn,
 	CONNECTION_API_CALL(conn, session, add_collator, config, cfg);
 	WT_UNUSED(cfg);
 
-	WT_ERR(__wt_calloc_def(session, 1, &ncoll));
+	if (WT_STREQ(name, "none"))
+		WT_ERR_MSG(session, EINVAL,
+		    "invalid name for a collator: %s", name);
+
+	WT_ERR(__wt_calloc_one(session, &ncoll));
 	WT_ERR(__wt_strdup(session, name, &ncoll->name));
 	ncoll->collator = collator;
 
@@ -334,6 +375,55 @@ __wt_conn_remove_collator(WT_SESSION_IMPL *session)
 }
 
 /*
+ * __compressor_confchk --
+ *	Validate the compressor.
+ */
+static int
+__compressor_confchk(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_COMPRESSOR **compressorp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_NAMED_COMPRESSOR *ncomp;
+
+	if (compressorp != NULL)
+		*compressorp = NULL;
+
+	if (cval->len == 0 || WT_STRING_MATCH("none", cval->str, cval->len))
+		return (0);
+
+	conn = S2C(session);
+	TAILQ_FOREACH(ncomp, &conn->compqh, q)
+		if (WT_STRING_MATCH(ncomp->name, cval->str, cval->len)) {
+			if (compressorp != NULL)
+				*compressorp = ncomp->compressor;
+			return (0);
+		}
+	WT_RET_MSG(session, EINVAL,
+	    "unknown compressor '%.*s'", (int)cval->len, cval->str);
+}
+
+/*
+ * __wt_compressor_confchk --
+ *	Validate the compressor (public).
+ */
+int
+__wt_compressor_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval)
+{
+	return (__compressor_confchk(session, cval, NULL));
+}
+
+/*
+ * __wt_compressor_config --
+ *	Given a configuration, configure the compressor.
+ */
+int
+__wt_compressor_config(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_COMPRESSOR **compressorp)
+{
+	return (__compressor_confchk(session, cval, compressorp));
+}
+
+/*
  * __conn_add_compressor --
  *	WT_CONNECTION->add_compressor method.
  */
@@ -354,7 +444,11 @@ __conn_add_compressor(WT_CONNECTION *wt_conn,
 	CONNECTION_API_CALL(conn, session, add_compressor, config, cfg);
 	WT_UNUSED(cfg);
 
-	WT_ERR(__wt_calloc_def(session, 1, &ncomp));
+	if (WT_STREQ(name, "none"))
+		WT_ERR_MSG(session, EINVAL,
+		    "invalid name for a compressor: %s", name);
+
+	WT_ERR(__wt_calloc_one(session, &ncomp));
 	WT_ERR(__wt_strdup(session, name, &ncomp->name));
 	ncomp->compressor = compressor;
 
@@ -419,7 +513,7 @@ __conn_add_data_source(WT_CONNECTION *wt_conn,
 	CONNECTION_API_CALL(conn, session, add_data_source, config, cfg);
 	WT_UNUSED(cfg);
 
-	WT_ERR(__wt_calloc_def(session, 1, &ndsrc));
+	WT_ERR(__wt_calloc_one(session, &ndsrc));
 	WT_ERR(__wt_strdup(session, prefix, &ndsrc->prefix));
 	ndsrc->dsrc = dsrc;
 
@@ -484,7 +578,11 @@ __conn_add_extractor(WT_CONNECTION *wt_conn,
 	CONNECTION_API_CALL(conn, session, add_extractor, config, cfg);
 	WT_UNUSED(cfg);
 
-	WT_ERR(__wt_calloc_def(session, 1, &nextractor));
+	if (WT_STREQ(name, "none"))
+		WT_ERR_MSG(session, EINVAL,
+		    "invalid name for an extractor: %s", name);
+
+	WT_ERR(__wt_calloc_one(session, &nextractor));
 	WT_ERR(__wt_strdup(session, name, &nextractor->name));
 	nextractor->extractor = extractor;
 
@@ -502,51 +600,77 @@ err:	if (nextractor != NULL) {
 }
 
 /*
+ * __extractor_confchk --
+ *	Check for a valid custom extractor.
+ */
+static int
+__extractor_confchk(
+    WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname, WT_EXTRACTOR **extractorp)
+{
+	WT_CONNECTION_IMPL *conn;
+	WT_NAMED_EXTRACTOR *nextractor;
+
+	if (extractorp != NULL)
+		*extractorp = NULL;
+
+	if (cname->len == 0 || WT_STRING_MATCH("none", cname->str, cname->len))
+		return (0);
+
+	conn = S2C(session);
+	TAILQ_FOREACH(nextractor, &conn->extractorqh, q)
+		if (WT_STRING_MATCH(nextractor->name, cname->str, cname->len)) {
+			if (extractorp != NULL)
+				*extractorp = nextractor->extractor;
+			return (0);
+		}
+	WT_RET_MSG(session, EINVAL,
+	    "unknown extractor '%.*s'", (int)cname->len, cname->str);
+}
+
+/*
+ * __wt_extractor_confchk --
+ *	Check for a valid custom extractor (public).
+ */
+int
+__wt_extractor_confchk(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname)
+{
+	return (__extractor_confchk(session, cname, NULL));
+}
+
+/*
  * __wt_extractor_config --
  *	Given a configuration, configure the extractor.
  */
 int
-__wt_extractor_config(WT_SESSION_IMPL *session, const char *config,
-    WT_EXTRACTOR **extractorp, int *ownp)
+__wt_extractor_config(WT_SESSION_IMPL *session,
+    const char *config, WT_EXTRACTOR **extractorp, int *ownp)
 {
-	WT_CONNECTION_IMPL *conn;
-	WT_CONFIG_ITEM cval;
-	WT_DECL_RET;
-	WT_NAMED_EXTRACTOR *nextractor;
+	WT_CONFIG_ITEM cname;
+	WT_EXTRACTOR *extractor;
 
 	*extractorp = NULL;
 	*ownp = 0;
 
-	conn = S2C(session);
+	WT_RET_NOTFOUND_OK(
+	    __wt_config_getones_none(session, config, "extractor", &cname));
+	if (cname.len == 0)
+		return (0);
 
-	if ((ret =
-	    __wt_config_getones(session, config, "extractor", &cval)) != 0)
-		return (ret == WT_NOTFOUND ? 0 : ret);
+	WT_RET(__extractor_confchk(session, &cname, &extractor));
+	if (extractor == NULL)
+		return (0);
 
-	if (cval.len > 0) {
-		TAILQ_FOREACH(nextractor, &conn->extractorqh, q)
-			if (WT_STRING_MATCH(
-			    nextractor->name, cval.str, cval.len))
-				break;
-
-		if (nextractor == NULL)
-			WT_RET_MSG(session, EINVAL,
-			    "unknown extractor '%.*s'",
-			    (int)cval.len, cval.str);
-
-		if (nextractor->extractor->customize != NULL) {
-			WT_RET(__wt_config_getones(session,
-			    config, "app_metadata", &cval));
-			WT_RET(nextractor->extractor->customize(
-			    nextractor->extractor, &session->iface,
-			    session->dhandle->name, &cval, extractorp));
-		}
-
-		if (*extractorp == NULL)
-			*extractorp = nextractor->extractor;
-		else
-			*ownp = 1;
+	if (extractor->customize != NULL) {
+		WT_RET(__wt_config_getones(session,
+		    config, "app_metadata", &cname));
+		WT_RET(extractor->customize(extractor, &session->iface,
+		   session->dhandle->name, &cname, extractorp));
 	}
+
+	if (*extractorp == NULL)
+		*extractorp = extractor;
+	else
+		*ownp = 1;
 
 	return (0);
 }
@@ -728,38 +852,44 @@ __conn_reconfigure(WT_CONNECTION *wt_conn, const char *config)
 	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
-	const char *p, *config_cfg[] = { NULL, NULL, NULL };
+	const char *p;
 
 	conn = (WT_CONNECTION_IMPL *)wt_conn;
 
 	CONNECTION_API_CALL(conn, session, reconfigure, config, cfg);
-	WT_UNUSED(cfg);
 
 	/* Serialize reconfiguration. */
 	__wt_spin_lock(session, &conn->reconfig_lock);
 
 	/*
-	 * The configuration argument has been checked for validity, replace the
+	 * The configuration argument has been checked for validity, update the
 	 * previous connection configuration.
 	 *
 	 * DO NOT merge the configuration before the reconfigure calls.  Some
 	 * of the underlying reconfiguration functions do explicit checks with
 	 * the second element of the configuration array, knowing the defaults
 	 * are in slot #1 and the application's modifications are in slot #2.
+	 *
+	 * First, replace the base configuration set up by CONNECTION_API_CALL
+	 * with the current connection configuration, otherwise reconfiguration
+	 * functions will find the base value instead of previously configured
+	 * value.
 	 */
-	config_cfg[0] = conn->cfg;
-	config_cfg[1] = config;
+	cfg[0] = conn->cfg;
+	cfg[1] = config;
 
-	WT_ERR(__conn_statistics_config(session, config_cfg));
-	WT_ERR(__wt_async_reconfig(session, config_cfg));
-	WT_ERR(__wt_cache_config(session, config_cfg));
-	WT_ERR(__wt_cache_pool_config(session, config_cfg));
-	WT_ERR(__wt_checkpoint_server_create(session, config_cfg));
-	WT_ERR(__wt_lsm_manager_reconfig(session, config_cfg));
-	WT_ERR(__wt_statlog_create(session, config_cfg));
-	WT_ERR(__wt_verbose_config(session, config_cfg));
+	/* Second, reconfigure the system. */
+	WT_ERR(__conn_statistics_config(session, cfg));
+	WT_ERR(__wt_async_reconfig(session, cfg));
+	WT_ERR(__wt_cache_config(session, 1, cfg));
+	WT_ERR(__wt_checkpoint_server_create(session, cfg));
+	WT_ERR(__wt_lsm_manager_reconfig(session, cfg));
+	WT_ERR(__wt_statlog_create(session, cfg));
+	WT_ERR(__wt_sweep_config(session, cfg));
+	WT_ERR(__wt_verbose_config(session, cfg));
 
-	WT_ERR(__wt_config_merge(session, config_cfg, &p));
+	/* Third, merge everything together, creating a new connection state. */
+	WT_ERR(__wt_config_merge(session, cfg, NULL, &p));
 	__wt_free(session, conn->cfg);
 	conn->cfg = p;
 
@@ -789,8 +919,7 @@ __conn_open_session(WT_CONNECTION *wt_conn,
 	CONNECTION_API_CALL(conn, session, open_session, config, cfg);
 	WT_UNUSED(cfg);
 
-	WT_ERR(__wt_open_session(conn, event_handler, config, &session_ret));
-
+	WT_ERR(__wt_open_session(conn, event_handler, config, 1, &session_ret));
 	*wt_sessionp = &session_ret->iface;
 
 err:	API_END_RET_NOTFOUND_MAP(session, ret);
@@ -845,7 +974,6 @@ static int
 __conn_config_file(WT_SESSION_IMPL *session,
     const char *filename, int is_user, const char **cfg, WT_ITEM *cbuf)
 {
-	WT_CONNECTION_IMPL *conn;
 	WT_DECL_RET;
 	WT_FH *fh;
 	size_t len;
@@ -853,21 +981,12 @@ __conn_config_file(WT_SESSION_IMPL *session,
 	int exist, quoted;
 	char *p, *t;
 
-	conn = S2C(session);
 	fh = NULL;
 
 	/* Configuration files are always optional. */
 	WT_RET(__wt_exist(session, filename, &exist));
 	if (!exist)
 		return (0);
-
-	/*
-	 * The base configuration should not exist if we are creating this
-	 * database.
-	 */
-	if (!is_user && conn->is_new)
-		WT_RET_MSG(session, EINVAL,
-		    "%s exists before database creation", filename);
 
 	/* Open the configuration file. */
 	WT_RET(__wt_open(session, filename, 0, 0, 0, &fh));
@@ -981,8 +1100,7 @@ __conn_config_file(WT_SESSION_IMPL *session,
 	/* Append it to the stack. */
 	__conn_config_append(cfg, cbuf->data);
 
-err:	if (fh != NULL)
-		WT_TRET(__wt_close(session, fh));
+err:	WT_TRET(__wt_close(session, &fh));
 	return (ret);
 }
 
@@ -994,15 +1112,19 @@ static int
 __conn_config_env(WT_SESSION_IMPL *session, const char *cfg[], WT_ITEM *cbuf)
 {
 	WT_CONFIG_ITEM cval;
+	WT_DECL_RET;
 	const char *env_config;
 	size_t len;
 
-	if ((env_config = getenv("WIREDTIGER_CONFIG")) == NULL)
+	ret = __wt_getenv(session, "WIREDTIGER_CONFIG", &env_config);
+	if (ret == WT_NOTFOUND)
 		return (0);
+	WT_ERR(ret);
+
 	len = strlen(env_config);
 	if (len == 0)
-		return (0);
-	WT_RET(__wt_buf_set(session, cbuf, env_config, len + 1));
+		goto err;			/* Free the memory. */
+	WT_ERR(__wt_buf_set(session, cbuf, env_config, len + 1));
 
 	/*
 	 * Security stuff:
@@ -1010,26 +1132,28 @@ __conn_config_env(WT_SESSION_IMPL *session, const char *cfg[], WT_ITEM *cbuf)
 	 * If the "use_environment_priv" configuration string is set, use the
 	 * environment variable if the process has appropriate privileges.
 	 */
-	WT_RET(__wt_config_gets(session, cfg, "use_environment_priv", &cval));
+	WT_ERR(__wt_config_gets(session, cfg, "use_environment_priv", &cval));
 	if (cval.val == 0 && __wt_has_priv())
-		WT_RET_MSG(session, WT_ERROR, "%s",
+		WT_ERR_MSG(session, WT_ERROR, "%s",
 		    "WIREDTIGER_CONFIG environment variable set but process "
 		    "lacks privileges to use that environment variable");
 
 	/* Check any version. */
-	WT_RET(__conn_config_check_version(session, env_config));
+	WT_ERR(__conn_config_check_version(session, env_config));
 
 	/* Upgrade the configuration string. */
-	WT_RET(__wt_config_upgrade(session, cbuf));
+	WT_ERR(__wt_config_upgrade(session, cbuf));
 
 	/* Check the configuration information. */
-	WT_RET(__wt_config_check(session,
+	WT_ERR(__wt_config_check(session,
 	    WT_CONFIG_REF(session, wiredtiger_open), env_config, 0));
 
 	/* Append it to the stack. */
-	__conn_config_append(cfg, env_config);
+	__conn_config_append(cfg, cbuf->data);
 
-	return (0);
+err:	__wt_free(session, env_config);
+
+      return (ret);
 }
 
 /*
@@ -1039,17 +1163,19 @@ __conn_config_env(WT_SESSION_IMPL *session, const char *cfg[], WT_ITEM *cbuf)
 static int
 __conn_home(WT_SESSION_IMPL *session, const char *home, const char *cfg[])
 {
+	WT_DECL_RET;
 	WT_CONFIG_ITEM cval;
 
 	/* If the application specifies a home directory, use it. */
 	if (home != NULL)
 		goto copy;
 
+	ret = __wt_getenv(session, "WIREDTIGER_HOME", &S2C(session)->home);
+	if (ret == 0)
+		return (0);
+
 	/* If there's no WIREDTIGER_HOME environment variable, use ".". */
-	if ((home = getenv("WIREDTIGER_HOME")) == NULL || strlen(home) == 0) {
-		home = ".";
-		goto copy;
-	}
+	home = ".";
 
 	/*
 	 * Security stuff:
@@ -1186,6 +1312,7 @@ __conn_single(WT_SESSION_IMPL *session, const char *cfg[])
 		len = (size_t)snprintf(buf, sizeof(buf),
 		    "%s\n%s\n", WT_WIREDTIGER, WIREDTIGER_VERSION_STRING);
 		WT_ERR(__wt_write(session, fh, (wt_off_t)0, len, buf));
+		WT_ERR(__wt_fsync(session, fh));
 
 		conn->is_new = 1;
 	} else {
@@ -1202,8 +1329,7 @@ err:	/*
 	 * We ignore the connection's lock file handle on error, it will be
 	 * closed when the connection structure is destroyed.
 	 */
-	if (fh != NULL)
-		WT_TRET(__wt_close(session, fh));
+	WT_TRET(__wt_close(session, &fh));
 
 	__wt_spin_unlock(session, &__wt_process.spinlock);
 	return (ret);
@@ -1335,45 +1461,47 @@ __wt_verbose_config(WT_SESSION_IMPL *session, const char *cfg[])
 }
 
 /*
- * __conn_write_config --
- *	Save the configuration used to create a database.
+ * __conn_write_base_config --
+ *	Save the base configuration used to create a database.
  */
 static int
-__conn_write_config(
-    WT_SESSION_IMPL *session, const char *filename, const char *cfg[])
+__conn_write_base_config(
+    WT_SESSION_IMPL *session, const char *cfg[], const char *config)
 {
 	FILE *fp;
 	WT_CONFIG parser;
-	WT_CONFIG_ITEM k, v;
+	WT_CONFIG_ITEM cval, k, v;
 	WT_DECL_RET;
-	char *path;
+	int exist;
+
+	fp = NULL;
 
 	/*
-	 * We were passed an array of configuration strings where slot 0 is all
-	 * all possible values and the second and subsequent slots are changes
-	 * specified by the application during open (using the wiredtiger_open
-	 * configuration string, an environment variable, or user-configuration
-	 * file). The base configuration file contains all changes to default
-	 * settings made at create, and we include the user-configuration file
-	 * in that list, even though we don't expect it to change. Of course,
-	 * an application could leave that file as it is right now and not
-	 * remove a configuration we need, but applications can also guarantee
-	 * all database users specify consistent environment variables and
-	 * wiredtiger_open configuration arguments, and if we protect against
-	 * those problems, might as well include the application's configuration
-	 * file as well.
-	 *
-	 * If there is no configuration, don't bother creating an empty file.
+	 * Discard any base configuration setup file left-over from previous
+	 * runs.  This doesn't matter for correctness, it's just cleaning up
+	 * random files.
 	 */
-	if (cfg[1] == NULL)
+	WT_RET(__wt_remove_if_exists(session, WT_BASECONFIG_SET));
+
+	/* The base configuration file is optional, check the configuration. */
+	WT_RET(__wt_config_gets(session, cfg, "config_base", &cval));
+	if (!cval.val)
 		return (0);
 
-	WT_RET(__wt_filename(session, filename, &path));
-	if ((fp = fopen(path, "w")) == NULL)
-		ret = __wt_errno();
-	__wt_free(session, path);
-	if (fp == NULL)
-		return (ret);
+	/*
+	 * We don't test separately if we're creating the database in this run
+	 * as we might have crashed between creating the "WiredTiger" file and
+	 * creating the base configuration file. If configured, there's always
+	 * a base configuration file, and we rename it into place, so it can
+	 * only NOT exist if we crashed before it was created; in other words,
+	 * if the base configuration file exists, we're done.
+	 */
+	WT_RET(__wt_exist(session, WT_BASECONFIG, &exist));
+	if (exist)
+		return (0);
+
+	WT_RET(__wt_fopen(session,
+	    WT_BASECONFIG_SET, WT_FHANDLE_WRITE, 0, &fp));
 
 	fprintf(fp, "%s\n\n",
 	    "# Do not modify this file.\n"
@@ -1383,39 +1511,41 @@ __conn_write_config(
 	    "# these settings, set a WIREDTIGER_CONFIG environment variable\n"
 	    "# or create a WiredTiger.config file to override them.");
 
-	fprintf(fp, "version=(major=%d,minor=%d)\n\n",
-	    WIREDTIGER_VERSION_MAJOR, WIREDTIGER_VERSION_MINOR);
-
 	/*
-	 * We want the list of defaults that have been changed, that is, if the
-	 * application didn't somehow configure a setting, we don't write out a
-	 * default value, so future releases may silently migrate to new default
-	 * values.
+	 * The base configuration file contains all changes to default settings
+	 * made at create, and we include the user-configuration file in that
+	 * list, even though we don't expect it to change. Of course, an
+	 * application could leave that file as it is right now and not remove
+	 * a configuration we need, but applications can also guarantee all
+	 * database users specify consistent environment variables and
+	 * wiredtiger_open configuration arguments -- if we protect against
+	 * those problems, might as well include the application's configuration
+	 * file in that protection.
+	 *
+	 * We were passed the configuration items specified by the application.
+	 * That list includes configuring the default setting, presumably if
+	 * the application configured it explicitly, that setting should survive
+	 * even if the default changes.
 	 */
-	while (*++cfg != NULL) {
-		WT_ERR(__wt_config_init( session,
-		    &parser, WT_CONFIG_BASE(session, wiredtiger_open_basecfg)));
-		while ((ret = __wt_config_next(&parser, &k, &v)) == 0) {
-			if ((ret =
-			    __wt_config_getone(session, *cfg, &k, &v)) == 0) {
-				/* Fix quoting for non-trivial settings. */
-				if (v.type == WT_CONFIG_ITEM_STRING) {
-					--v.str;
-					v.len += 2;
-				}
-				fprintf(fp, "%.*s=%.*s\n",
-				    (int)k.len, k.str, (int)v.len, v.str);
-			}
-			WT_ERR_NOTFOUND_OK(ret);
+	WT_ERR(__wt_config_init(session, &parser, config));
+	while ((ret = __wt_config_next(&parser, &k, &v)) == 0) {
+		/* Fix quoting for non-trivial settings. */
+		if (v.type == WT_CONFIG_ITEM_STRING) {
+			--v.str;
+			v.len += 2;
 		}
-		WT_ERR_NOTFOUND_OK(ret);
+		fprintf(fp,
+		    "%.*s=%.*s\n", (int)k.len, k.str, (int)v.len, v.str);
 	}
+	WT_ERR_NOTFOUND_OK(ret);
 
-err:	WT_TRET(fclose(fp));
+	/* Flush the handle and rename the file into place. */
+	return (__wt_sync_and_rename_fp(
+	    session, &fp, WT_BASECONFIG_SET, WT_BASECONFIG));
 
-	/* Don't leave a damaged file in place. */
-	if (ret != 0)
-		(void)__wt_remove(session, filename);
+	/* Close any file handle left open, remove any temporary file. */
+err:	WT_TRET(__wt_fclose(&fp, WT_FHANDLE_WRITE));
+	WT_TRET(__wt_remove_if_exists(session, WT_BASECONFIG_SET));
 
 	return (ret);
 }
@@ -1454,30 +1584,28 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 
 	WT_CONFIG_ITEM cval, sval;
 	WT_CONNECTION_IMPL *conn;
+	WT_DECL_ITEM(i1);
+	WT_DECL_ITEM(i2);
+	WT_DECL_ITEM(i3);
 	WT_DECL_RET;
-	WT_ITEM i1, i2, i3;
 	const WT_NAME_FLAG *ft;
 	WT_SESSION_IMPL *session;
+	const char *base_merge;
+	char version[64];
 
-	/* Leave space for optional additional configuration. */
-	const char *cfg[] = { NULL, NULL, NULL, NULL, NULL, NULL };
+	/* Leave lots of space for optional additional configuration. */
+	const char *cfg[] = {
+	    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 
 	*wt_connp = NULL;
 
 	conn = NULL;
 	session = NULL;
-
-	/*
-	 * We could use scratch buffers, but I'd rather the default session
-	 * not tie down chunks of memory past the open call.
-	 */
-	WT_CLEAR(i1);
-	WT_CLEAR(i2);
-	WT_CLEAR(i3);
+	base_merge = NULL;
 
 	WT_RET(__wt_library_init());
 
-	WT_RET(__wt_calloc_def(NULL, 1, &conn));
+	WT_RET(__wt_calloc_one(NULL, &conn));
 	conn->iface = stdc;
 
 	/*
@@ -1521,20 +1649,55 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	 * entries override earlier entries):
 	 *
 	 * 1. all possible wiredtiger_open configurations
-	 * 2. base configuration file, created with the database (optional)
-	 * 3. the config passed in by the application.
-	 * 4. user configuration file (optional)
-	 * 5. environment variable settings (optional)
+	 * 2. the WiredTiger compilation version (expected to be overridden by
+	 *    any value in the base configuration file)
+	 * 3. base configuration file, created with the database (optional)
+	 * 4. the config passed in by the application
+	 * 5. user configuration file (optional)
+	 * 6. environment variable settings (optional)
 	 *
 	 * Clear the entries we added to the stack, we're going to build it in
 	 * order.
 	 */
+	WT_ERR(__wt_scr_alloc(session, 0, &i1));
+	WT_ERR(__wt_scr_alloc(session, 0, &i2));
+	WT_ERR(__wt_scr_alloc(session, 0, &i3));
 	cfg[0] = WT_CONFIG_BASE(session, wiredtiger_open_all);
 	cfg[1] = NULL;
-	WT_ERR(__conn_config_file(session, WT_BASECONFIG, 0, cfg, &i1));
+	WT_ERR_TEST(snprintf(version, sizeof(version),
+	    "version=(major=%d,minor=%d)",
+	    WIREDTIGER_VERSION_MAJOR, WIREDTIGER_VERSION_MINOR) >=
+	    (int)sizeof(version), ENOMEM);
+	__conn_config_append(cfg, version);
+	WT_ERR(__conn_config_file(session, WT_BASECONFIG, 0, cfg, i1));
 	__conn_config_append(cfg, config);
-	WT_ERR(__conn_config_file(session, WT_USERCONFIG, 1, cfg, &i2));
-	WT_ERR(__conn_config_env(session, cfg, &i3));
+	WT_ERR(__conn_config_file(session, WT_USERCONFIG, 1, cfg, i2));
+	WT_ERR(__conn_config_env(session, cfg, i3));
+
+	/*
+	 * Merge the full configuration stack and save it for reconfiguration.
+	 */
+	WT_ERR(__wt_config_merge(session, cfg, NULL, &conn->cfg));
+
+	/*
+	 * When writing the base configuration file, we write the version and
+	 * any configuration information set by the application (in other words,
+	 * the stack except for cfg[0]). However, some configuration values need
+	 * to be stripped out from the base configuration file; do that now, and
+	 * merge the rest to be written.
+	 */
+	WT_ERR(__wt_config_merge(session, cfg + 1, "create=", &base_merge));
+
+	/*
+	 * Reset cfg to the configuration stack we're going to use for the rest
+	 * of the open.
+	 *
+	 * Underlying code distinguishes the base values from the user-specified
+	 * information by ignoring cfg[0]. Make that work by leaving base values
+	 * in cfg[0], and the collapsed user-specified values in cfg[1].
+	 */
+	cfg[1] = base_merge;
+	cfg[2] = NULL;
 
 	/*
 	 * Configuration ...
@@ -1559,20 +1722,12 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	WT_ERR(__wt_config_gets(session, cfg, "session_max", &cval));
 	conn->session_size = (uint32_t)cval.val + WT_NUM_INTERNAL_SESSIONS;
 
+	WT_ERR(__wt_config_gets(session, cfg, "session_scratch_max", &cval));
+	conn->session_scratch_max = (size_t)cval.val;
+
 	WT_ERR(__wt_config_gets(session, cfg, "checkpoint_sync", &cval));
 	if (cval.val)
 		F_SET(conn, WT_CONN_CKPT_SYNC);
-
-	WT_ERR(__wt_config_gets(session, cfg, "buffer_alignment", &cval));
-	if (cval.val == -1)
-		conn->buffer_alignment = WT_BUFFER_ALIGNMENT_DEFAULT;
-	else
-		conn->buffer_alignment = (size_t)cval.val;
-#ifndef HAVE_POSIX_MEMALIGN
-	if (conn->buffer_alignment != 0)
-		WT_ERR_MSG(session, EINVAL,
-		    "buffer_alignment requires posix_memalign");
-#endif
 
 	WT_ERR(__wt_config_gets(session, cfg, "direct_io", &cval));
 	for (ft = file_types; ft->name != NULL; ft++) {
@@ -1583,6 +1738,22 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 		} else if (ret != WT_NOTFOUND)
 			goto err;
 	}
+
+	/*
+	 * If buffer alignment is not configured, use zero unless direct I/O is
+	 * also configured, in which case use the build-time default.
+	 */
+	WT_ERR(__wt_config_gets(session, cfg, "buffer_alignment", &cval));
+	if (cval.val == -1)
+		conn->buffer_alignment =
+		    (conn->direct_io == 0) ? 0 : WT_BUFFER_ALIGNMENT_DEFAULT;
+	else
+		conn->buffer_alignment = (size_t)cval.val;
+#ifndef HAVE_POSIX_MEMALIGN
+	if (conn->buffer_alignment != 0)
+		WT_ERR_MSG(session, EINVAL,
+		    "buffer_alignment requires posix_memalign");
+#endif
 
 	WT_ERR(__wt_config_gets(session, cfg, "file_extend", &cval));
 	for (ft = file_types; ft->name != NULL; ft++) {
@@ -1605,6 +1776,7 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 
 	WT_ERR(__conn_statistics_config(session, cfg));
 	WT_ERR(__wt_lsm_manager_config(session, cfg));
+	WT_ERR(__wt_sweep_config(session, cfg));
 	WT_ERR(__wt_verbose_config(session, cfg));
 
 	/* Now that we know if verbose is configured, output the version. */
@@ -1635,33 +1807,36 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 	WT_ERR(__conn_load_extensions(session, cfg));
 
 	/*
-	 * We've completed configuration, write the base configuration file if
-	 * we're creating the database.
+	 * Configuration completed; optionally write the base configuration file
+	 * if it doesn't already exist.
 	 */
-	if (conn->is_new) {
-		WT_ERR(__wt_config_gets(session, cfg, "config_base", &cval));
-		if (cval.val)
-			WT_ERR(
-			    __conn_write_config(session, WT_BASECONFIG, cfg));
-	}
+	WT_ERR(__conn_write_base_config(session, cfg, base_merge));
 
 	/*
 	 * Start the worker threads last.
 	 */
 	WT_ERR(__wt_connection_workers(session, cfg));
 
-	/* Merge the final configuration for later reconfiguration. */
-	WT_ERR(__wt_config_merge(session, cfg, &conn->cfg));
-
 	WT_STATIC_ASSERT(offsetof(WT_CONNECTION_IMPL, iface) == 0);
 	*wt_connp = &conn->iface;
 
-err:	/* Discard the configuration strings. */
-	__wt_buf_free(session, &i1);
-	__wt_buf_free(session, &i2);
-	__wt_buf_free(session, &i3);
+err:	/* Discard the scratch buffers. */
+	__wt_scr_free(session, &i1);
+	__wt_scr_free(session, &i2);
+	__wt_scr_free(session, &i3);
 
-	if (ret != 0 && conn != NULL)
+	__wt_free(session, base_merge);
+
+	/*
+	 * We may have allocated scratch memory when using the dummy session or
+	 * the subsequently created real session, and we don't want to tie down
+	 * memory for the rest of the run in either of them.
+	 */
+	if (session != &conn->dummy_session)
+		__wt_scr_discard(session);
+	__wt_scr_discard(&conn->dummy_session);
+
+	if (ret != 0)
 		WT_TRET(__wt_connection_close(conn));
 
 	return (ret);

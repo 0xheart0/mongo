@@ -33,13 +33,20 @@
 #include "mongo/db/exec/delete.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/op_observer.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::vector;
 
     // static
     const char* DeleteStage::kStageType = "DELETE";
@@ -54,6 +61,8 @@ namespace mongo {
           _ws(ws),
           _collection(collection),
           _child(child),
+          _idRetrying(WorkingSet::INVALID_ID),
+          _idReturning(WorkingSet::INVALID_ID),
           _commonStats(kStageType) { }
 
     DeleteStage::~DeleteStage() {}
@@ -65,7 +74,9 @@ namespace mongo {
         if (!_params.isMulti && _specificStats.docsDeleted > 0) {
             return true;
         }
-        return _child->isEOF();
+        return _idRetrying == WorkingSet::INVALID_ID
+            && _idReturning == WorkingSet::INVALID_ID
+            && _child->isEOF();
     }
 
     PlanStage::StageState DeleteStage::work(WorkingSetID* out) {
@@ -77,60 +88,149 @@ namespace mongo {
         if (isEOF()) { return PlanStage::IS_EOF; }
         invariant(_collection); // If isEOF() returns false, we must have a collection.
 
-        WorkingSetID id = WorkingSet::INVALID_ID;
-        StageState status = _child->work(&id);
+        // It is possible that after a delete was executed, a WriteConflictException occurred
+        // and prevented us from returning ADVANCED with the old version of the document.
+        if (_idReturning != WorkingSet::INVALID_ID) {
+            // We should only get here if we were trying to return something before.
+            invariant(_params.returnDeleted);
+
+            WorkingSetMember* member = _ws->get(_idReturning);
+            invariant(member->state == WorkingSetMember::OWNED_OBJ);
+
+            *out = _idReturning;
+            _idReturning = WorkingSet::INVALID_ID;
+            ++_commonStats.advanced;
+            return PlanStage::ADVANCED;
+         }
+
+        // Either retry the last WSM we worked on or get a new one from our child.
+        WorkingSetID id;
+        StageState status;
+        if (_idRetrying == WorkingSet::INVALID_ID) {
+            status = _child->work(&id);
+        }
+        else {
+            status = ADVANCED;
+            id = _idRetrying;
+            _idRetrying = WorkingSet::INVALID_ID;
+        }
 
         if (PlanStage::ADVANCED == status) {
             WorkingSetMember* member = _ws->get(id);
+
+            // We want to free this member when we return, unless we need to retry it.
+            ScopeGuard memberFreer = MakeGuard(&WorkingSet::free, _ws, id);
+
             if (!member->hasLoc()) {
-                _ws->free(id);
-                const std::string errmsg = "delete stage failed to read member w/ loc from child";
-                *out = WorkingSetCommon::allocateStatusMember(_ws, Status(ErrorCodes::InternalError,
-                                                                          errmsg));
-                return PlanStage::FAILURE;
+                // We expect to be here because of an invalidation causing a force-fetch, and
+                // doc-locking storage engines do not issue invalidations.
+                ++_specificStats.nInvalidateSkips;
+                ++_commonStats.needTime;
+                return PlanStage::NEED_TIME;
             }
             RecordId rloc = member->loc;
-            _ws->free(id);
+            // Deletes can't have projections. This means that covering analysis will always add
+            // a fetch. We should always get fetched data, and never just key data.
+            invariant(member->hasObj());
 
-            BSONObj deletedDoc;
+            try {
+                // If the snapshot changed, then we have to make sure we have the latest copy of the
+                // doc and that it still matches.
+                if (_txn->recoveryUnit()->getSnapshotId() != member->obj.snapshotId()) {
+                    if (!WorkingSetCommon::fetch(_txn, member, _collection)) {
+                        // Doc is already deleted. Nothing more to do.
+                        ++_commonStats.needTime;
+                        return PlanStage::NEED_TIME;
+                    }
 
-            // TODO: Do we want to buffer docs and delete them in a group rather than
-            // saving/restoring state repeatedly?
-            _child->saveState();
-
-            {
-                WriteUnitOfWork wunit(_txn);
-
-                const bool deleteCappedOK = false;
-                const bool deleteNoWarn = false;
-
-                // Do the write, unless this is an explain.
-                if (!_params.isExplain) {
-                    _collection->deleteDocument(_txn, rloc, deleteCappedOK, deleteNoWarn,
-                                                _params.shouldCallLogOp ? &deletedDoc : NULL);
-
-                    if (_params.shouldCallLogOp) {
-                        if (deletedDoc.isEmpty()) {
-                            log() << "Deleted object without id in collection " << _collection->ns()
-                            << ", not logging.";
-                        }
-                        else {
-                            bool replJustOne = true;
-                            repl::logOp(_txn, "d", _collection->ns().ns().c_str(), deletedDoc, 0,
-                                        &replJustOne, _params.fromMigrate);
-                        }
+                    // Make sure the re-fetched doc still matches the predicate.
+                    if (_params.canonicalQuery &&
+                        !_params.canonicalQuery->root()->matchesBSON(member->obj.value(), NULL)) {
+                        // Doesn't match.
+                        ++_commonStats.needTime;
+                        return PlanStage::NEED_TIME;
                     }
                 }
 
-                wunit.commit();
+                // TODO: Do we want to buffer docs and delete them in a group rather than
+                // saving/restoring state repeatedly?
+
+                try {
+                    _child->saveState();
+                    if (supportsDocLocking()) {
+                        // Doc-locking engines require this after saveState() since they don't use
+                        // invalidations.
+                        WorkingSetCommon::prepareForSnapshotChange(_ws);
+                    }
+                }
+                catch ( const WriteConflictException& wce ) {
+                    std::terminate();
+                }
+
+                if (_params.returnDeleted) {
+                    // Save a copy of the document that is about to get deleted.
+                    BSONObj deletedDoc = member->obj.value();
+                    member->obj.setValue(deletedDoc.getOwned());
+                    member->loc = RecordId();
+                    member->state = WorkingSetMember::OWNED_OBJ;
+                }
+
+                // Do the write, unless this is an explain.
+                if (!_params.isExplain) {
+                    WriteUnitOfWork wunit(_txn);
+
+                    const bool deleteCappedOK = false;
+                    const bool deleteNoWarn = false;
+                    BSONObj deletedId;
+
+                    _collection->deleteDocument(_txn, rloc, deleteCappedOK, deleteNoWarn,
+                                                _params.shouldCallLogOp ? &deletedId : NULL);
+
+                    wunit.commit();
+                }
+
+                ++_specificStats.docsDeleted;
+            }
+            catch ( const WriteConflictException& wce ) {
+                _idRetrying = id;
+                memberFreer.Dismiss(); // Keep this member around so we can retry deleting it.
+                *out = WorkingSet::INVALID_ID;
+                _commonStats.needYield++;
+                return NEED_YIELD;
             }
 
             //  As restoreState may restore (recreate) cursors, cursors are tied to the
             //  transaction in which they are created, and a WriteUnitOfWork is a
             //  transaction, make sure to restore the state outside of the WritUnitOfWork.
-            _child->restoreState(_txn);
+            try {
+                _child->restoreState(_txn);
+            }
+            catch ( const WriteConflictException& wce ) {
+                // Note we don't need to retry anything in this case since the delete already
+                // was committed. However, we still need to return the deleted document
+                // (if it was requested).
+                if (_params.returnDeleted) {
+                    // member->obj should refer to the deleted document.
+                    invariant(member->state == WorkingSetMember::OWNED_OBJ);
 
-            ++_specificStats.docsDeleted;
+                    _idReturning = id;
+                    // Keep this member around so that we can return it on the next work() call.
+                    memberFreer.Dismiss();
+                }
+                *out = WorkingSet::INVALID_ID;
+                _commonStats.needYield++;
+                return NEED_YIELD;
+            }
+
+            if (_params.returnDeleted) {
+                // member->obj should refer to the deleted document.
+                invariant(member->state == WorkingSetMember::OWNED_OBJ);
+
+                memberFreer.Dismiss();  // Keep this member around so we can return it.
+                *out = id;
+                ++_commonStats.advanced;
+                return PlanStage::ADVANCED;
+            }
 
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
@@ -150,9 +250,9 @@ namespace mongo {
         else if (PlanStage::NEED_TIME == status) {
             ++_commonStats.needTime;
         }
-        else if (PlanStage::NEED_FETCH == status) {
+        else if (PlanStage::NEED_YIELD == status) {
             *out = id;
-            ++_commonStats.needFetch;
+            ++_commonStats.needYield;
         }
 
         return status;
@@ -196,12 +296,22 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* DeleteStage::getCommonStats() {
+    const CommonStats* DeleteStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* DeleteStage::getSpecificStats() {
+    const SpecificStats* DeleteStage::getSpecificStats() const {
         return &_specificStats;
+    }
+
+    // static
+    long long DeleteStage::getNumDeleted(PlanExecutor* exec) {
+        invariant(exec->getRootStage()->isEOF());
+        invariant(exec->getRootStage()->stageType() == STAGE_DELETE);
+        DeleteStage* deleteStage = static_cast<DeleteStage*>(exec->getRootStage());
+        const DeleteStats* deleteStats =
+            static_cast<const DeleteStats*>(deleteStage->getSpecificStats());
+        return deleteStats->docsDeleted;
     }
 
 }  // namespace mongo

@@ -45,67 +45,73 @@ namespace mongo {
 
     class NamespaceDetailsCollectionCatalogEntry : public CollectionCatalogEntry {
     public:
-        NamespaceDetailsCollectionCatalogEntry( const StringData& ns,
+        NamespaceDetailsCollectionCatalogEntry( StringData ns,
                                                 NamespaceDetails* details,
+                                                RecordStore* namespacesRecordStore,
                                                 RecordStore* indexRecordStore,
                                                 MMAPV1DatabaseCatalogEntry* db );
 
-        virtual ~NamespaceDetailsCollectionCatalogEntry(){}
+        ~NamespaceDetailsCollectionCatalogEntry(){}
 
-        virtual CollectionOptions getCollectionOptions(OperationContext* txn) const;
+        CollectionOptions getCollectionOptions(OperationContext* txn) const final;
 
-        virtual int getTotalIndexCount(OperationContext* txn) const;
+        int getTotalIndexCount(OperationContext* txn) const final;
 
-        virtual int getCompletedIndexCount(OperationContext* txn) const;
+        int getCompletedIndexCount(OperationContext* txn) const final;
 
-        virtual int getMaxAllowedIndexes() const;
+        int getMaxAllowedIndexes() const final;
 
-        virtual void getAllIndexes( OperationContext* txn,
-                                    std::vector<std::string>* names ) const;
+        void getAllIndexes( OperationContext* txn,
+                            std::vector<std::string>* names ) const final;
 
-        virtual BSONObj getIndexSpec( OperationContext* txn,
-                                      const StringData& idxName ) const;
+        BSONObj getIndexSpec( OperationContext* txn,
+                              StringData idxName ) const final;
 
-        virtual bool isIndexMultikey(OperationContext* txn,
-                                     const StringData& indexName) const;
-        virtual bool isIndexMultikey(int idxNo) const;
+        bool isIndexMultikey(OperationContext* txn,
+                             StringData indexName) const final;
+        bool isIndexMultikey(int idxNo) const;
 
-        virtual bool setIndexIsMultikey(OperationContext* txn,
-                                        int idxNo,
-                                        bool multikey = true);
-        virtual bool setIndexIsMultikey(OperationContext* txn,
-                                        const StringData& indexName,
-                                        bool multikey = true);
+        bool setIndexIsMultikey(OperationContext* txn,
+                                int idxNo,
+                                bool multikey = true);
+        bool setIndexIsMultikey(OperationContext* txn,
+                                StringData indexName,
+                                bool multikey = true) final;
 
-        virtual DiskLoc getIndexHead( OperationContext* txn,
-                                      const StringData& indexName ) const;
+        RecordId getIndexHead( OperationContext* txn,
+                               StringData indexName ) const final;
 
-        virtual void setIndexHead( OperationContext* txn,
-                                   const StringData& indexName,
-                                   const DiskLoc& newHead );
+        void setIndexHead( OperationContext* txn,
+                           StringData indexName,
+                           const RecordId& newHead ) final;
 
-        virtual bool isIndexReady( OperationContext* txn,
-                                   const StringData& indexName ) const;
+        bool isIndexReady( OperationContext* txn,
+                           StringData indexName ) const final;
 
-        virtual Status removeIndex( OperationContext* txn,
-                                    const StringData& indexName );
+        Status removeIndex( OperationContext* txn,
+                            StringData indexName ) final;
 
-        virtual Status prepareForIndexBuild( OperationContext* txn,
-                                             const IndexDescriptor* spec );
+        Status prepareForIndexBuild( OperationContext* txn,
+                                     const IndexDescriptor* spec ) final;
 
-        virtual void indexBuildSuccess( OperationContext* txn,
-                                        const StringData& indexName );
+        void indexBuildSuccess( OperationContext* txn,
+                                StringData indexName ) final;
 
-        virtual void updateTTLSetting( OperationContext* txn,
-                                       const StringData& idxName,
-                                       long long newExpireSeconds );
+        void updateTTLSetting( OperationContext* txn,
+                               StringData idxName,
+                               long long newExpireSeconds ) final;
+
+        void updateFlags(OperationContext* txn, int newValue) final;
+
+        void updateValidator(OperationContext* txn, const BSONObj& validator) final;
 
         // not part of interface, but available to my storage engine
 
-        int _findIndexNumber( OperationContext* txn, const StringData& indexName) const;
+        int _findIndexNumber( OperationContext* txn, StringData indexName) const;
 
     private:
         NamespaceDetails* _details;
+        RecordStore* _namespacesRecordStore;
         RecordStore* _indexRecordStore;
         MMAPV1DatabaseCatalogEntry* _db;
 

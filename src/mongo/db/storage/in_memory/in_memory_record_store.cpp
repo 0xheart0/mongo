@@ -33,6 +33,9 @@
 
 #include "mongo/db/storage/in_memory/in_memory_record_store.h"
 
+#include <boost/shared_ptr.hpp>
+
+#include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/oplog_hack.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -41,6 +44,9 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
+
     class InMemoryRecordStore::InsertChange : public RecoveryUnit::Change {
     public:
         InsertChange(Data* data, RecordId loc) :_data(data), _loc(loc) {}
@@ -107,7 +113,7 @@ namespace mongo {
     // RecordStore
     //
 
-    InMemoryRecordStore::InMemoryRecordStore(const StringData& ns,
+    InMemoryRecordStore::InMemoryRecordStore(StringData ns,
                                              boost::shared_ptr<void>* dataInOut,
                                              bool isCapped,
                                              int64_t cappedMaxSize,
@@ -195,12 +201,14 @@ namespace mongo {
         while (cappedAndNeedDelete(txn)) {
             invariant(!_data->records.empty());
 
-            RecordId oldest = _data->records.begin()->first;
+            Records::iterator oldest = _data->records.begin();
+            RecordId id = oldest->first;
+            RecordData data = oldest->second.toRecordData();
 
             if (_cappedDeleteCallback)
-                uassertStatusOK(_cappedDeleteCallback->aboutToDeleteCapped(txn, oldest));
+                uassertStatusOK(_cappedDeleteCallback->aboutToDeleteCapped(txn, id, data));
 
-            deleteRecord(txn, oldest);
+            deleteRecord(txn, id);
         }
     }
 
@@ -289,7 +297,7 @@ namespace mongo {
                                                           const char* data,
                                                           int len,
                                                           bool enforceQuota,
-                                                          UpdateMoveNotifier* notifier ) {
+                                                          UpdateNotifier* notifier ) {
         InMemoryRecord* oldRecord = recordFor( loc );
         int oldLen = oldRecord->size;
 
@@ -297,6 +305,15 @@ namespace mongo {
             return StatusWith<RecordId>( ErrorCodes::InternalError,
                                         "failing update: objects in a capped ns cannot grow",
                                         10003 );
+        }
+
+        if (notifier) {
+            // The in-memory KV engine uses the invalidation framework (does not support
+            // doc-locking), and therefore must notify that it is updating a document.
+            Status callbackStatus = notifier->recordStoreGoingToUpdateInPlace(txn, loc);
+            if (!callbackStatus.isOK()) {
+                return StatusWith<RecordId>(callbackStatus);
+            }
         }
 
         InMemoryRecord newRecord(len);
@@ -309,6 +326,17 @@ namespace mongo {
         cappedDeleteAsNeeded(txn);
 
         return StatusWith<RecordId>(loc);
+    }
+
+    bool InMemoryRecordStore::updateWithDamagesSupported() const {
+        // TODO: Currently the UpdateStage assumes that updateWithDamages will apply the
+        // damages directly to the unowned BSONObj containing the record to be modified.
+        // The implementation of updateWithDamages() below copies the old record to a
+        // a new one and then applies the damages.
+        //
+        // We should be able to enable updateWithDamages() here once this assumption is
+        // relaxed.
+        return false;
     }
 
     Status InMemoryRecordStore::updateWithDamages( OperationContext* txn,
@@ -386,23 +414,12 @@ namespace mongo {
         }
     }
 
-    bool InMemoryRecordStore::compactSupported() const {
-        return false;
-    }
-    Status InMemoryRecordStore::compact(OperationContext* txn,
-                                        RecordStoreCompactAdaptor* adaptor,
-                                        const CompactOptions* options,
-                                        CompactStats* stats) {
-        // TODO might be possible to do something here
-        invariant(!"compact not yet implemented");
-    }
-
     Status InMemoryRecordStore::validate(OperationContext* txn,
                                          bool full,
                                          bool scanData,
                                          ValidateAdaptor* adaptor,
                                          ValidateResults* results,
-                                         BSONObjBuilder* output) const {
+                                         BSONObjBuilder* output) {
         results->valid = true;
         if (scanData && full) {
             for (Records::const_iterator it = _data->records.begin();
@@ -430,7 +447,7 @@ namespace mongo {
         result->appendBool( "capped", _isCapped );
         if ( _isCapped ) {
             result->appendIntOrLL( "max", _cappedMaxDocs );
-            result->appendIntOrLL( "maxSize", _cappedMaxSize );
+            result->appendIntOrLL( "maxSize", _cappedMaxSize / scale );
         }
     }
 
@@ -440,20 +457,6 @@ namespace mongo {
             output->append("millis", 0);
         }
         return Status::OK();
-    }
-
-    Status InMemoryRecordStore::setCustomOption(
-                OperationContext* txn, const BSONElement& option, BSONObjBuilder* info) {
-        StringData name = option.fieldName();
-        if ( name == "usePowerOf2Sizes" ) {
-            // we ignore, so just say ok
-            return Status::OK();
-        }
-
-        return Status( ErrorCodes::InvalidOptions,
-                       mongoutils::str::stream()
-                       << "unknown custom option to InMemoryRecordStore: "
-                       << name );
     }
 
     void InMemoryRecordStore::increaseStorageSize(OperationContext* txn,
@@ -471,17 +474,17 @@ namespace mongo {
     }
 
     RecordId InMemoryRecordStore::allocateLoc() {
-        const int64_t id = _data->nextId++;
-        // This is a hack, but both the high and low order bits of RecordId offset must be 0, and the
-        // file must fit in 23 bits. This gives us a total of 30 + 23 == 53 bits.
-        invariant(id < (1LL << 53));
-        return RecordId(int(id >> 30), int((id << 1) & ~(1<<31)));
+        RecordId out = RecordId(_data->nextId++);
+        invariant(out < RecordId::max());
+        return out;
     }
 
-    RecordId InMemoryRecordStore::oplogStartHack(OperationContext* txn,
-                                                const RecordId& startingPosition) const {
+    boost::optional<RecordId> InMemoryRecordStore::oplogStartHack(
+            OperationContext* txn,
+            const RecordId& startingPosition) const {
+
         if (!_data->isOplog)
-            return RecordId().setInvalid();
+            return boost::none;
 
         const Records& records = _data->records;
 

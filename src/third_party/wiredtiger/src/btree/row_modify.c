@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -19,7 +20,7 @@ __wt_page_modify_alloc(WT_SESSION_IMPL *session, WT_PAGE *page)
 
 	conn = S2C(session);
 
-	WT_RET(__wt_calloc_def(session, 1, &modify));
+	WT_RET(__wt_calloc_one(session, &modify));
 
 	/*
 	 * Select a spinlock for the page; let the barrier immediately below
@@ -103,8 +104,7 @@ __wt_row_modify(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt,
 			/* Avoid WT_CURSOR.update data copy. */
 			cbt->modify_update = upd;
 		} else {
-			upd_size = sizeof(WT_UPDATE) +
-			    (WT_UPDATE_DELETED_ISSET(upd) ? 0 : upd->size);
+			upd_size = __wt_update_list_memsize(upd);
 
 			/*
 			 * We are restoring updates that couldn't be evicted,
@@ -174,8 +174,7 @@ __wt_row_modify(WT_SESSION_IMPL *session, WT_CURSOR_BTREE *cbt,
 			/* Avoid WT_CURSOR.update data copy. */
 			cbt->modify_update = upd;
 		} else
-			upd_size = sizeof(WT_UPDATE) +
-			    (WT_UPDATE_DELETED_ISSET(upd) ? 0 : upd->size);
+			upd_size = __wt_update_list_memsize(upd);
 
 		ins->upd = upd;
 		ins_size += upd_size;
@@ -279,7 +278,7 @@ __wt_update_alloc(
 	}
 
 	*updp = upd;
-	*sizep = sizeof(WT_UPDATE) + size;
+	*sizep = WT_UPDATE_MEMSIZE(upd);
 	return (0);
 }
 
@@ -288,9 +287,11 @@ __wt_update_alloc(
  *	Check for obsolete updates.
  */
 WT_UPDATE *
-__wt_update_obsolete_check(WT_SESSION_IMPL *session, WT_UPDATE *upd)
+__wt_update_obsolete_check(
+    WT_SESSION_IMPL *session, WT_PAGE *page, WT_UPDATE *upd)
 {
 	WT_UPDATE *first, *next;
+	u_int count;
 
 	/*
 	 * This function identifies obsolete updates, and truncates them from
@@ -300,7 +301,7 @@ __wt_update_obsolete_check(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 	 *
 	 * Walk the list of updates, looking for obsolete updates at the end.
 	 */
-	for (first = NULL; upd != NULL; upd = upd->next)
+	for (first = NULL, count = 0; upd != NULL; upd = upd->next, count++)
 		if (__wt_txn_visible_all(session, upd->txnid)) {
 			if (first == NULL)
 				first = upd;
@@ -318,6 +319,14 @@ __wt_update_obsolete_check(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 	    WT_ATOMIC_CAS8(first->next, next, NULL))
 		return (next);
 
+	/*
+	 * If the list is long, don't retry checks on this page until the
+	 * transaction state has moved forwards.
+	 */
+	if (count > 20)
+		page->modify->obsolete_check_txn =
+		    S2C(session)->txn_global.last_running;
+
 	return (NULL);
 }
 
@@ -334,11 +343,8 @@ __wt_update_obsolete_free(
 
 	/* Free a WT_UPDATE list. */
 	for (size = 0; upd != NULL; upd = next) {
-		/* Deleted items have a dummy size: don't include that. */
-		size += sizeof(WT_UPDATE) +
-		    (WT_UPDATE_DELETED_ISSET(upd) ? 0 : upd->size);
-
 		next = upd->next;
+		size += WT_UPDATE_MEMSIZE(upd);
 		__wt_free(session, upd);
 	}
 	if (size != 0)

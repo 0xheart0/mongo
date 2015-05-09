@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -79,6 +80,56 @@ struct __wt_named_extractor {
 	WT_CONN_CHECK_PANIC(S2C(session))
 
 /*
+ * Macros to ensure the dhandle is inserted or removed from both the
+ * main queue and the hashed queue.
+ */
+#define	WT_CONN_DHANDLE_INSERT(conn, dhandle, bucket) do {		\
+	SLIST_INSERT_HEAD(&(conn)->dhlh, dhandle, l);			\
+	SLIST_INSERT_HEAD(&(conn)->dhhash[bucket], dhandle, hashl);	\
+} while (0)
+
+#define	WT_CONN_DHANDLE_REMOVE(conn, dhandle, bucket) do {		\
+	SLIST_REMOVE(&(conn)->dhlh, dhandle, __wt_data_handle, l);	\
+	SLIST_REMOVE(&(conn)->dhhash[bucket],				\
+	    dhandle, __wt_data_handle, hashl);				\
+} while (0)
+
+/*
+ * Macros to ensure the block is inserted or removed from both the
+ * main queue and the hashed queue.
+ */
+#define	WT_CONN_BLOCK_INSERT(conn, block, bucket) do {			\
+	SLIST_INSERT_HEAD(&(conn)->blocklh, block, l);			\
+	SLIST_INSERT_HEAD(&(conn)->blockhash[bucket], block, hashl);	\
+} while (0)
+
+#define	WT_CONN_BLOCK_REMOVE(conn, block, bucket) do {			\
+	SLIST_REMOVE(&(conn)->blocklh, block, __wt_block, l);		\
+	SLIST_REMOVE(							\
+	    &(conn)->blockhash[bucket], block, __wt_block, hashl);	\
+} while (0)
+
+/*
+ * Macros to ensure the file handle is inserted or removed from both the
+ * main queue and the hashed queue.
+ */
+#define	WT_CONN_FILE_INSERT(conn, fh, bucket) do {			\
+	SLIST_INSERT_HEAD(&(conn)->fhlh, fh, l);			\
+	SLIST_INSERT_HEAD(&(conn)->fhhash[bucket], fh, hashl);		\
+} while (0)
+
+#define	WT_CONN_FILE_REMOVE(conn, fh, bucket) do {			\
+	SLIST_REMOVE(&(conn)->fhlh, fh, __wt_fh, l);			\
+	SLIST_REMOVE(&(conn)->fhhash[bucket], fh, __wt_fh, hashl);	\
+} while (0)
+
+/*
+ * Default hash table size; use a prime number of buckets rather than assuming
+ * a good hash (Reference Sedgewick, Algorithms in C, "Hash Functions").
+ */
+#define	WT_HASH_ARRAY_SIZE	509
+
+/*
  * WT_CONNECTION_IMPL --
  *	Implementation of WT_CONNECTION
  */
@@ -130,22 +181,33 @@ struct __wt_connection_impl {
 
 	WT_FH *lock_fh;			/* Lock file handle */
 
-	uint64_t  split_gen;		/* Generation number for splits */
+	volatile uint64_t  split_gen;	/* Generation number for splits */
 
+	/*
+	 * The connection keeps a cache of data handles. The set of handles
+	 * can grow quite large so we maintain both a simple list and a hash
+	 * table of lists. The hash table key is based on a hash of the table
+	 * URI.
+	 */
+					/* Locked: data handle hash array */
+	SLIST_HEAD(__wt_dhhash, __wt_data_handle) dhhash[WT_HASH_ARRAY_SIZE];
 					/* Locked: data handle list */
 	SLIST_HEAD(__wt_dhandle_lh, __wt_data_handle) dhlh;
 					/* Locked: LSM handle list. */
 	TAILQ_HEAD(__wt_lsm_qh, __wt_lsm_tree) lsmqh;
 					/* Locked: file list */
-	TAILQ_HEAD(__wt_fh_qh, __wt_fh) fhqh;
+	SLIST_HEAD(__wt_fhhash, __wt_fh) fhhash[WT_HASH_ARRAY_SIZE];
+	SLIST_HEAD(__wt_fh_lh, __wt_fh) fhlh;
 					/* Locked: library list */
 	TAILQ_HEAD(__wt_dlh_qh, __wt_dlh) dlhqh;
 
 	WT_SPINLOCK block_lock;		/* Locked: block manager list */
-	TAILQ_HEAD(__wt_block_qh, __wt_block) blockqh;
+	SLIST_HEAD(__wt_blockhash, __wt_block) blockhash[WT_HASH_ARRAY_SIZE];
+	SLIST_HEAD(__wt_block_lh, __wt_block) blocklh;
 
 	u_int open_btree_count;		/* Locked: open writable btree count */
 	uint32_t next_file_id;		/* Locked: file ID counter */
+	uint32_t open_file_count;	/* Atomic: open file handle count */
 
 	/*
 	 * WiredTiger allocates space for 50 simultaneous sessions (threads of
@@ -162,6 +224,8 @@ struct __wt_connection_impl {
 	uint32_t	 session_size;	/* Session array size */
 	uint32_t	 session_cnt;	/* Session count */
 
+	size_t     session_scratch_max;	/* Max scratch memory per session */
+
 	/*
 	 * WiredTiger allocates space for a fixed number of hazard pointers
 	 * in each thread of control.
@@ -169,7 +233,7 @@ struct __wt_connection_impl {
 	uint32_t   hazard_max;		/* Hazard array size */
 
 	WT_CACHE  *cache;		/* Page cache */
-	uint64_t   cache_size;
+	uint64_t   cache_size;		/* Configured cache size */
 
 	WT_TXN_GLOBAL txn_global;	/* Global transaction state */
 
@@ -184,7 +248,7 @@ struct __wt_connection_impl {
 #define	WT_CKPT_LOGSIZE(conn)	((conn)->ckpt_logsize != 0)
 	wt_off_t	 ckpt_logsize;	/* Checkpoint log size period */
 	uint32_t	 ckpt_signalled;/* Checkpoint signalled */
-	long		 ckpt_usecs;	/* Checkpoint period */
+	uint64_t	 ckpt_usecs;	/* Checkpoint period */
 
 	int compact_in_memory_pass;	/* Compaction serialization */
 
@@ -197,29 +261,6 @@ struct __wt_connection_impl {
 
 	WT_CONNECTION_STATS stats;	/* Connection statistics */
 
-#if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_LOGGING
-	/*
-	 * Spinlock registration, so we can track which spinlocks are heavily
-	 * used, which are blocking and where.
-	 *
-	 * There's an array of spinlocks, and an array of blocking IDs.
-	 */
-#define	WT_SPINLOCK_MAX			1024
-#define	WT_SPINLOCK_MAX_LOCATION_ID	60
-	WT_SPINLOCK *spinlock_list[WT_SPINLOCK_MAX];
-
-					/* Spinlock blocking matrix */
-	struct __wt_connection_stats_spinlock {
-		const char *name;	/* Mutex name */
-
-		const char *file;	/* Caller's file/line, ID location */
-		int line;
-
-		u_int total;		/* Count of total, blocked calls */
-		u_int blocked[WT_SPINLOCK_MAX_LOCATION_ID];
-	} spinlock_block[WT_SPINLOCK_MAX_LOCATION_ID];
-#endif
-
 	WT_ASYNC	*async;		/* Async structure */
 	int		 async_cfg;	/* Global async configuration */
 	uint32_t	 async_size;	/* Async op array size */
@@ -231,6 +272,7 @@ struct __wt_connection_impl {
 	wt_thread_t	 evict_tid;	/* Eviction server thread ID */
 	int		 evict_tid_set;	/* Eviction server thread ID set */
 
+	uint32_t	 evict_workers_alloc;/* Allocated eviction workers */
 	uint32_t	 evict_workers_max;/* Max eviction workers */
 	uint32_t	 evict_workers_min;/* Min eviction workers */
 	uint32_t	 evict_workers;	/* Number of eviction workers */
@@ -245,23 +287,40 @@ struct __wt_connection_impl {
 	char		*stat_path;	/* Statistics log path format */
 	char	       **stat_sources;	/* Statistics log list of objects */
 	const char	*stat_stamp;	/* Statistics log entry timestamp */
-	long		 stat_usecs;	/* Statistics log period */
+	uint64_t	 stat_usecs;	/* Statistics log period */
 
-	int		 logging;	/* Global logging configuration */
-	int		 archive;	/* Global archive configuration */
-	WT_CONDVAR	*arch_cond;	/* Log archive wait mutex */
-	WT_SESSION_IMPL *arch_session;	/* Log archive session */
-	wt_thread_t	 arch_tid;	/* Log archive thread */
-	int		 arch_tid_set;	/* Log archive thread set */
+#define	WT_CONN_LOG_ARCHIVE	0x01	/* Archive is enabled */
+#define	WT_CONN_LOG_ENABLED	0x02	/* Logging is enabled */
+#define	WT_CONN_LOG_EXISTED	0x04	/* Log files found */
+#define	WT_CONN_LOG_PREALLOC	0x08	/* Pre-allocation is enabled */
+#define	WT_CONN_LOG_RECOVER_ERR	0x10	/* Error if recovery required */
+	uint32_t	 log_flags;	/* Global logging configuration */
+	WT_CONDVAR	*log_cond;	/* Log server wait mutex */
+	WT_SESSION_IMPL *log_session;	/* Log server session */
+	wt_thread_t	 log_tid;	/* Log server thread */
+	int		 log_tid_set;	/* Log server thread set */
+	WT_CONDVAR	*log_close_cond;/* Log close thread wait mutex */
+	WT_SESSION_IMPL *log_close_session;/* Log close thread session */
+	wt_thread_t	 log_close_tid;	/* Log close thread thread */
+	int		 log_close_tid_set;/* Log close thread set */
+	WT_CONDVAR	*log_wrlsn_cond;/* Log write lsn thread wait mutex */
+	WT_SESSION_IMPL *log_wrlsn_session;/* Log write lsn thread session */
+	wt_thread_t	 log_wrlsn_tid;	/* Log write lsn thread thread */
+	int		 log_wrlsn_tid_set;/* Log write lsn thread set */
 	WT_LOG		*log;		/* Logging structure */
+	WT_COMPRESSOR	*log_compressor;/* Logging compressor */
 	wt_off_t	 log_file_max;	/* Log file max size */
 	const char	*log_path;	/* Logging path format */
-	uint32_t	txn_logsync;	/* Log sync configuration */
+	uint32_t	 log_prealloc;	/* Log file pre-allocation */
+	uint32_t	 txn_logsync;	/* Log sync configuration */
 
 	WT_SESSION_IMPL *sweep_session;	/* Handle sweep session */
 	wt_thread_t	 sweep_tid;	/* Handle sweep thread */
 	int		 sweep_tid_set;	/* Handle sweep thread set */
 	WT_CONDVAR	*sweep_cond;	/* Handle sweep wait mutex */
+	time_t		 sweep_idle_time;/* Handle sweep idle time */
+	time_t		 sweep_interval;/* Handle sweep interval */
+	u_int		 sweep_handles_min;/* Handle sweep minimum open */
 
 					/* Locked: collator list */
 	TAILQ_HEAD(__wt_coll_qh, __wt_named_collator) collqh;

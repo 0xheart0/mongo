@@ -55,10 +55,10 @@ namespace mongo {
          * Instantiates a command that can be invoked by "name", which will be capable of issuing
          * write batches of type "writeType", and will require privilege "action" to run.
          */
-        WriteCmd( const StringData& name, BatchedCommandRequest::BatchType writeType );
+        WriteCmd( StringData name, BatchedCommandRequest::BatchType writeType );
 
         // Full log of write command can be quite large.
-        static void redactTooLongLog( mutablebson::Document* cmdObj, const StringData& fieldName );
+        static void redactTooLongLog( mutablebson::Document* cmdObj, StringData fieldName );
 
     private:
         virtual bool slaveOk() const;
@@ -78,8 +78,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  std::string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl);
+                 BSONObjBuilder& result);
 
         // Write commands can be explained.
         virtual Status explain(OperationContext* txn,

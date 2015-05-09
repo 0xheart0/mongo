@@ -48,7 +48,7 @@ namespace mongo {
      */
     class InMemoryRecordStore : public RecordStore {
     public:
-        explicit InMemoryRecordStore(const StringData& ns,
+        explicit InMemoryRecordStore(StringData ns,
                                      boost::shared_ptr<void>* dataInOut,
                                      bool isCapped = false,
                                      int64_t cappedMaxSize = -1,
@@ -77,7 +77,9 @@ namespace mongo {
                                                   const char* data,
                                                   int len,
                                                   bool enforceQuota,
-                                                  UpdateMoveNotifier* notifier );
+                                                  UpdateNotifier* notifier );
+
+        virtual bool updateWithDamagesSupported() const;
 
         virtual Status updateWithDamages( OperationContext* txn,
                                           const RecordId& loc,
@@ -97,27 +99,17 @@ namespace mongo {
 
         virtual void temp_cappedTruncateAfter( OperationContext* txn, RecordId end, bool inclusive );
 
-        virtual bool compactSupported() const;
-        virtual Status compact( OperationContext* txn,
-                                RecordStoreCompactAdaptor* adaptor,
-                                const CompactOptions* options,
-                                CompactStats* stats );
-
         virtual Status validate( OperationContext* txn,
                                  bool full,
                                  bool scanData,
                                  ValidateAdaptor* adaptor,
-                                 ValidateResults* results, BSONObjBuilder* output ) const;
+                                 ValidateResults* results, BSONObjBuilder* output );
 
         virtual void appendCustomStats( OperationContext* txn,
                                         BSONObjBuilder* result,
                                         double scale ) const;
 
         virtual Status touch( OperationContext* txn, BSONObjBuilder* output ) const;
-
-        virtual Status setCustomOption( OperationContext* txn,
-                                        const BSONElement& option,
-                                        BSONObjBuilder* info = NULL );
 
         virtual void increaseStorageSize( OperationContext* txn,  int size, bool enforceQuota );
 
@@ -131,8 +123,15 @@ namespace mongo {
             return _data->records.size();
         }
 
-        virtual RecordId oplogStartHack(OperationContext* txn,
-                                       const RecordId& startingPosition) const;
+        virtual boost::optional<RecordId> oplogStartHack(OperationContext* txn,
+                                                         const RecordId& startingPosition) const;
+
+        virtual void updateStatsAfterRepair(OperationContext* txn,
+                                            long long numRecords,
+                                            long long dataSize) {
+            invariant(_data->records.size() == size_t(numRecords));
+            _data->dataSize = dataSize;
+        }
 
     protected:
         struct InMemoryRecord {

@@ -28,7 +28,7 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -49,12 +49,17 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/isself.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::string;
+    using std::stringstream;
+    using std::endl;
 
     class CmdCloneCollection : public Command {
     public:
@@ -81,7 +86,7 @@ namespace mongo {
             actions.addAction(ActionType::insert);
             actions.addAction(ActionType::createIndex); // SERVER-11418
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(ns)), actions)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
             }
@@ -100,8 +105,7 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             string fromhost = cmdObj.getStringField("from");
             if ( fromhost.empty() ) {
@@ -118,10 +122,11 @@ namespace mongo {
             }
 
             string collection = parseNs(dbname, cmdObj);
-            if ( collection.empty() ) {
-                errmsg = "bad 'cloneCollection' value";
-                return false;
+            Status allowedWriteStatus = userAllowedWriteNS(dbname, collection);
+            if (!allowedWriteStatus.isOK()) {
+                return appendCommandStatus(result, allowedWriteStatus);
             }
+
             BSONObj query = cmdObj.getObjectField("query");
             if ( query.isEmpty() )
                 query = BSONObj();

@@ -45,21 +45,24 @@ namespace repl {
     const size_t ReplicaSetConfig::kMaxVotingMembers;
 #endif
 
-    const Seconds ReplicaSetConfig::kDefaultHeartbeatTimeoutPeriod(10);
-    const std::string ReplicaSetConfig::kIdFieldName = "_id";
     const std::string ReplicaSetConfig::kVersionFieldName = "version";
-    const std::string ReplicaSetConfig::kMembersFieldName = "members";
-    const std::string ReplicaSetConfig::kSettingsFieldName = "settings";
     const std::string ReplicaSetConfig::kMajorityWriteConcernModeName = "$majority";
-    const std::string ReplicaSetConfig::kStepDownCheckWriteConcernModeName = "$stepDownCheck";
+    const Seconds ReplicaSetConfig::kDefaultHeartbeatTimeoutPeriod(10);
 
 namespace {
 
+    const std::string kIdFieldName = "_id";
+    const std::string kMembersFieldName = "members";
+    const std::string kSettingsFieldName = "settings";
+    const std::string kStepDownCheckWriteConcernModeName = "$stepDownCheck";
+    const std::string kProtocolVersionFieldName = "protocolVersion";
+
     const std::string kLegalConfigTopFieldNames[] = {
-        ReplicaSetConfig::kIdFieldName,
+        kIdFieldName,
         ReplicaSetConfig::kVersionFieldName,
-        ReplicaSetConfig::kMembersFieldName,
-        ReplicaSetConfig::kSettingsFieldName
+        kMembersFieldName,
+        kSettingsFieldName,
+        kProtocolVersionFieldName
     };
 
     const std::string kHeartbeatTimeoutFieldName = "heartbeatTimeoutSecs";
@@ -69,7 +72,9 @@ namespace {
 
 }  // namespace
 
-    ReplicaSetConfig::ReplicaSetConfig() : _isInitialized(false), _heartbeatTimeoutPeriod(0) {}
+    ReplicaSetConfig::ReplicaSetConfig() : _isInitialized(false),
+                                           _heartbeatTimeoutPeriod(0),
+                                           _protocolVersion(0) {}
 
     Status ReplicaSetConfig::initialize(const BSONObj& cfg) {
         _isInitialized = false;
@@ -130,6 +135,15 @@ namespace {
         status = _parseSettingsSubdocument(settings);
         if (!status.isOK())
             return status;
+
+        //
+        // Parse protocol version
+        //
+        BSONElement protocolVersionElement;
+        status = bsonExtractIntegerField(cfg, kProtocolVersionFieldName, &_protocolVersion);
+        if (!status.isOK() && status != ErrorCodes::NoSuchKey) {
+            return status;
+        }
 
         _calculateMajorities();
         _addInternalWriteConcernModes();
@@ -327,7 +341,8 @@ namespace {
         if (voterCount > kMaxVotingMembers || voterCount == 0) {
             return Status(ErrorCodes::BadValue, str::stream() <<
                           "Replica set configuration contains " << voterCount <<
-                          " voting members, but must be between 0 and " << kMaxVotingMembers);
+                          " voting members, but must be at least 1 and no more than " <<
+                          kMaxVotingMembers);
         }
 
         if (electableCount == 0) {
@@ -344,7 +359,7 @@ namespace {
             }
         }
         else {
-            if ("majority" != _defaultWriteConcern.wMode &&
+            if (WriteConcernOptions::kMajority != _defaultWriteConcern.wMode &&
                     !findCustomWriteMode(_defaultWriteConcern.wMode).isOK()) {
                 return Status(ErrorCodes::BadValue, str::stream() <<
                               "Default write concern requires undefined write mode " <<
@@ -352,12 +367,17 @@ namespace {
             }
         }
 
+        if (_protocolVersion < 0 || _protocolVersion > std::numeric_limits<int>::max()) {
+            return Status(ErrorCodes::BadValue, str::stream() << kProtocolVersionFieldName <<
+                          " field value of " << _protocolVersion << " is out of range");
+        }
+
         return Status::OK();
     }
 
     Status ReplicaSetConfig::checkIfWriteConcernCanBeSatisfied(
             const WriteConcernOptions& writeConcern) const {
-        if (!writeConcern.wMode.empty() && writeConcern.wMode != "majority") {
+        if (!writeConcern.wMode.empty() && writeConcern.wMode != WriteConcernOptions::kMajority) {
             StatusWith<ReplicaSetTagPattern> tagPatternStatus =
                     findCustomWriteMode(writeConcern.wMode);
             if (!tagPatternStatus.isOK()) {
@@ -422,17 +442,29 @@ namespace {
         return -1;
     }
 
+    const int ReplicaSetConfig::findMemberIndexByConfigId(long long configId) const {
+        int x = 0;
+        for (const auto& member : _members) {
+
+            if (member.getId() == configId) {
+                return x;
+            }
+            ++x;
+        }
+        return -1;
+    }
+
     const MemberConfig* ReplicaSetConfig::findMemberByHostAndPort(const HostAndPort& hap) const {
         int idx = findMemberIndexByHostAndPort(hap);
         return idx != -1 ? &getMemberAt(idx) : NULL;
     }
 
-    ReplicaSetTag ReplicaSetConfig::findTag(const StringData& key, const StringData& value) const {
+    ReplicaSetTag ReplicaSetConfig::findTag(StringData key, StringData value) const {
         return _tagConfig.findTag(key, value);
     }
 
     StatusWith<ReplicaSetTagPattern> ReplicaSetConfig::findCustomWriteMode(
-            const StringData& patternName) const {
+            StringData patternName) const {
 
         const StringMap<ReplicaSetTagPattern>::const_iterator iter = _customWriteConcernModes.find(
                 patternName);
@@ -496,20 +528,20 @@ namespace {
 
     BSONObj ReplicaSetConfig::toBSON() const {
         BSONObjBuilder configBuilder;
-        configBuilder.append("_id", _replSetName);
-        configBuilder.appendIntOrLL("version", _version);
+        configBuilder.append(kIdFieldName, _replSetName);
+        configBuilder.appendIntOrLL(kVersionFieldName, _version);
 
-        BSONArrayBuilder members(configBuilder.subarrayStart("members"));
+        BSONArrayBuilder members(configBuilder.subarrayStart(kMembersFieldName));
         for (MemberIterator mem = membersBegin(); mem != membersEnd(); mem++) {
             members.append(mem->toBSON(getTagConfig()));
         }
         members.done();
 
-        BSONObjBuilder settingsBuilder(configBuilder.subobjStart("settings"));
-        settingsBuilder.append("chainingAllowed", _chainingAllowed);
-        settingsBuilder.append("heartbeatTimeoutSecs", _heartbeatTimeoutPeriod.total_seconds());
+        BSONObjBuilder settingsBuilder(configBuilder.subobjStart(kSettingsFieldName));
+        settingsBuilder.append(kChainingAllowedFieldName, _chainingAllowed);
+        settingsBuilder.append(kHeartbeatTimeoutFieldName, _heartbeatTimeoutPeriod.total_seconds());
 
-        BSONObjBuilder gleModes(settingsBuilder.subobjStart("getLastErrorModes"));
+        BSONObjBuilder gleModes(settingsBuilder.subobjStart(kGetLastErrorModesFieldName));
         for (StringMap<ReplicaSetTagPattern>::const_iterator mode =
                     _customWriteConcernModes.begin();
                 mode != _customWriteConcernModes.end();
@@ -529,7 +561,8 @@ namespace {
         }
         gleModes.done();
 
-        settingsBuilder.append("getLastErrorDefaults", _defaultWriteConcern.toBSON());
+        settingsBuilder.append(kGetLastErrorDefaultsFieldName, _defaultWriteConcern.toBSON());
+        settingsBuilder.append(kProtocolVersionFieldName, _protocolVersion);
         settingsBuilder.done();
         return configBuilder.obj();
     }

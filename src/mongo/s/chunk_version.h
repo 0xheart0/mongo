@@ -29,7 +29,6 @@
 #pragma once
 
 #include "mongo/db/jsobj.h"
-#include "mongo/s/bson_serializable.h"
 
 namespace mongo {
 
@@ -46,7 +45,7 @@ namespace mongo {
      * TODO: This is a "manual type" but, even so, still needs to comform to what's
      * expected from types.
      */
-    struct ChunkVersion : public BSONSerializable {
+    struct ChunkVersion {
 
         union {
             struct {
@@ -89,25 +88,9 @@ namespace mongo {
             return version;
         }
 
-        static bool isDroppedVersion( const ChunkVersion& version ) {
-            return version.majorVersion() == 0 && version.minorVersion() == 0
-                   && version.epoch() == DROPPED().epoch();
-        }
-
-        static bool isUnshardedVersion( const ChunkVersion& version ) {
-            return isDroppedVersion( version );
-        }
-
         static bool isIgnoredVersion( const ChunkVersion& version ) {
             return version.majorVersion() == 0 && version.minorVersion() == 0
                    && version.epoch() == IGNORED().epoch();
-        }
-
-        void inc( bool major ) {
-            if ( major )
-                incMajor();
-            else
-                incMinor();
         }
 
         void incMajor() {
@@ -264,7 +247,7 @@ namespace mongo {
                 return ChunkVersion( 0, 0, el.OID() );
             }
 
-            if( type == Timestamp || type == Date ){
+            if( type == bsonTimestamp || type == Date ){
                 return fromDeprecatedLong( el._numberLong(), OID() );
             }
 
@@ -428,17 +411,7 @@ namespace mongo {
             b.append( prefix + "Epoch", _epoch );
         }
 
-        //
-        // bson serializable interface implementation
-        // (toBSON and toString were implemented above)
-        //
-
-        virtual bool isValid(std::string* errMsg) const {
-            // TODO is there any check we want to do here?
-            return true;
-        }
-
-        virtual BSONObj toBSON() const {
+        BSONObj toBSON() const {
             // ChunkVersion wants to be an array.
             BSONArrayBuilder b;
             b.appendTimestamp(_combined);
@@ -446,7 +419,7 @@ namespace mongo {
             return b.arr();
         }
 
-        virtual bool parseBSON(const BSONObj& source, std::string* errMsg) {
+        bool parseBSON(const BSONObj& source, std::string* errMsg) {
             // ChunkVersion wants to be an array.
             BSONArray arrSource = static_cast<BSONArray>(source);
 
@@ -463,7 +436,7 @@ namespace mongo {
             return true;
         }
 
-        virtual void clear() {
+        void clear() {
             _minor = 0;
             _major = 0;
             _epoch = OID();

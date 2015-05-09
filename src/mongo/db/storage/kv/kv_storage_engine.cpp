@@ -35,9 +35,14 @@
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::vector;
 
     namespace {
         const std::string catalogInfo = "_mdb_catalog";
@@ -45,7 +50,7 @@ namespace mongo {
 
     class KVStorageEngine::RemoveDBChange : public RecoveryUnit::Change {
     public:
-        RemoveDBChange(KVStorageEngine* engine, const StringData& db, KVDatabaseCatalogEntry* entry)
+        RemoveDBChange(KVStorageEngine* engine, StringData db, KVDatabaseCatalogEntry* entry)
             : _engine(engine)
             , _db(db.toString())
             , _entry(entry)
@@ -56,7 +61,7 @@ namespace mongo {
         }
 
         virtual void rollback() {
-            boost::mutex::scoped_lock lk(_engine->_dbsLock);
+            boost::lock_guard<boost::mutex> lk(_engine->_dbsLock);
             _engine->_dbs[_db] = _entry;
         }
 
@@ -65,11 +70,23 @@ namespace mongo {
         KVDatabaseCatalogEntry* const _entry;
     };
 
-    KVStorageEngine::KVStorageEngine( KVEngine* engine )
-        : _engine( engine )
+    KVStorageEngine::KVStorageEngine( KVEngine* engine,
+                                      const KVStorageEngineOptions& options )
+        : _options( options )
+        , _engine( engine )
         , _supportsDocLocking(_engine->supportsDocLocking()) {
 
+        uassert(28601, "Storage engine does not support --directoryperdb",
+                !(options.directoryPerDB && !engine->supportsDirectoryPerDB()));
+
         OperationContextNoop opCtx( _engine->newRecoveryUnit() );
+
+        if (options.forRepair && engine->hasIdent(&opCtx, catalogInfo)) {
+            log() << "Repairing catalog metadata";
+            // TODO should also validate all BSON in the catalog.
+            engine->repairIdent(&opCtx, catalogInfo);
+        }
+
         {
             WriteUnitOfWork uow( &opCtx );
 
@@ -88,7 +105,10 @@ namespace mongo {
                                                                 catalogInfo,
                                                                 catalogInfo,
                                                                 CollectionOptions() ) );
-            _catalog.reset( new KVCatalog( _catalogRecordStore.get(), _supportsDocLocking ) );
+            _catalog.reset( new KVCatalog( _catalogRecordStore.get(),
+                                           _supportsDocLocking,
+                                           _options.directoryPerDB,
+                                           _options.directoryForIndexes) );
             _catalog->init( &opCtx );
 
             std::vector<std::string> collections;
@@ -104,7 +124,8 @@ namespace mongo {
                 if ( !db ) {
                     db = new KVDatabaseCatalogEntry( dbName, this );
                 }
-                db->initCollection( &opCtx, coll );
+
+                db->initCollection( &opCtx, coll, options.forRepair );
             }
 
             uow.commit();
@@ -146,7 +167,7 @@ namespace mongo {
 
     }
 
-    void KVStorageEngine::cleanShutdown(OperationContext* txn) {
+    void KVStorageEngine::cleanShutdown() {
 
         for ( DBMap::const_iterator it = _dbs.begin(); it != _dbs.end(); ++it ) {
             delete it->second;
@@ -156,7 +177,7 @@ namespace mongo {
         _catalog.reset( NULL );
         _catalogRecordStore.reset( NULL );
 
-        _engine->cleanShutdown(txn);
+        _engine->cleanShutdown();
         // intentionally not deleting _engine
     }
 
@@ -166,7 +187,7 @@ namespace mongo {
     void KVStorageEngine::finishInit() {
     }
 
-    RecoveryUnit* KVStorageEngine::newRecoveryUnit( OperationContext* opCtx ) {
+    RecoveryUnit* KVStorageEngine::newRecoveryUnit() {
         if ( !_engine ) {
             // shutdown
             return NULL;
@@ -175,7 +196,7 @@ namespace mongo {
     }
 
     void KVStorageEngine::listDatabases( std::vector<std::string>* out ) const {
-        boost::mutex::scoped_lock lk( _dbsLock );
+        boost::lock_guard<boost::mutex> lk( _dbsLock );
         for ( DBMap::const_iterator it = _dbs.begin(); it != _dbs.end(); ++it ) {
             if ( it->second->isEmpty() )
                 continue;
@@ -184,8 +205,8 @@ namespace mongo {
     }
 
     DatabaseCatalogEntry* KVStorageEngine::getDatabaseCatalogEntry( OperationContext* opCtx,
-                                                                    const StringData& dbName ) {
-        boost::mutex::scoped_lock lk( _dbsLock );
+                                                                    StringData dbName ) {
+        boost::lock_guard<boost::mutex> lk( _dbsLock );
         KVDatabaseCatalogEntry*& db = _dbs[dbName.toString()];
         if ( !db ) {
             // Not registering change since db creation is implicit and never rolled back.
@@ -194,16 +215,16 @@ namespace mongo {
         return db;
     }
 
-    Status KVStorageEngine::closeDatabase( OperationContext* txn, const StringData& db ) {
+    Status KVStorageEngine::closeDatabase( OperationContext* txn, StringData db ) {
         // This is ok to be a no-op as there is no database layer in kv.
         return Status::OK();
     }
 
-    Status KVStorageEngine::dropDatabase( OperationContext* txn, const StringData& db ) {
+    Status KVStorageEngine::dropDatabase( OperationContext* txn, StringData db ) {
 
         KVDatabaseCatalogEntry* entry;
         {
-            boost::mutex::scoped_lock lk( _dbsLock );
+            boost::lock_guard<boost::mutex> lk( _dbsLock );
             DBMap::const_iterator it = _dbs.find( db.toString() );
             if ( it == _dbs.end() )
                 return Status( ErrorCodes::NamespaceNotFound, "db not found to drop" );
@@ -229,7 +250,7 @@ namespace mongo {
         invariant( toDrop.empty() );
 
         {
-            boost::mutex::scoped_lock lk( _dbsLock );
+            boost::lock_guard<boost::mutex> lk( _dbsLock );
             txn->recoveryUnit()->registerChange(new RemoveDBChange(this, db, entry));
             _dbs.erase( db.toString() );
         }
@@ -246,24 +267,12 @@ namespace mongo {
         return _engine->isDurable();
     }
 
-    Status KVStorageEngine::repairDatabase( OperationContext* txn,
-                                            const std::string& dbName,
-                                            bool preserveClonedFilesOnFailure,
-                                            bool backupOriginalFiles ) {
-        if ( preserveClonedFilesOnFailure ) {
-            return Status( ErrorCodes::BadValue, "preserveClonedFilesOnFailure not supported" );
-        }
-        if ( backupOriginalFiles ) {
-            return Status( ErrorCodes::BadValue, "backupOriginalFiles not supported" );
-        }
+    Status KVStorageEngine::repairRecordStore(OperationContext* txn, const std::string& ns) {
+        Status status = _engine->repairIdent(txn, _catalog->getCollectionIdent(ns));
+        if (!status.isOK())
+            return status;
 
-        vector<string> idents = _catalog->getAllIdentsForDB( dbName );
-        for ( size_t i = 0; i < idents.size(); i++ ) {
-            Status status = _engine->repairIdent( txn, idents[i] );
-            if ( !status.isOK() )
-                return status;
-        }
+        _dbs[nsToDatabase(ns)]->reinitCollectionAfterRepair(txn, ns);
         return Status::OK();
     }
-
 }

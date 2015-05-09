@@ -5,12 +5,12 @@
 
 // Note: count command uses call
 
-var st = new ShardingTest({ shards: [], other: { sync: true, separateConfig: true }});
+var st = new ShardingTest({ shards: [], other: { sync: true }});
 var configDB = st.config;
 var coll = configDB.test;
 
 for( var x = 0; x < 10; x++ ){
-    coll.insert({ v: x });
+    assert.writeOK(coll.insert({ v: x }));
 }
 
 var testNormalCount = function(){

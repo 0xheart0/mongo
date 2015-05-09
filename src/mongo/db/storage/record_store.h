@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/db/exec/collection_scan_common.h"
@@ -69,13 +71,15 @@ namespace mongo {
     /**
      * @see RecordStore::updateRecord
      */
-    class UpdateMoveNotifier {
+    class UpdateNotifier {
     public:
-        virtual ~UpdateMoveNotifier(){}
+        virtual ~UpdateNotifier(){}
         virtual Status recordStoreGoingToMove( OperationContext* txn,
                                                const RecordId& oldLocation,
                                                const char* oldBuffer,
                                                size_t oldSize ) = 0;
+        virtual Status recordStoreGoingToUpdateInPlace( OperationContext* txn,
+                                                        const RecordId& loc ) = 0;
     };
 
     /**
@@ -114,10 +118,18 @@ namespace mongo {
     };
 
 
+    /**
+     * A RecordStore provides an abstraction used for storing documents in a collection,
+     * or entries in an index. In storage engines implementing the KVEngine, record stores
+     * are also used for implementing catalogs.
+     *
+     * Many methods take an OperationContext parameter. This contains the RecoveryUnit, with
+     * all RecordStore specific transaction information, as well as the LockState.
+     */
     class RecordStore {
         MONGO_DISALLOW_COPYING(RecordStore);
     public:
-        RecordStore( const StringData& ns ) : _ns(ns.toString()) { }
+        RecordStore( StringData ns ) : _ns(ns.toString()) { }
 
         virtual ~RecordStore() { }
 
@@ -128,9 +140,17 @@ namespace mongo {
 
         virtual const std::string& ns() const { return _ns; }
 
-        virtual long long dataSize( OperationContext* txn ) const = 0;
+        /**
+         * The dataSize is an approximation of the sum of the sizes (in bytes) of the
+         * documents or entries in the recordStore.
+         */
+        virtual long long dataSize(OperationContext* txn) const = 0;
 
-        virtual long long numRecords( OperationContext* txn ) const = 0;
+        /**
+         * Total number of record in the RecordStore. You may need to cache it, so this call
+         * takes constant time, as it is called often.
+         */
+        virtual long long numRecords(OperationContext* txn) const = 0;
 
         virtual bool isCapped() const = 0;
 
@@ -139,6 +159,7 @@ namespace mongo {
         /**
          * @param extraInfo - optional more debug info
          * @param level - optional, level of debug info to put in (higher is more)
+         * @return total estimate size (in bytes) on stable storage
          */
         virtual int64_t storageSize( OperationContext* txn,
                                      BSONObjBuilder* extraInfo = NULL,
@@ -168,9 +189,12 @@ namespace mongo {
                                                   bool enforceQuota ) = 0;
 
         /**
-         * @param notifier - this is called if the document is moved
-         *                   it is to be called after the document has been written to new
-         *                   location, before deleted from old.
+         * @param notifier - Only used by record stores which do not support doc-locking.
+         *                   In the case of a document move, this is called after the document
+         *                   has been written to the new location, but before it is deleted from
+         *                   the old location.
+         *                   In the case of an in-place update, this is called just before the
+         *                   in-place write occurs.
          * @return Status or RecordId, RecordId might be different
          */
         virtual StatusWith<RecordId> updateRecord( OperationContext* txn,
@@ -178,7 +202,16 @@ namespace mongo {
                                                   const char* data,
                                                   int len,
                                                   bool enforceQuota,
-                                                  UpdateMoveNotifier* notifier ) = 0;
+                                                  UpdateNotifier* notifier ) = 0;
+
+        /**
+         * @return Returns 'false' if this record store does not implement
+         * 'updatewithDamages'. If this method returns false, 'updateWithDamages' must not be
+         * called, and all updates must be routed through 'updateRecord' above. This allows the
+         * update framework to avoid doing the work of damage tracking if the underlying record
+         * store cannot utilize that information.
+         */
+        virtual bool updateWithDamagesSupported() const = 0;
 
         virtual Status updateWithDamages( OperationContext* txn,
                                           const RecordId& loc,
@@ -206,7 +239,9 @@ namespace mongo {
 
         /**
          * returned iterator owned by caller
-         * Default arguments return all items in record store.
+         * Default arguments return all items in record store. If this function is called
+         * twice on the same RecoveryUnit (in the OperationContext), without intervening
+         * reset of it, the iterator must be based on the same snapshot.
          */
         virtual RecordIterator* getIterator( OperationContext* txn,
                                              const RecordId& start = RecordId(),
@@ -248,12 +283,32 @@ namespace mongo {
                                               RecordId end,
                                               bool inclusive) = 0;
 
-        // does this RecordStore support the compact operation
-        virtual bool compactSupported() const = 0;
+        /**
+         * does this RecordStore support the compact operation?
+         *
+         * If you return true, you must provide implementations of all compact methods.
+         */
+        virtual bool compactSupported() const { return false; }
+
+        /**
+         * Does compact() leave RecordIds alone or can they change.
+         *
+         * Only called if compactSupported() returns true.
+         */
+        virtual bool compactsInPlace() const { invariant(false); }
+
+        /**
+         * Attempt to reduce the storage space used by this RecordStore.
+         *
+         * Only called if compactSupported() returns true.
+         * No RecordStoreCompactAdaptor will be passed if compactsInPlace() returns true.
+         */
         virtual Status compact( OperationContext* txn,
                                 RecordStoreCompactAdaptor* adaptor,
                                 const CompactOptions* options,
-                                CompactStats* stats ) = 0;
+                                CompactStats* stats ) {
+            invariant(false);
+        }
 
         /**
          * @param full - does more checks
@@ -265,7 +320,7 @@ namespace mongo {
         virtual Status validate( OperationContext* txn,
                                  bool full, bool scanData,
                                  ValidateAdaptor* adaptor,
-                                 ValidateResults* results, BSONObjBuilder* output ) const = 0;
+                                 ValidateResults* results, BSONObjBuilder* output ) = 0;
 
         /**
          * @param scaleSize - amount by which to scale size metrics
@@ -290,24 +345,15 @@ namespace mongo {
         }
 
         /**
-         * @return Status::OK() if option hanlded
-         *         InvalidOptions is option not supported
-         *         other errors indicate option supported, but error setting
-         */
-        virtual Status setCustomOption( OperationContext* txn,
-                                        const BSONElement& option,
-                                        BSONObjBuilder* info = NULL ) = 0;
-
-        /**
          * Return the RecordId of an oplog entry as close to startingPosition as possible without
          * being higher. If there are no entries <= startingPosition, return RecordId().
          *
          * If you don't implement the oplogStartHack, just use the default implementation which
-         * returns an Invalid RecordId.
+         * returns boost::none.
          */
-        virtual RecordId oplogStartHack(OperationContext* txn,
-                                       const RecordId& startingPosition) const {
-            return RecordId().setInvalid();
+        virtual boost::optional<RecordId> oplogStartHack(OperationContext* txn,
+                                                         const RecordId& startingPosition) const {
+            return boost::none;
         }
 
         /**
@@ -316,10 +362,16 @@ namespace mongo {
          * they are ordered.
          */
         virtual Status oplogDiskLocRegister( OperationContext* txn,
-                                             const OpTime& opTime ) {
+                                             const Timestamp& opTime ) {
             return Status::OK();
         }
 
+        /**
+         * Called after a repair operation is run with the recomputed numRecords and dataSize.
+         */
+        virtual void updateStatsAfterRepair(OperationContext* txn,
+                                            long long numRecords,
+                                            long long dataSize) = 0;
 
     protected:
         std::string _ns;

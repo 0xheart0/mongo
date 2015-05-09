@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -34,11 +35,11 @@ util_create(WT_SESSION *session, int argc, char *argv[])
 	if (argc != 1)
 		return (usage());
 
-	if ((uri = util_name(*argv, "table")) == NULL)
+	if ((uri = util_name(session, *argv, "table")) == NULL)
 		return (1);
 
 	if ((ret = session->create(session, uri, config)) != 0)
-		return (util_err(ret, "%s: session.create", uri));
+		return (util_err(session, ret, "%s: session.create", uri));
 	return (0);
 }
 

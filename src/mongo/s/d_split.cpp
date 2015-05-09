@@ -40,27 +40,40 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_legacy.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/s/chunk.h" // for static genID only
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
 #include "mongo/s/d_state.h"
-#include "mongo/s/distlock.h"
+#include "mongo/s/catalog/dist_lock_manager.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/s/type_chunk.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::ostringstream;
+    using std::set;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     class CmdMedianKey : public Command {
     public:
@@ -74,7 +87,12 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             errmsg = "medianKey command no longer supported. Calling this indicates mismatch between mongo versions.";
             return false;
         }
@@ -100,7 +118,12 @@ namespace mongo {
             return parseNsFullyQualified(dbname, cmdObj);
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             std::string ns = parseNs(dbname, jsobj);
             BSONObj keyPattern = jsobj.getObjectField( "keyPattern" );
@@ -130,9 +153,10 @@ namespace mongo {
             }
 
             IndexDescriptor *idx =
-                collection->getIndexCatalog()->findIndexByPrefix( txn,
-                                                                  keyPattern,
-                                                                  true );  /* require single key */
+                collection->getIndexCatalog()
+                          ->findShardKeyPrefixedIndex( txn,
+                                                       keyPattern,
+                                                       true ); // requireSingleKey
             if ( idx == NULL ) {
                 errmsg = "couldn't find valid index for shard key";
                 return false;
@@ -183,7 +207,7 @@ namespace mongo {
 
                     // This is a fetch, but it's OK.  The underlying code won't throw a page fault
                     // exception.
-                    BSONObj obj = collection->docFor(txn, loc);
+                    BSONObj obj = collection->docFor(txn, loc).value();
                     BSONObjIterator j( keyPattern );
                     BSONElement real;
                     for ( int x=0; x <= k; x++ )
@@ -232,7 +256,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                     ActionType::splitVector)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -242,7 +266,12 @@ namespace mongo {
         virtual std::string parseNs(const string& dbname, const BSONObj& cmdObj) const {
             return parseNsFullyQualified(dbname, cmdObj);
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             //
             // 1.a We'll parse the parameters in two steps. First, make sure the we can use the split index to get
@@ -292,9 +321,9 @@ namespace mongo {
                 // Therefore, any multi-key index prefixed by shard key cannot be multikey over
                 // the shard key fields.
                 IndexDescriptor *idx =
-                    collection->getIndexCatalog()->findIndexByPrefix( txn,
-                                                                      keyPattern,
-                                                                      false );
+                    collection->getIndexCatalog()->findShardKeyPrefixedIndex( txn,
+                                                                              keyPattern,
+                                                                              false );
                 if ( idx == NULL ) {
                     errmsg = (string)"couldn't find index over splitting key " +
                              keyPattern.clientReadable().toString();
@@ -498,7 +527,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
+            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                     ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                     ActionType::splitChunk)) {
                 return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -508,7 +537,12 @@ namespace mongo {
         virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
             return parseNsFullyQualified(dbname, cmdObj);
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             //
             // 1. check whether parameters passed to splitChunk are sound
@@ -555,12 +589,6 @@ namespace mongo {
                 splitKeys.push_back( it.next().Obj().getOwned() );
             }
 
-            const BSONElement shardId = cmdObj["shardId"];
-            if ( shardId.eoo() ) {
-                errmsg = "need to provide shardId";
-                return false;
-            }
-
             //
             // Get sharding state up-to-date
             //
@@ -593,17 +621,17 @@ namespace mongo {
             // 2. lock the collection's metadata and get highest version for the current shard
             //
 
-            ScopedDistributedLock collLock(configLoc, ns);
-            collLock.setLockMessage(str::stream() << "splitting chunk [" << minKey << ", " << maxKey
-                                                  << ") in " << ns);
+            string whyMessage(str::stream() << "splitting chunk [" << minKey
+                                            << ", " << maxKey
+                                            << ") in " << ns);
+            auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
+                    ns, whyMessage);
 
-            Status acquisitionStatus = collLock.tryAcquire();
-            if (!acquisitionStatus.isOK()) {
+            if (!scopedDistLock.isOK()) {
                 errmsg = str::stream() << "could not acquire collection lock for " << ns
                                        << " to split chunk [" << minKey << "," << maxKey << ")"
-                                       << causedBy(acquisitionStatus);
-
-                warning() << errmsg << endl;
+                                       << causedBy(scopedDistLock.getStatus());
+                warning() << errmsg;
                 return false;
             }
 
@@ -630,7 +658,7 @@ namespace mongo {
                 return false;
             }
 
-            // From mongos >= v2.8.
+            // From mongos >= v3.0.
             BSONElement epochElem(cmdObj["epoch"]);
             if (epochElem.type() == jstOID) {
                 OID cmdEpoch = epochElem.OID();
@@ -684,8 +712,7 @@ namespace mongo {
             BSONObj startKey = min;
             splitKeys.push_back( max ); // makes it easier to have 'max' in the next loop. remove later.
 
-            BSONObjBuilder cmdBuilder;
-            BSONArrayBuilder updates( cmdBuilder.subarrayStart( "applyOps" ) );
+            BSONArrayBuilder updates;
 
             for ( vector<BSONObj>::const_iterator it = splitKeys.begin(); it != splitKeys.end(); ++it ) {
                 BSONObj endKey = *it;
@@ -747,10 +774,8 @@ namespace mongo {
 
             splitKeys.pop_back(); // 'max' was used as sentinel
 
-            updates.done();
-
+            BSONArrayBuilder preCond;
             {
-                BSONArrayBuilder preCond( cmdBuilder.subarrayStart( "preCondition" ) );
                 BSONObjBuilder b;
                 b.append("ns", ChunkType::ConfigNS);
                 b.append("q", BSON("query" << BSON(ChunkType::ns(ns)) <<
@@ -762,30 +787,15 @@ namespace mongo {
                     bb.done();
                 }
                 preCond.append( b.obj() );
-                preCond.done();
             }
 
             //
             // 4. apply the batch of updates to remote and local metadata
             //
-
-            BSONObj cmd = cmdBuilder.obj();
-
-            LOG(1) << "splitChunk update: " << cmd << endl;
-
-            bool ok;
-            BSONObj cmdResult;
-            {
-                ScopedDbConnection conn(shardingState.getConfigServer(), 30);
-                ok = conn->runCommand( "config" , cmd , cmdResult );
-                conn.done();
-            }
-
-            if ( ! ok ) {
-                stringstream ss;
-                ss << "saving chunks failed.  cmd: " << cmd << " result: " << cmdResult;
-                error() << ss.str() << endl;
-                msgasserted( 13593 , ss.str() );
+            Status applyOpsStatus = grid.catalogManager()->applyChunkOpsDeprecated(updates.arr(),
+                                                                                   preCond.arr());
+            if (!applyOpsStatus.isOK()) {
+                return appendCommandStatus(result, applyOpsStatus);
             }
 
             //
@@ -817,7 +827,8 @@ namespace mongo {
             if ( newChunks.size() == 2 ) {
                 appendShortVersion(logDetail.subobjStart("left"), *newChunks[0]);
                 appendShortVersion(logDetail.subobjStart("right"), *newChunks[1]);
-                configServer.logChange( "split" , ns , logDetail.obj() );
+
+                grid.catalogManager()->logChange(txn, "split", ns, logDetail.obj());
             }
             else {
                 BSONObj beforeDetailObj = logDetail.obj();
@@ -830,41 +841,51 @@ namespace mongo {
                     chunkDetail.append( "number", i+1 );
                     chunkDetail.append( "of" , newChunksSize );
                     appendShortVersion(chunkDetail.subobjStart("chunk"), *newChunks[i]);
-                    configServer.logChange( "multi-split" , ns , chunkDetail.obj() );
+
+                    grid.catalogManager()->logChange(txn, "multi-split", ns, chunkDetail.obj());
                 }
             }
 
             dassert(newChunks.size() > 1);
 
             {
+                // Select chunk to move out for "top chunk optimization".
+                KeyPattern shardKeyPattern(collMetadata->getKeyPattern());
+
                 AutoGetCollectionForRead ctx(txn, ns);
                 Collection* collection = ctx.getCollection();
-                invariant(collection);
+                if (!collection) {
+                    warning() << "will not perform top-chunk checking since " << ns
+                              << " does not exist after splitting";
+                    return true;
+                }
 
                 // Allow multiKey based on the invariant that shard keys must be
                 // single-valued. Therefore, any multi-key index prefixed by shard
                 // key cannot be multikey over the shard key fields.
                 IndexDescriptor *idx =
-                    collection->getIndexCatalog()->findIndexByPrefix(txn, keyPattern, false);
+                    collection->getIndexCatalog()->findShardKeyPrefixedIndex(txn,
+                                                                             keyPattern,
+                                                                             false);
 
                 if (idx == NULL) {
                     return true;
                 }
 
-                const ChunkType* chunk = newChunks.vector().back();
-                KeyPattern kp(idx->keyPattern());
-                BSONObj newmin = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMin(), false));
-                BSONObj newmax = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMax(), false));
+                const ChunkType* backChunk = newChunks.vector().back();
+                const ChunkType* frontChunk = newChunks.vector().front();
 
-                auto_ptr<PlanExecutor> exec(
-                        InternalPlanner::indexScan(txn, collection, idx, newmin, newmax, false));
-
-                // check if exactly one document found
-                if (PlanExecutor::ADVANCED == exec->getNext(NULL, NULL)) {
-                    if (PlanExecutor::IS_EOF == exec->getNext(NULL, NULL)) {
-                        result.append("shouldMigrate",
-                                      BSON("min" << chunk->getMin() << "max" << chunk->getMax()));
-                    }
+                if (shardKeyPattern.globalMax().woCompare(backChunk->getMax()) == 0 &&
+                    checkIfSingleDoc(txn, collection, idx, backChunk)) {
+                    result.append("shouldMigrate",
+                                  BSON("min" << backChunk->getMin()
+                                       << "max" << backChunk->getMax()));
+                }
+                else if (shardKeyPattern.globalMin().woCompare(frontChunk->getMin()) == 0 &&
+                    checkIfSingleDoc(txn, collection, idx, frontChunk)) {
+                    result.append("shouldMigrate",
+                                  BSON("min" << frontChunk->getMin()
+                                       << "max" << frontChunk->getMax()));
                 }
             }
 
@@ -883,6 +904,27 @@ namespace mongo {
             if (chunk.isVersionSet())
                 chunk.getVersion().addToBSON(bb, ChunkType::DEPRECATED_lastmod());
             bb.done();
+        }
+
+        static bool checkIfSingleDoc(OperationContext* txn,
+                                     Collection* collection,
+                                     const IndexDescriptor* idx,
+                                     const ChunkType* chunk) {
+            KeyPattern kp(idx->keyPattern());
+            BSONObj newmin = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMin(), false));
+            BSONObj newmax = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMax(), true));
+
+            auto_ptr<PlanExecutor> exec(
+                InternalPlanner::indexScan(txn, collection, idx, newmin, newmax, false));
+
+            // check if exactly one document found
+            if (PlanExecutor::ADVANCED == exec->getNext(NULL, NULL)) {
+                if (PlanExecutor::IS_EOF == exec->getNext(NULL, NULL)) {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
     } cmdSplitChunk;

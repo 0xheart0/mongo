@@ -26,93 +26,112 @@
  *    it in the license file.
  */
 
-// only used by mongod, thus the name ('d')
-// (also used by dbtests test binary, which is running mongod test code)
-
 #pragma once
 
 #include <boost/scoped_ptr.hpp>
 #include <climits> // For UINT_MAX
 
-#include "mongo/base/string_data.h"
-#include "mongo/db/concurrency/lock_mgr_defs.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/concurrency/rwlock.h"
+#include "mongo/db/concurrency/locker.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-    class Locker;
     class StringData;
 
-    class Lock : boost::noncopyable { 
+    class Lock {
     public:
-        class ScopedLock;
 
-        // note: avoid TempRelease when possible. not a good thing.
-        struct TempRelease {
-            TempRelease(Locker* lockState);
+        /**
+         * NOTE: DO NOT add any new usages of TempRelease. It is being deprecated/removed.
+         */
+        class TempRelease {
+            MONGO_DISALLOW_COPYING(TempRelease);
+        public:
+            explicit TempRelease(Locker* lockState);
             ~TempRelease();
-            const bool cant; // true if couldn't because of recursive locking
 
+        private:
             // Not owned
-            Locker* _lockState;
-            ScopedLock *scopedLk;
+            Locker* const _lockState;
+
+            // If _locksReleased is true, this stores the persisted lock information to be restored
+            // in the destructor. Otherwise it is empty.
+            Locker::LockSnapshot _lockSnapshot;
+
+            // False if locks could not be released because of recursive locking
+            const bool _locksReleased;
         };
 
-        /** turn on "parallel batch writer mode".  blocks all other threads. this mode is off
-            by default. note only one thread creates a ParallelBatchWriterMode object; the rest just
-            call iAmABatchParticipant().  Note that this lock is not released on a temprelease, just
-            the normal lock things below.
-            */
-        class ParallelBatchWriterMode : boost::noncopyable {
-            RWLockRecursive::Exclusive _lk;
-        public:
-            ParallelBatchWriterMode() : _lk(_batchLock) {}
-            static void iAmABatchParticipant(Locker* lockState);
-            static RWLockRecursive &_batchLock;
-        };
 
-    public:
-        class ScopedLock : boost::noncopyable {
-        public:
-            virtual ~ScopedLock();
+        /**
+         * General purpose RAII wrapper for a resource managed by the lock manager
+         *
+         * See LockMode for the supported modes. Unlike DBLock/Collection lock, this will not do
+         * any additional checks/upgrades or global locking. Use ResourceLock for locking
+         * resources other than RESOURCE_GLOBAL, RESOURCE_DATABASE and RESOURCE_COLLECTION.
+         */
+        class ResourceLock {
+            MONGO_DISALLOW_COPYING(ResourceLock);
 
-        protected:
-            explicit ScopedLock(Locker* lockState, char type );
+        public:
+            ResourceLock(Locker* locker, ResourceId rid)
+                  : _rid(rid),
+                    _locker(locker),
+                    _result(LOCK_INVALID) {
+            }
+
+            ResourceLock(Locker* locker, ResourceId rid, LockMode mode)
+                  : _rid(rid),
+                    _locker(locker),
+                    _result(LOCK_INVALID) {
+                lock(mode);
+            }
+
+            ~ResourceLock() {
+                unlock();
+            }
+
+            void lock(LockMode mode);
+            void unlock();
+
+            bool isLocked() const { return _result == LOCK_OK; }
 
         private:
-            friend struct TempRelease;
+            const ResourceId _rid;
+            Locker* const _locker;
 
-            // TempRelease class calls these
-            void tempRelease();
-            void relock();
+            LockResult _result;
+        };
 
-        protected:
-            virtual void _tempRelease();
-            virtual void _relock();
 
-            Locker* _lockState;
+        /**
+         * Global lock.
+         *
+         * Grabs global resource lock. Allows further (recursive) acquisition of the global lock
+         * in any mode, see LockMode.
+         * NOTE: Does not acquire flush lock.
+         */
+        class GlobalLock {
+        public:
+            explicit GlobalLock(Locker* locker);
+            GlobalLock(Locker* locker, LockMode lockMode, unsigned timeoutMs);
+
+            ~GlobalLock() {
+                _unlock();
+            }
+
+            bool isLocked() const { return _result == LOCK_OK; }
 
         private:
 
-            class ParallelBatchWriterSupport : boost::noncopyable {
-            public:
-                ParallelBatchWriterSupport(Locker* lockState);
+            void _lock(LockMode lockMode, unsigned timeoutMs);
+            void _unlock();
 
-            private:
-                void tempRelease();
-                void relock();
-
-                Locker* _lockState;
-                boost::scoped_ptr<RWLockRecursive::Shared> _lk;
-                friend class ScopedLock;
-            };
-
-            ParallelBatchWriterSupport _pbws_lk;
-
-            char _type;      // 'r','w','R','W'
+            Locker* const _locker;
+            LockResult _result;
+            ResourceLock _pbwm;
         };
+
 
         /**
          * Global exclusive lock
@@ -121,15 +140,17 @@ namespace mongo {
          * access. Allows further (recursive) acquisition of the global lock in any mode,
          * see LockMode.
          */
-        class GlobalWrite : public ScopedLock {
-        protected:
-            void _tempRelease();
-            void _relock();
+        class GlobalWrite : public GlobalLock {
         public:
-            // timeoutms is only for writelocktry -- deprecated -- do not use
-            GlobalWrite(Locker* lockState, unsigned timeoutms = UINT_MAX);
-            virtual ~GlobalWrite();
+            explicit GlobalWrite(Locker* locker, unsigned timeoutMs = UINT_MAX)
+                : GlobalLock(locker, MODE_X, timeoutMs) {
+
+                if (isLocked()) {
+                    locker->lockMMAPV1Flush();
+                }
+            }
         };
+
 
         /**
          * Global shared lock
@@ -138,12 +159,17 @@ namespace mongo {
          * Allows further (recursive) acquisition of the global lock in shared (S) or intent-shared
          * (IS) mode, see LockMode.
          */
-        class GlobalRead : public ScopedLock {
+        class GlobalRead : public GlobalLock {
         public:
-            // timeoutms is only for readlocktry -- deprecated -- do not use
-            GlobalRead(Locker* lockState, unsigned timeoutms = UINT_MAX);
-            virtual ~GlobalRead();
+            explicit GlobalRead(Locker* locker, unsigned timeoutMs = UINT_MAX)
+                : GlobalLock(locker, MODE_S, timeoutMs) {
+
+                if (isLocked()) {
+                    locker->lockMMAPV1Flush();
+                }
+            }
         };
+
 
         /**
          * Database lock with support for collection- and document-level locking
@@ -159,10 +185,10 @@ namespace mongo {
          * For storage engines that do not support collection-level locking, MODE_IS will be
          * upgraded to MODE_S and MODE_IX will be upgraded to MODE_X.
          */
-        class DBLock : public ScopedLock {
+        class DBLock {
         public:
-            DBLock(Locker* lockState, const StringData& db, const LockMode mode);
-            virtual ~DBLock();
+            DBLock(Locker* locker, StringData db, LockMode mode);
+            ~DBLock();
 
             /**
              * Releases the DBLock and reacquires it with the new mode. The global intent
@@ -170,21 +196,21 @@ namespace mongo {
              * MODE_S to MODE_IX or MODE_X is not allowed to avoid violating the global intent.
              * Use relockWithMode() instead of upgrading to avoid deadlock.
              */
-            void relockWithMode(const LockMode newMode);
+            void relockWithMode(LockMode newMode);
 
         private:
-            void lockDB();
-            void unlockDB();
-
             const ResourceId _id;
-            LockMode _mode; // may be changed through relockWithMode
+            Locker* const _locker;
 
-        protected:
-            // Still need to override these for ScopedLock::tempRelease() and relock().
-            // TODO: make this go away
-            void _tempRelease()  { unlockDB(); }
-            void _relock() { lockDB(); }
+            // May be changed through relockWithMode. The global lock mode won't change though,
+            // because we never change from IS/S to IX/X or vice versa, just convert locks from
+            // IX -> X.
+            LockMode _mode;
+
+            // Acquires the global lock on our behalf.
+            GlobalLock _globalLock;
         };
+
 
         /**
          * Collection lock with support for document-level locking
@@ -200,67 +226,60 @@ namespace mongo {
          * collection. For storage engines that do not support document-level locking, MODE_IS
          * will be upgraded to MODE_S and MODE_IX will be upgraded to MODE_X.
          */
-        class CollectionLock : boost::noncopyable {
+        class CollectionLock {
+            MONGO_DISALLOW_COPYING(CollectionLock);
         public:
-            CollectionLock(Locker* lockState, const StringData& ns, const LockMode);
-            virtual ~CollectionLock();
+            CollectionLock(Locker* lockState, StringData ns, LockMode mode);
+            ~CollectionLock();
 
-            void relockWithMode( const LockMode mode, Lock::DBLock& dblock );
+            /**
+             * When holding the collection in MODE_IX or MODE_X, calling this will release the
+             * collection and database locks, and relocks the database in MODE_X. This is typically
+             * used if the collection still needs to be created. Upgrading would not be safe as
+             * it could lead to deadlock, similarly for relocking the database without releasing
+             * the collection lock. The collection lock will also be reacquired even though it is
+             * not really needed, as it simplifies invariant checking: the CollectionLock class
+             * has as invariant that a collection lock is being held.
+             */
+            void relockAsDatabaseExclusive(Lock::DBLock& dbLock);
+
         private:
             const ResourceId _id;
-            Locker* _lockState;
+            Locker* const _lockState;
         };
 
         /**
-         * General purpose RAII wrapper for a resource managed by the lock manager
-         *
-         * See LockMode for the supported modes. Unlike DBLock/Collection lock, this will not do
-         * any additional checks/upgrades or global locking. Use ResourceLock for locking
-         * resources other than RESOURCE_GLOBAL, RESOURCE_DATABASE and RESOURCE_COLLECTION.
+         * Like the CollectionLock, but optimized for the local oplog. Always locks in MODE_IX,
+         * must call serializeIfNeeded() before doing any concurrent operations in order to
+         * support storage engines without document level locking. It is an error, checked with a
+         * dassert(), to not have a suitable database lock when taking this lock.
          */
-        class ResourceLock : boost::noncopyable {
+        class OplogIntentWriteLock {
+            MONGO_DISALLOW_COPYING(OplogIntentWriteLock);
         public:
-            ResourceLock(Locker* lockState, const ResourceId rid, const LockMode);
-            virtual ~ResourceLock();
+            explicit OplogIntentWriteLock(Locker* lockState);
+            ~OplogIntentWriteLock();
+            void serializeIfNeeded();
         private:
-            const ResourceId _rid;
-            Locker* _lockState;
+            Locker* const _lockState;
+            bool _serialized;
         };
+
 
         /**
-         * Shared database lock -- DEPRECATED, please transition to DBLock and collection locks
-         *
-         * Allows concurrent read access to the given database, blocking any writers.
-         * Allows further (recursive) acquisision of database locks for this database in shared
-         * or intent-shared mode. Also acquires global lock in intent-shared (IS) mode.
+         * Turn on "parallel batch writer mode" by locking the global ParallelBatchWriterMode
+         * resource in exclusive mode. This mode is off by default.
+         * Note that only one thread creates a ParallelBatchWriterMode object; the other batch
+         * writers just call setIsBatchWriter().
          */
-        class DBRead : public DBLock {
+        class ParallelBatchWriterMode {
+            MONGO_DISALLOW_COPYING(ParallelBatchWriterMode);
+
         public:
-            DBRead(Locker* lockState, const StringData& dbOrNs);
+            explicit ParallelBatchWriterMode(Locker* lockState);
+
+        private:
+            ResourceLock _pbwm;
         };
-    };
-
-    class DBTryLockTimeoutException : public std::exception {
-    public:
-        DBTryLockTimeoutException();
-        virtual ~DBTryLockTimeoutException() throw();
-    };
-
-    class readlocktry : boost::noncopyable {
-        bool _got;
-        boost::scoped_ptr<Lock::GlobalRead> _dbrlock;
-    public:
-        readlocktry(Locker* lockState, int tryms);
-        ~readlocktry();
-        bool got() const { return _got; }
-    };
-
-    class writelocktry : boost::noncopyable {
-        bool _got;
-        boost::scoped_ptr<Lock::GlobalWrite> _dbwlock;
-    public:
-        writelocktry(Locker* lockState, int tryms);
-        ~writelocktry();
-        bool got() const { return _got; }
     };
 }

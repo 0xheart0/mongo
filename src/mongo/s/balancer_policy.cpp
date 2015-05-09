@@ -31,18 +31,29 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/s/balancer_policy.h"
+
 #include <algorithm>
 
-#include "mongo/s/balancer_policy.h"
-#include "mongo/s/chunk.h"
-#include "mongo/s/config.h"
+#include "mongo/client/connpool.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/type_tags.h"
 #include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
 #include "mongo/util/text.h"
 
-
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::map;
+    using std::numeric_limits;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     string TagRange::toString() const {
         return str::stream() << min << " -->> " << max << "  on  " << tag;
@@ -232,30 +243,49 @@ namespace mongo {
         }
     }
 
-    void DistributionStatus::populateShardInfoMap(const vector<Shard> allShards,
-                                                  ShardInfoMap* shardInfo) {
-        for (vector<Shard>::const_iterator it = allShards.begin();
-                it != allShards.end(); ++it ) {
-            const Shard& shard = *it;
-            ShardStatus status = shard.getStatus();
-            shardInfo->insert(make_pair(shard.getName(),
-                                        ShardInfo(shard.getMaxSize(),
-                                                  status.mapped(),
-                                                  shard.isDraining(),
-                                                  shard.tags(),
-                                                  status.mongoVersion())));
+    Status DistributionStatus::populateShardInfoMap(ShardInfoMap* shardInfo) {
+        try {
+            vector<ShardType> shards;
+            Status status = grid.catalogManager()->getAllShards(&shards);
+            if (!status.isOK()) {
+                return status;
+            }
+
+            for (const ShardType& shard : shards) {
+                std::set<std::string> dummy;
+                ShardInfo newShardEntry(shard.getMaxSize(),
+                                        Shard::getShardDataSizeBytes(shard.getHost()) /
+                                            1024 / 1024,
+                                        shard.getDraining(),
+                                        dummy,
+                                        Shard::getShardMongoVersion(shard.getHost()));
+
+                vector<string> shardTags = shard.getTags();
+                for (vector<string>::const_iterator it = shardTags.begin();
+                     it != shardTags.end();
+                     it++) {
+                    newShardEntry.addTag(*it);
+                }
+
+                shardInfo->insert(make_pair(shard.getName(), newShardEntry));
+            }
         }
+        catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+
+        return Status::OK();
     }
 
-    void DistributionStatus::populateShardToChunksMap(const vector<Shard>& allShards,
+    void DistributionStatus::populateShardToChunksMap(const ShardInfoMap& allShards,
                                                       const ChunkManager& chunkMgr,
                                                       ShardToChunksMap* shardToChunksMap) {
         // Makes sure there is an entry in shardToChunksMap for every shard.
-        for (vector<Shard>::const_iterator it = allShards.begin();
+        for (ShardInfoMap::const_iterator it = allShards.begin();
                 it != allShards.end(); ++it) {
 
             OwnedPointerVector<ChunkType>*& chunkList =
-                    (*shardToChunksMap)[it->getName()];
+                    (*shardToChunksMap)[it->first];
 
             if (chunkList == NULL) {
                 chunkList = new OwnedPointerVector<ChunkType>();
@@ -342,7 +372,7 @@ namespace mongo {
                 // since we have to move all chunks, lets just do in order
                 for ( unsigned i=0; i<chunks.size(); i++ ) {
                     const ChunkType& chunkToMove = *chunks[i];
-                    if (chunkToMove.isJumboSet() && chunkToMove.getJumbo()) {
+                    if (chunkToMove.getJumbo()) {
                         numJumboChunks++;
                         continue;
                     }
@@ -394,7 +424,7 @@ namespace mongo {
                           << " is not on a shard with the right tag: "
                           << tag << endl;
 
-                    if (chunk.isJumboSet() && chunk.getJumbo()) {
+                    if (chunk.getJumbo()) {
                         warning() << "chunk " << chunk << " is jumbo, so cannot be moved" << endl;
                         continue;
                     }
@@ -467,7 +497,7 @@ namespace mongo {
                 if (distribution.getTagForChunk(chunk) != tag)
                     continue;
 
-                if (chunk.isJumboSet() && chunk.getJumbo()) {
+                if (chunk.getJumbo()) {
                     numJumboChunks++;
                     continue;
                 }
@@ -479,8 +509,8 @@ namespace mongo {
             }
 
             if ( numJumboChunks ) {
-                error() << "shard: " << from << "ns: " << ns
-                        << "has too many chunks, but they are all jumbo "
+                error() << "shard: " << from << " ns: " << ns
+                        << " has too many chunks, but they are all jumbo "
                         << " numJumboChunks: " << numJumboChunks
                         << endl;
                 continue;
@@ -494,21 +524,22 @@ namespace mongo {
     }
 
 
-    ShardInfo::ShardInfo( long long maxSize, long long currSize,
-                          bool draining,
-                          const set<string>& tags, 
-                          const string& mongoVersion )
-        : _maxSize( maxSize ),
-          _currSize( currSize ),
-          _draining( draining ),
-          _tags( tags ),
-          _mongoVersion( mongoVersion ) {
+    ShardInfo::ShardInfo(long long maxSizeMB,
+                         long long currSizeMB,
+                         bool draining,
+                         const set<string>& tags,
+                         const string& mongoVersion):
+        _maxSizeMB(maxSizeMB),
+        _currSizeMB(currSizeMB),
+        _draining(draining),
+        _tags(tags),
+        _mongoVersion(mongoVersion) {
     }
 
     ShardInfo::ShardInfo()
-        : _maxSize( 0 ),
-          _currSize( 0 ),
-          _draining( false ) {
+        : _maxSizeMB(0),
+          _currSizeMB(0),
+          _draining(false) {
     }
 
     void ShardInfo::addTag( const string& tag ) {
@@ -517,10 +548,10 @@ namespace mongo {
 
 
     bool ShardInfo::isSizeMaxed() const {
-        if ( _maxSize == 0 || _currSize == 0 )
+        if (_maxSizeMB == 0 || _currSizeMB == 0)
             return false;
 
-        return _currSize >= _maxSize;
+        return _currSizeMB >= _maxSizeMB;
     }
 
     bool ShardInfo::hasTag( const string& tag ) const {
@@ -531,8 +562,8 @@ namespace mongo {
 
     string ShardInfo::toString() const {
         StringBuilder ss;
-        ss << " maxSize: " << _maxSize;
-        ss << " currSize: " << _currSize;
+        ss << " maxSizeMB: " << _maxSizeMB;
+        ss << " currSizeMB: " << _currSizeMB;
         ss << " draining: " << _draining;
         if ( _tags.size() > 0 ) {
             ss << "tags : ";

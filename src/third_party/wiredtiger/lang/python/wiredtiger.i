@@ -1,4 +1,5 @@
 /*-
+ * Public Domain 2014-2015 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -30,10 +31,16 @@
  *	The SWIG interface file defining the wiredtiger python API.
  */
 %define DOCSTRING
-"@defgroup wt_python WiredTiger Python API
-Python wrappers aroung the WiredTiger C API.
-@{
-@cond IGNORE"
+"Python wrappers around the WiredTiger C API
+
+This provides an API similar to the C API, with the following modifications:
+  - Many C functions are exposed as OO methods. See the Python examples and test suite
+  - Errors are handled in a Pythonic way; wrap calls in try/except blocks
+  - Cursors have extra accessor methods and iterators that are higher-level than the C API
+  - Statistics cursors behave a little differently and are best handled using the C-like functions
+  - C Constants starting with WT_STAT_DSRC are instead exposed under wiredtiger.stat.dsrc
+  - C Constants starting with WT_STAT_CONN are instead exposed under wiredtiger.stat.conn
+"
 %enddef
 
 %module(docstring=DOCSTRING) wiredtiger
@@ -156,7 +163,7 @@ from packing import pack, unpack
 %define DESTRUCTOR(class, method)
 %feature("shadow") class::method %{
 	def method(self, *args):
-		'''close(self, config) -> int
+		'''method(self, config) -> int
 		
 		@copydoc class::method'''
 		try:
@@ -169,6 +176,26 @@ from packing import pack, unpack
 DESTRUCTOR(__wt_connection, close)
 DESTRUCTOR(__wt_cursor, close)
 DESTRUCTOR(__wt_session, close)
+
+/*
+ * OVERRIDE_METHOD must be used when overriding or extending an existing
+ * method in the C interface.  It creates Python method() that calls
+ * _method(), which is the extended version of the method.  This works
+ * around potential naming conflicts.  Without this technique, for example,
+ * defining __wt_cursor::equals() creates the wrapper function
+ * __wt_cursor_equals(), which may be defined in the WT library.
+ */
+%define OVERRIDE_METHOD(cclass, pyclass, method, pyargs)
+%extend cclass {
+%pythoncode %{
+	def method(self, *args):
+		'''method pyargs -> int
+
+		@copydoc class::method'''
+		return self._##method(*args)
+%}
+};
+%enddef
 
 /* Don't require empty config strings. */
 %typemap(default) const char *config { $1 = NULL; }
@@ -337,10 +364,12 @@ retry:
 	$action
 	if (result != 0 && result != EBUSY)
 		SWIG_ERROR_IF_NOT_SET(result);
-        else if (result == EBUSY) {
-                __wt_sleep(0, 10000);
-                goto retry;
-        }
+	else if (result == EBUSY) {
+		SWIG_PYTHON_THREAD_BEGIN_ALLOW;
+		__wt_sleep(0, 10000);
+		SWIG_PYTHON_THREAD_END_ALLOW;
+		goto retry;
+	}
 }
 %enddef
 
@@ -360,8 +389,17 @@ retry:
 }
 %enddef
 
-/* Cursor compare can return any of -1, 0, 1 or WT_NOTFOUND. */
+/* Cursor compare can return any of -1, 0, 1. */
 %define COMPARE_OK(m)
+%exception m {
+	$action
+	if (result < -1 || result > 1)
+		SWIG_ERROR_IF_NOT_SET(result);
+}
+%enddef
+
+/* Cursor compare can return any of -1, 0, 1 or WT_NOTFOUND. */
+%define COMPARE_NOTFOUND_OK(m)
 %exception m {
 	$action
 	if ((result < -1 || result > 1) && result != WT_NOTFOUND)
@@ -377,8 +415,9 @@ NOTFOUND_OK(__wt_cursor::remove)
 NOTFOUND_OK(__wt_cursor::search)
 NOTFOUND_OK(__wt_cursor::update)
 
-COMPARE_OK(__wt_cursor::compare)
-COMPARE_OK(__wt_cursor::search_near)
+COMPARE_OK(__wt_cursor::_compare)
+COMPARE_OK(__wt_cursor::_equals)
+COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 
 /* Lastly, some methods need no (additional) error checking. */
 %exception __wt_connection::get_home;
@@ -412,7 +451,12 @@ COMPARE_OK(__wt_cursor::search_near)
 
 /* Next, override methods that return integers via arguments. */
 %ignore __wt_cursor::compare(WT_CURSOR *, WT_CURSOR *, int *);
+%ignore __wt_cursor::equals(WT_CURSOR *, WT_CURSOR *, int *);
 %ignore __wt_cursor::search_near(WT_CURSOR *, int *);
+
+OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, compare, (self, other))
+OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, equals, (self, other))
+OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 
 /* SWIG magic to turn Python byte strings into data / size. */
 %apply (char *STRING, int LENGTH) { (char *data, int size) };
@@ -670,8 +714,8 @@ typedef int int_void;
 		return (ret);
 	}
 
-	/* compare and search_near need special handling. */
-	int compare(WT_CURSOR *other) {
+	/* compare: special handling. */
+	int _compare(WT_CURSOR *other) {
 		int cmp = 0;
 		int ret = 0;
 		if (other == NULL) {
@@ -688,21 +732,40 @@ typedef int int_void;
 			 * Map less-than-zero to -1 and greater-than-zero to 1
 			 * to avoid colliding with other errors.
 			 */
-			ret = ((ret != 0) ? ret :
-			    (cmp < 0) ? -1 : (cmp == 0) ? 0 : 1);
+			ret = (ret != 0) ? ret :
+			    ((cmp < 0) ? -1 : (cmp == 0) ? 0 : 1);
 		}
 		return (ret);
 	}
 
-	int search_near() {
+	/* equals: special handling. */
+	int _equals(WT_CURSOR *other) {
+		int cmp = 0;
+		int ret = 0;
+		if (other == NULL) {
+			SWIG_Error(SWIG_NullReferenceError,
+			    "in method 'Cursor_equals', "
+			    "argument 1 of type 'struct __wt_cursor *' "
+			    "is None");
+			ret = EINVAL;  /* any non-zero value will do. */
+		}
+		else {
+			ret = $self->equals($self, other, &cmp);
+			if (ret == 0)
+				ret = cmp;
+		}
+		return (ret);
+	}
+
+	/* search_near: special handling. */
+	int _search_near() {
 		int cmp = 0;
 		int ret = $self->search_near($self, &cmp);
 		/*
 		 * Map less-than-zero to -1 and greater-than-zero to 1 to avoid
-		 * colliding with WT_NOTFOUND.
+		 * colliding with other errors.
 		 */
-		return ((ret != 0) ? ret :
-		    (cmp < 0) ? -1 : (cmp == 0) ? 0 : 1);
+		return ((ret != 0) ? ret : (cmp < 0) ? -1 : (cmp == 0) ? 0 : 1);
 	}
 
 	int _freecb() {
@@ -785,17 +848,30 @@ typedef int int_void;
 			self._iterable = IterableCursor(self)
 		return self._iterable
 
+	def __delitem__(self, key):
+		'''Python convenience for removing'''
+		self.set_key(key)
+		if self.remove() != 0:
+			raise KeyError
+
 	def __getitem__(self, key):
 		'''Python convenience for searching'''
 		self.set_key(key)
 		if self.search() != 0:
 			raise KeyError
 		return self.get_value()
+
+	def __setitem__(self, key, value):
+		'''Python convenience for inserting'''
+		self.set_key(key)
+		self.set_value(value)
+		if self.insert() != 0:
+			raise KeyError
 %}
 };
 
 %extend __wt_session {
-	int log_printf(const char *msg) {
+	int _log_printf(const char *msg) {
 		return self->log_printf(self, "%s", msg);
 	}
 
@@ -813,17 +889,17 @@ typedef int int_void;
 %{
 int diagnostic_build() {
 #ifdef HAVE_DIAGNOSTIC
-        return 1;
+	return 1;
 #else
-        return 0;
+	return 0;
 #endif
 }
 
 int verbose_build() {
 #ifdef HAVE_VERBOSE
-        return 1;
+	return 1;
 #else
-        return 0;
+	return 0;
 #endif
 }
 %}
@@ -858,6 +934,8 @@ int verbose_build();
 %ignore __wt_connection::add_extractor;
 %ignore __wt_connection::get_extension_api;
 %ignore __wt_session::log_printf;
+
+OVERRIDE_METHOD(__wt_session, WT_SESSION, log_printf, (self, msg))
 
 %ignore wiredtiger_struct_pack;
 %ignore wiredtiger_struct_size;
@@ -1068,8 +1146,8 @@ pythonAsyncCallback(WT_ASYNC_CALLBACK *cb, WT_ASYNC_OP *asyncop, int opret,
 	int ret, t_ret;
 	PY_CALLBACK *pcb;
 	PyObject *arglist, *notify_method, *pyresult;
-        WT_ASYNC_OP_IMPL *op;
-        WT_SESSION_IMPL *session;
+	WT_ASYNC_OP_IMPL *op;
+	WT_SESSION_IMPL *session;
 
 	/*
 	 * Ensure the global interpreter lock is held since we'll be
@@ -1077,8 +1155,8 @@ pythonAsyncCallback(WT_ASYNC_CALLBACK *cb, WT_ASYNC_OP *asyncop, int opret,
 	 */
 	SWIG_PYTHON_THREAD_BEGIN_BLOCK;
 
-        op = (WT_ASYNC_OP_IMPL *)asyncop;
-        session = O2S(op);
+	op = (WT_ASYNC_OP_IMPL *)asyncop;
+	session = O2S(op);
 	pcb = (PY_CALLBACK *)asyncop->c.lang_private;
 	asyncop->c.lang_private = NULL;
 	ret = 0;
@@ -1113,10 +1191,10 @@ err:		__wt_err(session, ret, "python async callback error");
 	}
 	__wt_free(session, pcb);
 
-        if (ret == 0 && (opret == 0 || opret == WT_NOTFOUND))
-	        return (0);
-        else
-                return (1);
+	if (ret == 0 && (opret == 0 || opret == WT_NOTFOUND))
+		return (0);
+	else
+		return (1);
 }
 
 static WT_ASYNC_CALLBACK pyApiAsyncCallback = { pythonAsyncCallback };

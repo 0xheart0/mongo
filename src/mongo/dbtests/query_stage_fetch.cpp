@@ -33,18 +33,23 @@
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/mock_stage.h"
+#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageFetch {
+
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::set;
 
     class QueryStageFetchBase {
     public:
@@ -87,9 +92,9 @@ namespace QueryStageFetch {
     class FetchStageAlreadyFetched : public QueryStageFetchBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -105,7 +110,7 @@ namespace QueryStageFetch {
             ASSERT_EQUALS(size_t(1), locs.size());
 
             // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
+            auto_ptr<QueuedDataStage> mockStage(new QueuedDataStage(&ws));
 
             // Mock data.
             {
@@ -118,8 +123,8 @@ namespace QueryStageFetch {
 
                 mockMember.state = WorkingSetMember::OWNED_OBJ;
                 mockMember.loc = RecordId();
-                mockMember.obj = BSON("foo" << 6);
-                ASSERT_TRUE(mockMember.obj.isOwned());
+                mockMember.obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+                ASSERT_TRUE(mockMember.obj.value().isOwned());
                 mockStage->pushBack(mockMember);
             }
 
@@ -149,9 +154,9 @@ namespace QueryStageFetch {
         void run() {
             ScopedTransaction transaction(&_txn, MODE_IX);
             Lock::DBLock lk(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X);
-            Client::Context ctx(&_txn, ns());
+            OldClientContext ctx(&_txn, ns());
             Database* db = ctx.db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -167,7 +172,7 @@ namespace QueryStageFetch {
             ASSERT_EQUALS(size_t(1), locs.size());
 
             // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
+            auto_ptr<QueuedDataStage> mockStage(new QueuedDataStage(&ws));
 
             // Mock data.
             {

@@ -32,48 +32,100 @@
 
 #include "mongo/db/concurrency/lock_state.h"
 
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/global_environment_experiment.h"
+#include <vector>
+
+#include "mongo/db/service_context.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/background.h"
+#include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/stacktrace.h"
 
 namespace mongo {
 namespace {
+
+    /**
+     * Partitioned global lock statistics, so we don't hit the same bucket.
+     */
+    class PartitionedInstanceWideLockStats {
+        MONGO_DISALLOW_COPYING(PartitionedInstanceWideLockStats);
+    public:
+
+        PartitionedInstanceWideLockStats() { }
+
+        void recordAcquisition(LockerId id, ResourceId resId, LockMode mode) {
+            _get(id).recordAcquisition(resId, mode);
+        }
+
+        void recordWait(LockerId id, ResourceId resId, LockMode mode) {
+            _get(id).recordWait(resId, mode);
+        }
+
+        void recordWaitTime(LockerId id, ResourceId resId, LockMode mode, uint64_t waitMicros) {
+            _get(id).recordWaitTime(resId, mode, waitMicros);
+        }
+
+        void recordDeadlock(ResourceId resId, LockMode mode) {
+            _get(resId).recordDeadlock(resId, mode);
+        }
+
+        void report(SingleThreadedLockStats* outStats) const {
+            for (int i = 0; i < NumPartitions; i++) {
+                outStats->append(_partitions[i].stats);
+            }
+        }
+
+        void reset() {
+            for (int i = 0; i < NumPartitions; i++) {
+                _partitions[i].stats.reset();
+            }
+        }
+
+    private:
+
+        // This alignment is a best effort approach to ensure that each partition falls on a
+        // separate page/cache line in order to avoid false sharing.
+        struct MONGO_COMPILER_ALIGN_TYPE(128) AlignedLockStats {
+            AtomicLockStats stats;
+        };
+
+        enum { NumPartitions = 8 };
+
+
+        AtomicLockStats& _get(LockerId id) {
+            return _partitions[id % NumPartitions].stats;
+        }
+
+
+        AlignedLockStats _partitions[NumPartitions];
+    };
+
 
     // Global lock manager instance.
     LockManager globalLockManager;
 
     // Global lock. Every server operation, which uses the Locker must acquire this lock at least
     // once. See comments in the header file (begin/endTransaction) for more information.
-    const ResourceId resourceIdGlobal = ResourceId(RESOURCE_GLOBAL, 1ULL);
+    const ResourceId resourceIdGlobal = ResourceId(RESOURCE_GLOBAL,
+                                                   ResourceId::SINGLETON_GLOBAL);
 
     // Flush lock. This is only used for the MMAP V1 storage engine and synchronizes journal writes
     // to the shared view and remaps. See the comments in the header for information on how MMAP V1
     // concurrency control works.
-    const ResourceId resourceIdMMAPV1Flush = ResourceId(RESOURCE_MMAPV1_FLUSH, 2ULL);
+    const ResourceId resourceIdMMAPV1Flush = ResourceId(RESOURCE_MMAPV1_FLUSH,
+                                                        ResourceId::SINGLETON_MMAPV1_FLUSH);
 
     // How often (in millis) to check for deadlock if a lock has not been granted for some time
-    const unsigned DeadlockTimeoutMs = 100;
+    const unsigned DeadlockTimeoutMs = 500;
 
-    /**
-     * Used to sort locks by granularity when snapshotting lock state. We must report and reacquire
-     * locks in the same granularity in which they are acquired (i.e. global, flush, database,
-     * collection, etc).
-     */
-    struct SortByGranularity {
-        inline bool operator()(const Locker::OneLock& lhs, const Locker::OneLock& rhs) const {
-            return lhs.resourceId.getType() < rhs.resourceId.getType();
-        }
-    };
+    // Dispenses unique LockerId identifiers
+    AtomicUInt64 idCounter(0);
 
-    /**
-     * Returns whether the passed in mode is S or IS. Used for validation checks.
-     */
-    bool isSharedMode(LockMode mode) {
-        return (mode == MODE_IS || mode == MODE_S);
-    }
+    // Partitioned global lock statistics, so we don't hit the same bucket
+    PartitionedInstanceWideLockStats globalStats;
+
 
     /**
      * Whether the particular lock's release should be held until the end of the operation. We
@@ -83,7 +135,7 @@ namespace {
     bool shouldDelayUnlock(ResourceId resId, LockMode mode) {
         // Global and flush lock are not used to protect transactional resources and as such, they
         // need to be acquired and released when requested.
-        if (resId == resourceIdGlobal) {
+        if (resId.getType() == RESOURCE_GLOBAL) {
             return false;
         }
 
@@ -105,48 +157,6 @@ namespace {
         }
     }
 
-    /**
-     * Dumps the contents of the global lock manager to the server log for diagnostics.
-     */
-    enum {
-        LockMgrDumpThrottleMillis = 60000,
-        LockMgrDumpThrottleMicros = LockMgrDumpThrottleMillis * 1000
-    };
-
-    AtomicUInt64 lastDumpTimestampMicros(0);
-
-    void dumpGlobalLockManagerAndCallstackThrottled(const Locker* locker) {
-        const uint64_t lastDumpMicros = lastDumpTimestampMicros.load();
-
-        // Don't print too frequently
-        if (curTimeMicros64() - lastDumpMicros < LockMgrDumpThrottleMicros) return;
-
-        // Only one thread should dump the lock manager in order to not pollute the log
-        if (lastDumpTimestampMicros.compareAndSwap(lastDumpMicros,
-            curTimeMicros64()) == lastDumpMicros) {
-
-            log() << "LockerId " << locker->getId()
-                  << " has been waiting to acquire lock for more than 30 seconds. MongoDB will"
-                  << " print the lock manager state and the stack of the thread that has been"
-                  << " waiting, for diagnostic purposes. This message does not necessary imply"
-                  << " that the server is experiencing an outage, but might be an indication of"
-                  << " an overload.";
-
-            // Dump the lock manager state and the stack trace so we can investigate
-            globalLockManager.dump();
-
-            log() << '\n';
-            printStackTrace();
-
-            // If a deadlock was discovered, the server will never recover from it, so shutdown
-            DeadlockDetector wfg(globalLockManager, locker);
-            if (wfg.check().hasCycle()) {
-                severe() << "Deadlock found during lock acquisition: " << wfg.toString();
-                fassertFailed(28557);
-            }
-        }
-    }
-
 } // namespace
 
 
@@ -161,11 +171,6 @@ namespace {
     }
 
     template<bool IsForMMAPV1>
-    bool LockerImpl<IsForMMAPV1>::hasAnyReadLock() const {
-        return isLockHeldForMode(resourceIdGlobal, MODE_IS);
-    }
-
-    template<bool IsForMMAPV1>
     bool LockerImpl<IsForMMAPV1>::isLocked() const {
         return getLockMode(resourceIdGlobal) != MODE_NONE;
     }
@@ -176,80 +181,36 @@ namespace {
     }
 
     template<bool IsForMMAPV1>
-    bool LockerImpl<IsForMMAPV1>::isWriteLocked(const StringData& ns) const {
-        if (isWriteLocked()) {
-            return true;
-        }
-
-        const StringData db = nsToDatabaseSubstring(ns);
-        const ResourceId resIdNs(RESOURCE_DATABASE, db);
-
-        return isLockHeldForMode(resIdNs, MODE_X);
+    bool LockerImpl<IsForMMAPV1>::isReadLocked() const {
+        return isLockHeldForMode(resourceIdGlobal, MODE_IS);
     }
 
     template<bool IsForMMAPV1>
-    bool LockerImpl<IsForMMAPV1>::isRecursive() const {
-        return recursiveCount() > 1;
-    }
+    void LockerImpl<IsForMMAPV1>::assertEmptyAndReset() {
+        invariant(!inAWriteUnitOfWork());
+        invariant(_resourcesToUnlockAtEndOfUnitOfWork.empty());
+        invariant(_requests.empty());
 
-    template<bool IsForMMAPV1>
-    void LockerImpl<IsForMMAPV1>::assertWriteLocked(const StringData& ns) const {
-        if (!isWriteLocked(ns)) {
-            dump();
-            msgasserted(
-                16105, mongoutils::str::stream() << "expected to be write locked for " << ns);
-        }
+        // Reset the locking statistics so the object can be reused
+        _stats.reset();
     }
 
     template<bool IsForMMAPV1>
     void LockerImpl<IsForMMAPV1>::dump() const {
         StringBuilder ss;
-        ss << "lock status: ";
-
-        //  isLocked() must be called without holding _lock
-        if (!isLocked()) {
-            ss << "unlocked";
-        }
-        else {
-            // SERVER-14978: Dump lock stats information
-        }
-
-        ss << " requests:";
+        ss << "Locker id " << _id << " status: ";
 
         _lock.lock();
         LockRequestsMap::ConstIterator it = _requests.begin();
         while (!it.finished()) {
-            ss << " " << it.key().toString();
+            ss << it.key().toString() << " "
+               << lockRequestStatusName(it->status) << " in "
+               << modeName(it->mode) << "; ";
             it.next();
         }
         _lock.unlock();
 
         log() << ss.str() << std::endl;
-    }
-
-    template<bool IsForMMAPV1>
-    void LockerImpl<IsForMMAPV1>::enterScopedLock(Lock::ScopedLock* lock) {
-        _recursive++;
-        if (_recursive == 1) {
-            invariant(_scopedLk == NULL);
-            _scopedLk = lock;
-        }
-    }
-
-    template<bool IsForMMAPV1>
-    Lock::ScopedLock* LockerImpl<IsForMMAPV1>::getCurrentScopedLock() const {
-        invariant(_recursive == 1);
-        return _scopedLk;
-    }
-
-    template<bool IsForMMAPV1>
-    void LockerImpl<IsForMMAPV1>::leaveScopedLock(Lock::ScopedLock* lock) {
-        if (_recursive == 1) {
-            // Sanity check we are releasing the same lock
-            invariant(_scopedLk == lock);
-            _scopedLk = NULL;
-        }
-        _recursive--;
     }
 
 
@@ -291,14 +252,11 @@ namespace {
     //
 
     template<bool IsForMMAPV1>
-    LockerImpl<IsForMMAPV1>::LockerImpl(LockerId id)
-        : _id(id),
+    LockerImpl<IsForMMAPV1>::LockerImpl()
+        : _id(idCounter.addAndFetch(1)),
+          _requestStartTime(0),
           _wuowNestingLevel(0),
-          _batchWriter(false),
-          _lockPendingParallelWriter(false),
-          _recursive(0),
-          _scopedLk(NULL) {
-
+          _batchWriter(false) {
     }
 
     template<bool IsForMMAPV1>
@@ -306,63 +264,26 @@ namespace {
         // Cannot delete the Locker while there are still outstanding requests, because the
         // LockManager may attempt to access deleted memory. Besides it is probably incorrect
         // to delete with unaccounted locks anyways.
-        invariant(!inAWriteUnitOfWork());
-        invariant(_resourcesToUnlockAtEndOfUnitOfWork.empty());
-        invariant(_requests.empty());
+        assertEmptyAndReset();
     }
 
     template<bool IsForMMAPV1>
     LockResult LockerImpl<IsForMMAPV1>::lockGlobal(LockMode mode, unsigned timeoutMs) {
-        LockResult globalLockResult = lockGlobalBegin(mode);
-        if (globalLockResult != LOCK_OK) {
-            // Could only be LOCK_WAITING (checked by lockGlobalComplete)
-            globalLockResult = lockGlobalComplete(timeoutMs);
-
-            // If waiting for the lock failed, no point in asking for the flush lock
-            if (globalLockResult != LOCK_OK) {
-                return globalLockResult;
-            }
+        LockResult result = lockGlobalBegin(mode);
+        if (result == LOCK_WAITING) {
+            result = lockGlobalComplete(timeoutMs);
         }
 
-        // We would have returned above if global lock acquisition failed for any reason
-        invariant(globalLockResult == LOCK_OK);
-
-        // We are done if this is not MMAP V1
-        if (!IsForMMAPV1) {
-            return LOCK_OK;
+        if (result == LOCK_OK) {
+            lockMMAPV1Flush();
         }
 
-        // Special-handling for MMAP V1 commit concurrency control. We will not obey the timeout
-        // request to simplify the logic here, since the only places which acquire global lock with
-        // a timeout is the shutdown code.
-
-        // The flush lock always has a reference count of 1, because it is dropped at the end of
-        // each write unit of work in order to allow the flush thread to run. See the comments in
-        // the header for information on how the MMAP V1 journaling system works.
-        const LockRequest* globalLockRequest = _requests.find(resourceIdGlobal).objAddr();
-        if (globalLockRequest->recursiveCount > 1){
-            return LOCK_OK;
-        }
-
-        const LockResult flushLockResult = lock(resourceIdMMAPV1Flush,
-                                                _getModeForMMAPV1FlushLock());
-        if (flushLockResult != LOCK_OK) {
-            invariant(flushLockResult == LOCK_TIMEOUT);
-            invariant(unlock(resourceIdGlobal));
-        }
-
-        return flushLockResult;
-    }
-
-    template<bool IsForMMAPV1>
-    LockResult LockerImpl<IsForMMAPV1>::lockGlobalComplete(unsigned timeoutMs) {
-        return lockComplete(resourceIdGlobal, timeoutMs, false);
+        return result;
     }
 
     template<bool IsForMMAPV1>
     LockResult LockerImpl<IsForMMAPV1>::lockGlobalBegin(LockMode mode) {
         const LockResult result = lockBegin(resourceIdGlobal, mode);
-
         if (result == LOCK_OK) return LOCK_OK;
 
         // Currently, deadlock detection does not happen inline with lock acquisition so the only
@@ -373,12 +294,37 @@ namespace {
     }
 
     template<bool IsForMMAPV1>
+    LockResult LockerImpl<IsForMMAPV1>::lockGlobalComplete(unsigned timeoutMs) {
+        return lockComplete(resourceIdGlobal, getLockMode(resourceIdGlobal), timeoutMs, false);
+    }
+
+    template<bool IsForMMAPV1>
+    void LockerImpl<IsForMMAPV1>::lockMMAPV1Flush() {
+        if (!IsForMMAPV1) return;
+
+        // The flush lock always has a reference count of 1, because it is dropped at the end of
+        // each write unit of work in order to allow the flush thread to run. See the comments in
+        // the header for information on how the MMAP V1 journaling system works.
+        LockRequest* globalLockRequest = _requests.find(resourceIdGlobal).objAddr();
+        if (globalLockRequest->recursiveCount == 1) {
+            invariant(LOCK_OK == lock(resourceIdMMAPV1Flush, _getModeForMMAPV1FlushLock()));
+        }
+
+        dassert(getLockMode(resourceIdMMAPV1Flush) == _getModeForMMAPV1FlushLock());
+    }
+
+    template<bool IsForMMAPV1>
     void LockerImpl<IsForMMAPV1>::downgradeGlobalXtoSForMMAPV1() {
         invariant(!inAWriteUnitOfWork());
 
         LockRequest* globalLockRequest = _requests.find(resourceIdGlobal).objAddr();
         invariant(globalLockRequest->mode == MODE_X);
         invariant(globalLockRequest->recursiveCount == 1);
+
+        // Making this call here will record lock downgrades as acquisitions, which is acceptable
+        globalStats.recordAcquisition(_id, resourceIdGlobal, MODE_S);
+        _stats.recordAcquisition(resourceIdGlobal, MODE_S);
+
         globalLockManager.downgrade(globalLockRequest, MODE_S);
 
         if (IsForMMAPV1) {
@@ -397,7 +343,12 @@ namespace {
             // If we're here we should only have one reference to any lock. It is a programming
             // error for any lock to have more references than the global lock, because every
             // scope starts by calling lockGlobal.
-            invariant(_unlockImpl(it));
+            if (it.key().getType() == RESOURCE_GLOBAL) {
+                it.next();
+            }
+            else {
+                invariant(_unlockImpl(it));
+            }
         }
 
         return true;
@@ -405,6 +356,10 @@ namespace {
 
     template<bool IsForMMAPV1>
     void LockerImpl<IsForMMAPV1>::beginWriteUnitOfWork() {
+        // Sanity check that write transactions under MMAP V1 have acquired the flush lock, so we
+        // don't allow partial changes to be written.
+        dassert(!IsForMMAPV1 || isLockHeldForMode(resourceIdMMAPV1Flush, MODE_IX));
+
         _wuowNestingLevel++;
     }
 
@@ -425,15 +380,7 @@ namespace {
         // For MMAP V1, we need to yield the flush lock so that the flush thread can run
         if (IsForMMAPV1) {
             invariant(unlock(resourceIdMMAPV1Flush));
-
-            while (true) {
-                LockResult result =
-                    lock(resourceIdMMAPV1Flush, _getModeForMMAPV1FlushLock(), UINT_MAX, true);
-
-                if (result == LOCK_OK) break;
-
-                invariant(result == LOCK_DEADLOCK);
-            }
+            invariant(LOCK_OK == lock(resourceIdMMAPV1Flush, _getModeForMMAPV1FlushLock()));
         }
     }
 
@@ -452,7 +399,7 @@ namespace {
         // unsuccessful result that the lock manager would return is LOCK_WAITING.
         invariant(result == LOCK_WAITING);
 
-        return lockComplete(resId, timeoutMs, checkDeadlock);
+        return lockComplete(resId, mode, timeoutMs, checkDeadlock);
     }
 
     template<bool IsForMMAPV1>
@@ -483,24 +430,24 @@ namespace {
     }
 
     template<bool IsForMMAPV1>
-    bool LockerImpl<IsForMMAPV1>::isDbLockedForMode(const StringData& dbName,
+    bool LockerImpl<IsForMMAPV1>::isDbLockedForMode(StringData dbName,
                                                     LockMode mode) const {
         invariant(nsIsDbOnly(dbName));
 
         if (isW()) return true;
-        if (isR() && isSharedMode(mode)) return true;
+        if (isR() && isSharedLockMode(mode)) return true;
 
         const ResourceId resIdDb(RESOURCE_DATABASE, dbName);
         return isLockHeldForMode(resIdDb, mode);
     }
 
     template<bool IsForMMAPV1>
-    bool LockerImpl<IsForMMAPV1>::isCollectionLockedForMode(const StringData& ns,
+    bool LockerImpl<IsForMMAPV1>::isCollectionLockedForMode(StringData ns,
                                                             LockMode mode) const {
         invariant(nsIsFull(ns));
 
         if (isW()) return true;
-        if (isR() && isSharedMode(mode)) return true;
+        if (isR() && isSharedLockMode(mode)) return true;
 
         const NamespaceString nss(ns);
         const ResourceId resIdDb(RESOURCE_DATABASE, nss.db());
@@ -510,7 +457,7 @@ namespace {
         switch (dbMode) {
         case MODE_NONE: return false;
         case MODE_X: return true;
-        case MODE_S: return isSharedMode(mode);
+        case MODE_S: return isSharedLockMode(mode);
         case MODE_IX:
         case MODE_IS:
             {
@@ -549,8 +496,7 @@ namespace {
         // Zero-out the contents
         lockerInfo->locks.clear();
         lockerInfo->waitingResource = ResourceId();
-
-        if (!isLocked()) return;
+        lockerInfo->stats.reset();
 
         _lock.lock();
         LockRequestsMap::ConstIterator it = _requests.begin();
@@ -564,9 +510,10 @@ namespace {
         }
         _lock.unlock();
 
-        std::sort(lockerInfo->locks.begin(), lockerInfo->locks.end(), SortByGranularity());
+        std::sort(lockerInfo->locks.begin(), lockerInfo->locks.end());
 
         lockerInfo->waitingResource = getWaitingResource();
+        lockerInfo->stats.append(_stats);
     }
 
     template<bool IsForMMAPV1>
@@ -597,17 +544,16 @@ namespace {
         // The global lock must have been acquired just once
         stateOut->globalMode = globalRequest->mode;
         invariant(unlock(resourceIdGlobal));
-        if (IsForMMAPV1) {
-            invariant(unlock(resourceIdMMAPV1Flush));
-        }
 
         // Next, the non-global locks.
         for (LockRequestsMap::Iterator it = _requests.begin(); !it.finished(); it.next()) {
             const ResourceId resId = it.key();
 
-            // We don't support saving and restoring document-level locks.
-            invariant(RESOURCE_DATABASE == resId.getType() ||
-                      RESOURCE_COLLECTION == resId.getType());
+            // We should never have to save and restore metadata locks.
+            invariant((IsForMMAPV1 && (resourceIdMMAPV1Flush == resId)) ||
+                      RESOURCE_DATABASE == resId.getType() ||
+                      RESOURCE_COLLECTION == resId.getType() ||
+                      (RESOURCE_GLOBAL == resId.getType() && isSharedLockMode(it->mode)));
 
             // And, stuff the info into the out parameter.
             OneLock info;
@@ -619,8 +565,8 @@ namespace {
             invariant(unlock(resId));
         }
 
-        // Sort locks from coarsest to finest.  They'll later be acquired in this order.
-        std::sort(stateOut->locks.begin(), stateOut->locks.end(), SortByGranularity());
+        // Sort locks by ResourceId. They'll later be acquired in this canonical locking order.
+        std::sort(stateOut->locks.begin(), stateOut->locks.end());
 
         return true;
     }
@@ -630,17 +576,29 @@ namespace {
         // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork.
         invariant(!inAWriteUnitOfWork());
 
-        lockGlobal(state.globalMode); // also handles MMAPV1Flush
-
         std::vector<OneLock>::const_iterator it = state.locks.begin();
-        for (; it != state.locks.end(); it++) {
+        // If we locked the PBWM, it must be locked before the resourceIdGlobal resource.
+        if (it != state.locks.end() && it->resourceId == resourceIdParallelBatchWriterMode) {
             invariant(LOCK_OK == lock(it->resourceId, it->mode));
+            it++;
+        }
+
+        invariant(LOCK_OK == lockGlobal(state.globalMode));
+        for (; it != state.locks.end(); it++) {
+            // This is a sanity check that lockGlobal restored the MMAP V1 flush lock in the
+            // expected mode.
+            if (IsForMMAPV1 && (it->resourceId == resourceIdMMAPV1Flush)) {
+                invariant(it->mode == _getModeForMMAPV1FlushLock());
+            }
+            else {
+                invariant(LOCK_OK == lock(it->resourceId, it->mode));
+            }
         }
     }
 
     template<bool IsForMMAPV1>
     LockResult LockerImpl<IsForMMAPV1>::lockBegin(ResourceId resId, LockMode mode) {
-        invariant(!getWaitingResource().isValid());
+        dassert(!getWaitingResource().isValid());
 
         LockRequest* request;
         bool isNew = true;
@@ -658,35 +616,62 @@ namespace {
             isNew = false;
         }
 
-        // Give priority to the full modes for global and flush lock so we don't stall global
-        // operations such as shutdown or flush.
-        if (resId == resourceIdGlobal || (IsForMMAPV1 && resId == resourceIdMMAPV1Flush)) {
+        // Making this call here will record lock re-acquisitions and conversions as well.
+        globalStats.recordAcquisition(_id, resId, mode);
+        _stats.recordAcquisition(resId, mode);
+
+        // Give priority to the full modes for global, parallel batch writer mode,
+        // and flush lock so we don't stall global operations such as shutdown or flush.
+        const ResourceType resType = resId.getType();
+        if (resType == RESOURCE_GLOBAL || (IsForMMAPV1 && resId == resourceIdMMAPV1Flush)) {
             if (mode == MODE_S || mode == MODE_X) {
                 request->enqueueAtFront = true;
                 request->compatibleFirst = true;
             }
         }
+        else {
+            // This is all sanity checks that the global and flush locks are always be acquired
+            // before any other lock has been acquired and they must be in sync with the nesting.
+            DEV {
+                const LockRequestsMap::Iterator itGlobal = _requests.find(resourceIdGlobal);
+                invariant(itGlobal->recursiveCount > 0);
+                invariant(itGlobal->mode != MODE_NONE);
 
+                // Check the MMAP V1 flush lock is held in the appropriate mode
+                invariant(!IsForMMAPV1 || isLockHeldForMode(resourceIdMMAPV1Flush,
+                                                            _getModeForMMAPV1FlushLock()));
+            };
+        }
+
+        // The notification object must be cleared before we invoke the lock manager, because
+        // otherwise we might reset state if the lock becomes granted very fast.
         _notify.clear();
 
-        return isNew ? globalLockManager.lock(resId, request, mode) :
-                       globalLockManager.convert(resId, request, mode);
+        LockResult result = isNew ? globalLockManager.lock(resId, request, mode) :
+                                    globalLockManager.convert(resId, request, mode);
+
+        if (result == LOCK_WAITING) {
+            // Start counting the wait time so that lockComplete can update that metric
+            _requestStartTime = curTimeMicros64();
+            globalStats.recordWait(_id, resId, mode);
+            _stats.recordWait(resId, mode);
+        }
+
+        return result;
     }
 
     template<bool IsForMMAPV1>
     LockResult LockerImpl<IsForMMAPV1>::lockComplete(ResourceId resId,
+                                                     LockMode mode,
                                                      unsigned timeoutMs,
                                                      bool checkDeadlock) {
-
-        // Tracks the lock acquisition time if we don't obtain the lock immediately
-        Timer timer;
 
         // Under MMAP V1 engine a deadlock can occur if a thread goes to sleep waiting on
         // DB lock, while holding the flush lock, so it has to be released. This is only
         // correct to do if not in a write unit of work.
         const bool yieldFlushLock = IsForMMAPV1 &&
                                     !inAWriteUnitOfWork() &&
-                                    resId != resourceIdGlobal &&
+                                    resId.getType() != RESOURCE_GLOBAL &&
                                     resId != resourceIdMMAPV1Flush;
         if (yieldFlushLock) {
             invariant(unlock(resourceIdMMAPV1Flush));
@@ -698,32 +683,41 @@ namespace {
         // deadlock detection.
         unsigned waitTimeMs = std::min(timeoutMs, DeadlockTimeoutMs);
         while (true) {
+            // It is OK if this call wakes up spuriously, because we re-evaluate the remaining
+            // wait time anyways.
             result = _notify.wait(waitTimeMs);
+
+            // Account for the time spent waiting on the notification object
+            const uint64_t elapsedTimeMicros = curTimeMicros64() - _requestStartTime;
+            globalStats.recordWaitTime(_id, resId, mode, elapsedTimeMicros);
+            _stats.recordWaitTime(resId, mode, elapsedTimeMicros);
 
             if (result == LOCK_OK) break;
 
             if (checkDeadlock) {
                 DeadlockDetector wfg(globalLockManager, this);
                 if (wfg.check().hasCycle()) {
-                    log() << "Deadlock found: " << wfg.toString();
+                    warning() << "Deadlock found: " << wfg.toString();
+
+                    globalStats.recordDeadlock(resId, mode);
+                    _stats.recordDeadlock(resId, mode);
 
                     result = LOCK_DEADLOCK;
                     break;
                 }
             }
 
-            const unsigned elapsedTimeMs = timer.millis();
+            // If infinite timeout was requested, just keep waiting
+            if (timeoutMs == UINT_MAX) {
+                continue;
+            }
+
+            const unsigned elapsedTimeMs = elapsedTimeMicros / 1000;
             waitTimeMs = (elapsedTimeMs < timeoutMs) ?
                 std::min(timeoutMs - elapsedTimeMs, DeadlockTimeoutMs) : 0;
 
             if (waitTimeMs == 0) {
                 break;
-            }
-
-            // This will occasionally dump the global lock manager in case lock acquisition is
-            // taking too long.
-            if (elapsedTimeMs > LockMgrDumpThrottleMillis) {
-                dumpGlobalLockManagerAndCallstackThrottled(this);
             }
         }
 
@@ -780,6 +774,23 @@ namespace {
         }
     }
 
+    template<bool IsForMMAPV1>
+    bool LockerImpl<IsForMMAPV1>::hasStrongLocks() const {
+        if (!isLocked()) return false;
+
+        boost::lock_guard<SpinLock> lk(_lock);
+        LockRequestsMap::ConstIterator it = _requests.begin();
+        while (!it.finished()) {
+            if (it->mode == MODE_X || it->mode == MODE_S) {
+                return true;
+            }
+
+            it.next();
+        }
+
+        return false;
+    }
+
 
     //
     // Auto classes
@@ -806,30 +817,77 @@ namespace {
 
 
     AutoAcquireFlushLockForMMAPV1Commit::AutoAcquireFlushLockForMMAPV1Commit(Locker* locker)
-        : _locker(static_cast<MMAPV1LockerImpl*>(locker)),
-          _isReleased(false) {
+        : _locker(locker),
+          _released(false) {
 
-        invariant(LOCK_OK == _locker->lock(resourceIdMMAPV1Flush, MODE_S));
+        // The journal thread acquiring the journal lock in S-mode opens opportunity for deadlock
+        // involving operations which do not acquire and release the Oplog collection's X lock
+        // inside a WUOW (see SERVER-17416 for the sequence of events), therefore acquire it with
+        // check for deadlock and back-off if one is encountered.
+        // 
+        // This exposes theoretical chance that we might starve the journaling system, but given
+        // that these deadlocks happen extremely rarely and are usually due to incorrect locking
+        // policy, and we have the deadlock counters as part of the locking statistics, this is a
+        // reasonable handling.
+        //
+        // In the worst case, if we are to starve the journaling system, the server will shut down
+        // due to too much uncommitted in-memory journal, but won't have corruption.
+
+        while (true) {
+            LockResult result = _locker->lock(resourceIdMMAPV1Flush, MODE_S, UINT_MAX, true);
+            if (result == LOCK_OK) {
+                break;
+            }
+
+            invariant(result == LOCK_DEADLOCK);
+
+            warning() << "Delayed journaling in order to avoid deadlock during MMAP V1 journal " <<
+                         "lock acquisition. See the previous messages for information on the " <<
+                         "involved threads.";
+        }
     }
 
     void AutoAcquireFlushLockForMMAPV1Commit::upgradeFlushLockToExclusive() {
-        invariant(LOCK_OK == _locker->lock(resourceIdMMAPV1Flush, MODE_X));
+        // This should not be able to deadlock, since we already hold the S journal lock, which
+        // means all writers are kicked out. Readers always yield the journal lock if they block
+        // waiting on any other lock.
+        invariant(LOCK_OK == _locker->lock(resourceIdMMAPV1Flush, MODE_X, UINT_MAX, false));
 
         // Lock bumps the recursive count. Drop it back down so that the destructor doesn't
-        // complain
+        // complain.
         invariant(!_locker->unlock(resourceIdMMAPV1Flush));
     }
 
     void AutoAcquireFlushLockForMMAPV1Commit::release() {
-        invariant(_locker->unlock(resourceIdMMAPV1Flush));
-        _isReleased = true;
+        if (!_released) {
+            invariant(_locker->unlock(resourceIdMMAPV1Flush));
+            _released = true;
+        }
     }
 
     AutoAcquireFlushLockForMMAPV1Commit::~AutoAcquireFlushLockForMMAPV1Commit() {
-        if (!_isReleased) {
-            invariant(_locker->unlock(resourceIdMMAPV1Flush));
-        }
+        release();
     }
+
+
+namespace {
+    /**
+     *  Periodically purges unused lock buckets. The first time the lock is used again after
+     *  cleanup it needs to be allocated, and similarly, every first use by a client for an intent
+     *  mode may need to create a partitioned lock head. Cleanup is done roughtly once a minute.
+     */
+    class UnusedLockCleaner : PeriodicTask {
+    public:
+        std::string taskName() const {
+            return "UnusedLockCleaner";
+        }
+
+        void taskDoWork() {
+            LOG(2) << "cleaning up unused lock buckets of the global lock manager";
+            getGlobalLockManager()->cleanupUnusedLocks();
+        }
+    } unusedLockCleaner;
+} // namespace
 
 
     //
@@ -840,10 +898,26 @@ namespace {
         return &globalLockManager;
     }
 
+    void reportGlobalLockingStats(SingleThreadedLockStats* outStats) {
+        globalStats.report(outStats);
+    }
+
+    void resetGlobalLockStats() {
+        globalStats.reset();
+    }
+
     
     // Ensures that there are two instances compiled for LockerImpl for the two values of the
     // template argument.
     template class LockerImpl<true>;
     template class LockerImpl<false>;
+
+    // Definition for the hardcoded localdb and oplog collection info
+    const ResourceId resourceIdLocalDB = ResourceId(RESOURCE_DATABASE, StringData("local"));
+    const ResourceId resourceIdOplog =
+        ResourceId(RESOURCE_COLLECTION, StringData("local.oplog.rs"));
+    const ResourceId resourceIdAdminDB = ResourceId(RESOURCE_DATABASE, StringData("admin"));
+    const ResourceId resourceIdParallelBatchWriterMode =
+        ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_PARALLEL_BATCH_WRITER_MODE);
 
 } // namespace mongo

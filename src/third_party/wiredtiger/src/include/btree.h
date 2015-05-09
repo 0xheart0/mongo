@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -53,6 +54,9 @@
  */
 #define	WT_BTREE_MAX_ADDR_COOKIE	255	/* Maximum address cookie */
 
+/* Evict pages if we see this many consecutive deleted records. */
+#define	WT_BTREE_DELETE_THRESHOLD	1000
+
 /*
  * WT_BTREE --
  *	A btree handle.
@@ -80,9 +84,10 @@ struct __wt_btree {
 
 	uint32_t allocsize;		/* Allocation size */
 	uint32_t maxintlpage;		/* Internal page max size */
-	uint32_t maxintlitem;		/* Internal page max item size */
+	uint32_t maxintlkey;		/* Internal page max key size */
 	uint32_t maxleafpage;		/* Leaf page max size */
-	uint32_t maxleafitem;		/* Leaf page max item size */
+	uint32_t maxleafkey;		/* Leaf page max key size */
+	uint32_t maxleafvalue;		/* Leaf page max value size */
 	uint64_t maxmempage;		/* In memory page max size */
 
 	void *huffman_key;		/* Key huffman encoding */
@@ -93,14 +98,21 @@ struct __wt_btree {
 		CKSUM_UNCOMPRESSED=3	/* Uncompressed blocks only */
 	} checksum;			/* Checksum configuration */
 
-	u_int dictionary;		/* Reconcile: dictionary slots */
-	int   internal_key_truncate;	/* Reconcile: internal key truncate */
-	int   maximum_depth;		/* Reconcile: maximum tree depth */
-	int   prefix_compression;	/* Reconcile: prefix compression */
-	u_int prefix_compression_min;	/* Reconcile: prefix compression min */
-	int   split_pct;		/* Reconcile: split page percent */
-	WT_COMPRESSOR *compressor;	/* Reconcile: page compressor */
-	WT_RWLOCK *ovfl_lock;		/* Reconcile: overflow lock */
+	/*
+	 * Reconciliation...
+	 */
+	u_int dictionary;		/* Dictionary slots */
+	int   internal_key_truncate;	/* Internal key truncate */
+	int   maximum_depth;		/* Maximum tree depth */
+	int   prefix_compression;	/* Prefix compression */
+	u_int prefix_compression_min;	/* Prefix compression min */
+#define	WT_SPLIT_DEEPEN_MIN_CHILD_DEF	10000
+	u_int split_deepen_min_child;	/* Minimum entries to deepen tree */
+#define	WT_SPLIT_DEEPEN_PER_CHILD_DEF	100
+	u_int split_deepen_per_child;	/* Entries per child when deepened */
+	int   split_pct;		/* Split page percent */
+	WT_COMPRESSOR *compressor;	/* Page compressor */
+	WT_RWLOCK *ovfl_lock;		/* Overflow lock */
 
 	uint64_t last_recno;		/* Column-store last record number */
 
@@ -111,6 +123,8 @@ struct __wt_btree {
 	WT_BM	*bm;			/* Block manager reference */
 	u_int	 block_header;		/* WT_PAGE_HEADER_BYTE_SIZE */
 
+	uint64_t checkpoint_gen;	/* Checkpoint generation */
+	uint64_t rec_max_txn;		/* Maximum txn seen (clean trees) */
 	uint64_t write_gen;		/* Write generation */
 
 	WT_REF  *evict_ref;		/* Eviction thread's location */
@@ -130,8 +144,8 @@ struct __wt_btree {
 
 	/* Flags values up to 0xff are reserved for WT_DHANDLE_* */
 #define	WT_BTREE_BULK		0x00100	/* Bulk-load handle */
-#define	WT_BTREE_NO_EVICTION	0x00200	/* Disable eviction */
-#define	WT_BTREE_NO_HAZARD	0x00400	/* Disable hazard pointers */
+#define	WT_BTREE_IN_MEMORY	0x00200	/* Cache-resident object */
+#define	WT_BTREE_NO_EVICTION	0x00400	/* Disable eviction */
 #define	WT_BTREE_SALVAGE	0x00800	/* Handle is for salvage */
 #define	WT_BTREE_UPGRADE	0x01000	/* Handle is for upgrade */
 #define	WT_BTREE_VERIFY		0x02000	/* Handle is for verify */

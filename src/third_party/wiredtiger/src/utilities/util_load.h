@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -15,9 +16,9 @@ typedef struct {
 } CONFIG_LIST;
 
 int	 config_exec(WT_SESSION *, char **);
-int	 config_list_add(CONFIG_LIST *, char *);
+int	 config_list_add(WT_SESSION *, CONFIG_LIST *, char *);
 void	 config_list_free(CONFIG_LIST *);
-int	 config_reorder(char **);
+int	 config_reorder(WT_SESSION *, char **);
 int	 config_update(WT_SESSION *, char **);
 
 /* Flags for util_load_json */

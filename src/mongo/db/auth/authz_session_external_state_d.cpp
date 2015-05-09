@@ -36,6 +36,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/assert_util.h"
 
@@ -49,14 +50,22 @@ namespace mongo {
 
     void AuthzSessionExternalStateMongod::startRequest(OperationContext* txn) {
         // No locks should be held as this happens before any database accesses occur
-        fassert(17506, !txn->lockState()->isLocked());
+        dassert(!txn->lockState()->isLocked());
 
         _checkShouldAllowLocalhost(txn);
     }
 
     bool AuthzSessionExternalStateMongod::shouldIgnoreAuthChecks() const {
-        // TODO(spencer): get "isGod" from OperationContext
-        return cc().isGod() || AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks();
+        // TODO(spencer): get "isInDirectClient" from OperationContext
+        return cc().isInDirectClient() ||
+               AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks();
+    }
+
+    bool AuthzSessionExternalStateMongod::serverIsArbiter() const {
+        // Arbiters have access to extra privileges under localhost. See SERVER-5479.
+        return (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+                repl::ReplicationCoordinator::modeReplSet &&
+                repl::getGlobalReplicationCoordinator()->getMemberState().arbiter());
     }
 
 } // namespace mongo

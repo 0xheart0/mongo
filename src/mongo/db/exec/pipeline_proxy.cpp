@@ -30,10 +30,16 @@
 
 #include "mongo/db/exec/pipeline_proxy.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::shared_ptr;
+    using std::vector;
 
     PipelineProxyStage::PipelineProxyStage(intrusive_ptr<Pipeline> pipeline,
                                            const boost::shared_ptr<PlanExecutor>& child,
@@ -52,7 +58,7 @@ namespace mongo {
         if (!_stash.empty()) {
             *out = _ws->allocate();
             WorkingSetMember* member = _ws->get(*out);
-            member->obj = _stash.back();
+            member->obj = Snapshotted<BSONObj>(SnapshotId(), _stash.back());
             _stash.pop_back();
             member->state = WorkingSetMember::OWNED_OBJ;
             return PlanStage::ADVANCED;
@@ -61,7 +67,7 @@ namespace mongo {
         if (boost::optional<BSONObj> next = getNextBson()) {
             *out = _ws->allocate();
             WorkingSetMember* member = _ws->get(*out);
-            member->obj = *next;
+            member->obj = Snapshotted<BSONObj>(SnapshotId(), *next);
             member->state = WorkingSetMember::OWNED_OBJ;
             return PlanStage::ADVANCED;
         }

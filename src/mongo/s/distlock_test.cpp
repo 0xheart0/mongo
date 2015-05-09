@@ -31,18 +31,21 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/s/distlock.h"
+#include "mongo/s/catalog/legacy/distlock.h"
 
+#include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
 #include <iostream>
 #include <vector>
 
 #include "mongo/base/init.h"
+#include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/s/catalog/legacy/legacy_dist_lock_pinger.h"
 #include "mongo/util/bson_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/log.h"
@@ -75,110 +78,39 @@
 
 namespace mongo {
 
-    class TestDistLockWithSync: public Command {
-    public:
-        TestDistLockWithSync() :
-            Command("_testDistLockWithSyncCluster") {
-        }
-        virtual void help(stringstream& help) const {
-            help << "should not be calling this directly" << endl;
-        }
+    using boost::shared_ptr;
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
-        virtual bool slaveOk() const {
-            return false;
-        }
-        virtual bool adminOnly() const {
-            return true;
-        }
-        virtual bool isWriteCommandForConfigServer() const { return false;  }
-
-        // No auth needed because it only works when enabled via command line.
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {}
-        static void runThread() {
-            while (keepGoing) {
-                try {
-                    if (current->lock_try( "test" )) {
-                        int before = count.addAndFetch(1);
-                        sleepmillis(3);
-                        int after = count.loadRelaxed();
-
-                        if (after != before) {
-                            error() << " before: " << before << " after: " << after
-                                    << endl;
-                        }
-
-                        current->unlock();
-                    }
-                }
-                catch ( const DBException& ex ) {
-                    log() << "*** !Could not try distributed lock." << causedBy( ex ) << endl;
-                }
-            }
-        }
-
-        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
-                 BSONObjBuilder& result, bool) {
-            Timer t;
-            DistributedLock lk(ConnectionString(cmdObj["host"].String(),
-                                                ConnectionString::SYNC), "testdistlockwithsync", 0, 0);
-            current = &lk;
-            count.store(0);
-            gotit = 0;
-            errors = 0;
-            keepGoing = true;
-
-            vector<shared_ptr<boost::thread> > l;
-            for (int i = 0; i < 4; i++) {
-                l.push_back(
-                    shared_ptr<boost::thread> (new boost::thread(runThread)));
-            }
-
-            int secs = 10;
-            if (cmdObj["secs"].isNumber())
-                secs = cmdObj["secs"].numberInt();
-            sleepsecs(secs);
-            keepGoing = false;
-
-            for (unsigned i = 0; i < l.size(); i++)
-                l[i]->join();
-
-            current = 0;
-
-            result.append("count", count.loadRelaxed());
-            result.append("gotit", gotit);
-            result.append("errors", errors);
-            result.append("timeMS", t.millis());
-
-            return errors == 0;
-        }
-
-        // variables for test
-        static DistributedLock * current;
-        static int gotit;
-        static int errors;
-        static AtomicUInt32 count;
-
-        static bool keepGoing;
-
-    };
-    MONGO_INITIALIZER(RegisterDistLockWithSyncCmd)(InitializerContext* context) {
-        if (Command::testCommandsEnabled) {
-            // Leaked intentionally: a Command registers itself when constructed.
-            new TestDistLockWithSync();
-        }
-        return Status::OK();
-    }
-
-    DistributedLock * TestDistLockWithSync::current;
-    AtomicUInt32 TestDistLockWithSync::count;
-    int TestDistLockWithSync::gotit;
-    int TestDistLockWithSync::errors;
-    bool TestDistLockWithSync::keepGoing;
-
-
-
+    /**
+     * Stress test distributed lock by running multiple threads to contend with a single lock.
+     * Also has an option to make some thread terminate while holding the lock and have some
+     * other thread take over it after takeoverMS has elapsed. Note that this test does not check
+     * whether the lock was eventually overtaken and this is only valid if the LockPinger frequency
+     * is faster than takeoverMS.
+     *
+     * {
+     *   _testDistLockWithSkew: 1,
+     *
+     *   lockName: <string for distributed lock>,
+     *   host: <connection string for config server>,
+     *   seed: <numeric seed for random generator>,
+     *   numThreads: <num of threads to spawn and grab the lock>,
+     *
+     *   takeoverMS: <duration of missed ping in milliSeconds before a lock can be overtaken>,
+     *   wait: <time in milliseconds before stopping the test threads>,
+     *   skewHosts: <Array<Numeric>, numbers to be used when calling _skewClockCommand
+     *              against each config server>,
+     *   threadWait: <upper bound wait in milliSeconds while holding a lock>,
+     *
+     *   hangThreads: <integer n, where 1 out of n threads will abort after acquiring lock>,
+     *   threadSleep: <upper bound sleep duration in mSecs between each round of lock operation>,
+     *   skewRange: <maximum skew variance in milliSeconds for a thread's clock, delta will never
+     *              be greater than skewRange/2>
+     * }
+     */
     class TestDistLockWithSkew: public Command {
     public:
 
@@ -266,20 +198,23 @@ namespace mongo {
 
             bool errors = false;
             BSONObj lockObj;
-            while (keepGoing) {
+            while (keepGoing.loadRelaxed()) {
+                Status pingStatus = _pinger.startPing(*myLock,
+                        stdx::chrono::milliseconds(takeoverMS / LOCK_SKEW_FACTOR));
+
+                if (!pingStatus.isOK()) {
+                    log() << "**** Not good for pinging: " << pingStatus;
+                    break;
+                }
+
                 try {
 
-                    if (myLock->lock_try("Testing distributed lock with skew.", false, &lockObj )) {
+                    if (myLock->lock_try("Testing distributed lock with skew.", &lockObj)) {
 
                         log() << "**** Locked for thread " << threadId << " with ts " << lockObj["ts"] << endl;
 
-                        if( count.loadRelaxed() % 2 == 1 && ! myLock->lock_try( "Testing lock re-entry.", true ) ) {
-                            errors = true;
-                            log() << "**** !Could not re-enter lock already held" << endl;
-                            break;
-                        }
-
-                        if( count.loadRelaxed() % 3 == 1 && myLock->lock_try( "Testing lock non-re-entry.", false ) ) {
+                        if (count.loadRelaxed() % 3 == 1 &&
+                                myLock->lock_try( "Testing lock non-re-entry.")) {
                             errors = true;
                             log() << "**** !Invalid lock re-entry" << endl;
                             break;
@@ -299,11 +234,11 @@ namespace mongo {
                         // Unlock only half the time...
                         if(hangThreads == 0 || threadId % hangThreads != 0) {
                             log() << "**** Unlocking for thread " << threadId << " with ts " << lockObj["ts"] << endl;
-                            myLock->unlock( &lockObj );
+                            myLock->unlock(lockObj["ts"].OID());
                         }
                         else {
                             log() << "**** Not unlocking for thread " << threadId << endl;
-                            verify( DistributedLock::killPinger( *myLock ) );
+                            _pinger.stopPing(myLock->getRemoteConnection(), myLock->getProcessId());
                             // We're simulating a crashed process...
                             break;
                         }
@@ -335,8 +270,12 @@ namespace mongo {
             return;
         }
 
-        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
-                 BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             Timer t;
 
@@ -362,7 +301,7 @@ namespace mongo {
             }
 
             count.store(0);
-            keepGoing = true;
+            keepGoing.store(true);
 
             vector<shared_ptr<boost::thread> > threads;
             vector<shared_ptr<BSONObjBuilder> > results;
@@ -375,7 +314,7 @@ namespace mongo {
             }
 
             sleepsecs(wait / 1000);
-            keepGoing = false;
+            keepGoing.store(false);
 
             bool errors = false;
             for (unsigned i = 0; i < threads.size(); i++) {
@@ -439,8 +378,10 @@ namespace mongo {
         // variables for test
         thread_specific_ptr<DistributedLock> lock;
         AtomicUInt32 count;
-        bool keepGoing;
+        AtomicWord<bool> keepGoing;
 
+    private:
+        LegacyDistLockPinger _pinger;
     };
     MONGO_INITIALIZER(RegisterDistLockWithSkewCmd)(InitializerContext* context) {
         if (Command::testCommandsEnabled) {
@@ -475,8 +416,12 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
 
-        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
-                 BSONObjBuilder& result, bool) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
 
             long long skew = (long long) number_field(cmdObj, "skew", 0);
 

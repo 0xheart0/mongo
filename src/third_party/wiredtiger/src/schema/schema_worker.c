@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -48,24 +49,34 @@ __wt_schema_worker(WT_SESSION_IMPL *session,
 			 * any open file handles, including checkpoints.
 			 */
 			if (FLD_ISSET(open_flags, WT_DHANDLE_EXCLUSIVE)) {
-				WT_WITH_DHANDLE_LOCK(session,
+				WT_WITH_HANDLE_LIST_LOCK(session,
 				    ret = __wt_conn_dhandle_close_all(
 				    session, uri, 0));
 				WT_ERR(ret);
 			}
 
-			WT_ERR(__wt_session_get_btree_ckpt(
-			    session, uri, cfg, open_flags));
-			ret = file_func(session, cfg);
-			WT_TRET(__wt_session_release_btree(session));
+			if ((ret = __wt_session_get_btree_ckpt(
+			    session, uri, cfg, open_flags)) == 0) {
+				WT_SAVE_DHANDLE(session,
+				    ret = file_func(session, cfg));
+				WT_TRET(__wt_session_release_btree(session));
+			} else if (ret == EBUSY) {
+				WT_ASSERT(session, !FLD_ISSET(
+				    open_flags, WT_DHANDLE_EXCLUSIVE));
+				WT_WITH_HANDLE_LIST_LOCK(session,
+				    ret = __wt_conn_btree_apply_single_ckpt(
+				    session, uri, file_func, cfg));
+			}
+			WT_ERR(ret);
 		}
 	} else if (WT_PREFIX_MATCH(uri, "colgroup:")) {
-		WT_ERR(__wt_schema_get_colgroup(session, uri, NULL, &colgroup));
-		WT_ERR(__wt_schema_worker(session, colgroup->source,
-		    file_func, name_func, cfg, open_flags));
+		WT_ERR(__wt_schema_get_colgroup(
+		    session, uri, 0, NULL, &colgroup));
+		WT_ERR(__wt_schema_worker(session,
+		    colgroup->source, file_func, name_func, cfg, open_flags));
 	} else if (WT_PREFIX_SKIP(tablename, "index:")) {
 		idx = NULL;
-		WT_ERR(__wt_schema_get_index(session, uri, NULL, &idx));
+		WT_ERR(__wt_schema_get_index(session, uri, 0, NULL, &idx));
 		WT_ERR(__wt_schema_worker(session, idx->source,
 		    file_func, name_func, cfg, open_flags));
 	} else if (WT_PREFIX_MATCH(uri, "lsm:")) {

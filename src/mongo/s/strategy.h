@@ -30,7 +30,6 @@
 
 #pragma once
 
-#include "mongo/pch.h"
 #include "chunk.h"
 #include "request.h"
 

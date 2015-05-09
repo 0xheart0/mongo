@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,6 +15,7 @@
 	set_key,							\
 	set_value,							\
 	compare,							\
+	equals,								\
 	next,								\
 	prev,								\
 	reset,								\
@@ -22,6 +24,7 @@
 	insert,								\
 	update,								\
 	remove,								\
+	reconfigure,							\
 	close)								\
 	static const WT_CURSOR n = {					\
 	NULL,				/* session */			\
@@ -33,6 +36,7 @@
 	(void (*)(WT_CURSOR *, ...))(set_key),				\
 	(void (*)(WT_CURSOR *, ...))(set_value),			\
 	(int (*)(WT_CURSOR *, WT_CURSOR *, int *))(compare),		\
+	(int (*)(WT_CURSOR *, WT_CURSOR *, int *))(equals),		\
 	next,								\
 	prev,								\
 	reset,								\
@@ -42,6 +46,7 @@
 	update,								\
 	remove,								\
 	close,								\
+	(int (*)(WT_CURSOR *, const char *))(reconfigure),		\
 	{ NULL, NULL },			/* TAILQ_ENTRY q */		\
 	0,				/* recno key */			\
 	{ 0 },				/* recno raw buffer */		\
@@ -94,6 +99,8 @@ struct __wt_cursor_btree {
 					/* Next item(s) found during search */
 	WT_INSERT	*next_stack[WT_SKIP_MAXDEPTH];
 
+	uint32_t page_deleted_count;	/* Deleted items on the page */
+
 	uint64_t recno;			/* Record number */
 
 	/*
@@ -105,12 +112,16 @@ struct __wt_cursor_btree {
 	int	compare;
 
 	/*
-	 * The key value from a binary search of a row-store files; we keep a
-	 * copy of the last key we retrieved in the search, it avoids having
-	 * doing the additional work of getting the key again for return to
-	 * the application.
+	 * A key returned from a binary search or cursor movement on a row-store
+	 * page; if we find an exact match on a row-store leaf page in a search
+	 * operation, keep a copy of key we built during the search to avoid
+	 * doing the additional work of getting the key again for return to the
+	 * application. Note, this only applies to exact matches when searching
+	 * disk-image structures, so it's not, for example, a key from an insert
+	 * list. Additionally, this structure is used to build keys when moving
+	 * a cursor through a row-store leaf page.
 	 */
-	WT_ITEM search_key;
+	WT_ITEM *row_key, _row_key;
 
 	/*
 	 * It's relatively expensive to calculate the last record on a variable-
@@ -156,9 +167,15 @@ struct __wt_cursor_btree {
 	WT_ROW *rip_saved;		/* Last-returned key reference */
 
 	/*
-	 * A temporary buffer for caching RLE values for column-store files.
+	 * A temporary buffer for caching RLE values for column-store files (if
+	 * RLE is non-zero, then we don't unpack the value every time we move
+	 * to the next cursor position, we re-use the unpacked value we stored
+	 * here the first time we hit the value).
+	 *
+	 * A temporary buffer for building on-page keys when searching row-store
+	 * files.
 	 */
-	WT_ITEM tmp;
+	WT_ITEM *tmp, _tmp;
 
 	/*
 	 * The update structure allocated by the row- and column-store modify
@@ -261,6 +278,8 @@ struct __wt_cursor_log {
 	WT_ITEM		*logrec;	/* Copy of record for cursor */
 	WT_ITEM		*opkey, *opvalue;	/* Op key/value copy */
 	const uint8_t	*stepp, *stepp_end;	/* Pointer within record */
+	uint8_t		*packed_key;	/* Packed key for 'raw' interface */
+	uint8_t		*packed_value;	/* Packed value for 'raw' interface */
 	uint32_t	step_count;	/* Intra-record count */
 	uint32_t	rectype;	/* Record type */
 	uint64_t	txnid;		/* Record txnid */
@@ -280,6 +299,7 @@ struct __wt_cursor_metadata {
 struct __wt_cursor_stat {
 	WT_CURSOR iface;
 
+	int	notinitialized;		/* Cursor not initialized */
 	int	notpositioned;		/* Cursor not positioned */
 
 	WT_STATS *stats;		/* Stats owned by the cursor */
@@ -291,6 +311,8 @@ struct __wt_cursor_stat {
 		WT_DSRC_STATS dsrc_stats;
 		WT_CONNECTION_STATS conn_stats;
 	} u;
+
+	const char **cfg;		/* Original cursor configuration */
 
 	int	 key;			/* Current stats key */
 	uint64_t v;			/* Current stats value */

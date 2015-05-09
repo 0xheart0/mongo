@@ -28,7 +28,6 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
 #include <boost/thread/condition_variable.hpp>
 #include <boost/thread/mutex.hpp>
 #include <memory>
@@ -51,9 +50,11 @@
 
 namespace mongo {
 
+    class AuthorizationSession;
     class AuthzManagerExternalState;
-    class UserDocumentParser;
     class OperationContext;
+    class ServiceContext;
+    class UserDocumentParser;
 
     /**
      * Internal secret key info.
@@ -69,9 +70,13 @@ namespace mongo {
     class AuthorizationManager {
         MONGO_DISALLOW_COPYING(AuthorizationManager);
     public:
+        static AuthorizationManager* get(ServiceContext* service);
+        static AuthorizationManager* get(ServiceContext& service);
+        static void set(ServiceContext* service,
+                        std::unique_ptr<AuthorizationManager> authzManager);
 
         // The newly constructed AuthorizationManager takes ownership of "externalState"
-        explicit AuthorizationManager(AuthzManagerExternalState* externalState);
+        explicit AuthorizationManager(std::unique_ptr<AuthzManagerExternalState> externalState);
 
         ~AuthorizationManager();
 
@@ -121,13 +126,13 @@ namespace mongo {
         static const int schemaVersion26Upgrade = 2;
 
         /**
-         * Auth schema version for MongoDB 2.6 and 2.8 MONGODB-CR/SCRAM mixed auth mode.
+         * Auth schema version for MongoDB 2.6 and 3.0 MONGODB-CR/SCRAM mixed auth mode.
          * Users are stored in admin.system.users, roles in admin.system.roles.
          */
         static const int schemaVersion26Final = 3;
 
         /**
-         * Auth schema version for MongoDB 2.8 SCRAM only mode.
+         * Auth schema version for MongoDB 3.0 SCRAM only mode.
          * Users are stored in admin.system.users, roles in admin.system.roles.
          * MONGODB-CR credentials have been replaced with SCRAM credentials in the user documents.
          */
@@ -154,6 +159,10 @@ namespace mongo {
                                      const RoleName& roleName,
                                      mutablebson::Element result);
 
+        /**
+         * Returns a new AuthorizationSession for use with this AuthorizationManager.
+         */
+        std::unique_ptr<AuthorizationSession> makeAuthorizationSession();
 
         /**
          * Sets whether or not access control enforcement is enabled for this manager.
@@ -179,8 +188,15 @@ namespace mongo {
          */
         OID getCacheGeneration();
 
-        // Returns true if there exists at least one privilege document in the system.
-        bool hasAnyPrivilegeDocuments(OperationContext* txn) const;
+        /**
+         * Returns true if there exists at least one privilege document in the system.
+         * Used by the AuthorizationSession to determine whether localhost connections should be
+         * granted special access to bootstrap the system.
+         * NOTE: If this method ever returns true, the result is cached in _privilegeDocsExist,
+         * meaning that once this method returns true it will continue to return true for the
+         * lifetime of this process, even if all users are subsequently dropped from the system.
+         */
+        bool hasAnyPrivilegeDocuments(OperationContext* txn);
 
         /**
          * Updates the auth schema version document to reflect the current state of the system.
@@ -280,7 +296,7 @@ namespace mongo {
         // "system.users" collection of database "dbname".
         //
         // Returns Status::OK() if the document is good, or Status(ErrorCodes::BadValue), otherwise.
-        Status checkValidPrivilegeDocument(const StringData& dbname, const BSONObj& doc);
+        Status checkValidPrivilegeDocument(StringData dbname, const BSONObj& doc);
 
         // Given a database name and a readOnly flag return an ActionSet describing all the actions
         // that an old-style user with those attributes should be given.
@@ -384,7 +400,7 @@ namespace mongo {
          * admin.system.version collections.  This serializes all writers to the authorization
          * documents, but does not impact readers.
          */
-        bool tryAcquireAuthzUpdateLock(const StringData& why);
+        bool tryAcquireAuthzUpdateLock(StringData why);
 
         /**
          * Releases the lock guarding modifications to persistent authorization data, which must
@@ -427,11 +443,11 @@ namespace mongo {
          * Hook called by replication code to let the AuthorizationManager observe changes
          * to relevant collections.
          */
-        void logOp(const char* opstr,
+        void logOp(OperationContext* txn,
+                   const char* opstr,
                    const char* ns,
                    const BSONObj& obj,
-                   BSONObj* patt,
-                   bool* b);
+                   BSONObj* patt);
 
     private:
         /**
@@ -477,7 +493,15 @@ namespace mongo {
          */
         bool _authEnabled;
 
-        scoped_ptr<AuthzManagerExternalState> _externalState;
+        /**
+         * A cache of whether there are any users set up for the cluster.
+         */
+        bool _privilegeDocsExist;
+
+        // Protects _privilegeDocsExist
+        mutable boost::mutex _privilegeDocsExistMutex;
+
+        std::unique_ptr<AuthzManagerExternalState> _externalState;
 
         /**
          * Cached value of the authorization schema version.

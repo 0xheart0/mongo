@@ -2,9 +2,7 @@
 // Tests the state of sharding data after a replica set reconfig
 //
 
-var options = { separateConfig : true,
-                rs : true,
-                rsOptions : { nodes : 1 } };
+var options = { rs : true, rsOptions : { nodes : 1 } };
 
 var st = new ShardingTest({ shards : 2, mongos : 1, other : options });
 st.stopBalancer();
@@ -117,30 +115,36 @@ stepDownPrimaries();
 
 //
 //
-// No sharding data until shards are hit by a metadata operation
-assert.eq("",
-          st.rs0.getPrimary().adminCommand({ getShardVersion : coll.toString() }).configServer);
-assert.eq("",
-          st.rs1.getPrimary().adminCommand({ getShardVersion : coll.toString() }).configServer);
+// No sharding metadata until shards are hit by a metadata operation
+assert.eq({},
+          st.rs0.getPrimary().adminCommand(
+            { getShardVersion : collSharded.toString(), fullMetadata : true }).metadata);
+assert.eq({},
+          st.rs1.getPrimary().adminCommand(
+            { getShardVersion : collSharded.toString(), fullMetadata : true }).metadata);
 
 //
 //
 // Metadata commands should enable sharding data implicitly
 assert.commandWorked(mongos.adminCommand({ split : collSharded.toString(), middle : { _id : 0 }}));
-assert.eq("",
-           st.rs0.getPrimary().adminCommand({ getShardVersion : coll.toString() }).configServer);
-assert.neq("",
-          st.rs1.getPrimary().adminCommand({ getShardVersion : coll.toString() }).configServer);
+assert.eq({},
+          st.rs0.getPrimary().adminCommand(
+            { getShardVersion : collSharded.toString(), fullMetadata : true }).metadata);
+assert.neq({},
+           st.rs1.getPrimary().adminCommand(
+            { getShardVersion : collSharded.toString(), fullMetadata : true }).metadata);
 
 //
 //
 // MoveChunk command should enable sharding data implicitly on TO-shard
 assert.commandWorked(mongos.adminCommand({ moveChunk : collSharded.toString(), find : { _id : 0 },
                                            to : shards[0]._id }));
-assert.neq("",
-           st.rs0.getPrimary().adminCommand({ getShardVersion : coll.toString() }).configServer);
-assert.neq("",
-           st.rs1.getPrimary().adminCommand({ getShardVersion : coll.toString() }).configServer);
+assert.neq({},
+           st.rs0.getPrimary().adminCommand(
+                { getShardVersion : collSharded.toString(), fullMetadata : true }).metadata);
+assert.neq({},
+           st.rs1.getPrimary().adminCommand(
+                { getShardVersion : collSharded.toString(), fullMetadata : true }).metadata);
 
 jsTest.log( "DONE!" );
 

@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
@@ -42,12 +43,11 @@ namespace mongo {
 
     class BSONObjBuilder;
     class CurOp;
+    class LastError;
     class OpCounters;
     class OperationContext;
-    struct LastError;
-
-    struct WriteOpStats;
     class WriteBatchStats;
+    struct WriteOpStats;
 
     /**
      * An instance of WriteBatchExecutor is an object capable of issuing a write batch.
@@ -60,7 +60,6 @@ namespace mongo {
         class ExecInsertsState;
 
         WriteBatchExecutor( OperationContext* txn,
-                            const BSONObj& defaultWriteConcern,
                             OpCounters* opCounters,
                             LastError* le );
 
@@ -141,9 +140,6 @@ namespace mongo {
 
         OperationContext* _txn;
 
-        // Default write concern, if one isn't provide in the batches.
-        const BSONObj _defaultWriteConcern;
-
         // OpCounters object to update - needed for stats reporting
         // Not owned here.
         OpCounters* _opCounters;
@@ -153,7 +149,7 @@ namespace mongo {
         LastError* _le;
 
         // Stats
-        scoped_ptr<WriteBatchStats> _stats;
+        boost::scoped_ptr<WriteBatchStats> _stats;
     };
 
     /**

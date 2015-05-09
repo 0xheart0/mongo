@@ -1,0 +1,69 @@
+# -*- mode: python -*-
+
+Import("env")
+
+env.SConscript(
+    dirs=[
+        'legacy',
+    ],
+)
+
+env.Library(
+    target='catalog_types',
+    source=[
+        'type_actionlog.cpp',
+        'type_changelog.cpp',
+        'type_chunk.cpp',
+        'type_collection.cpp',
+        'type_database.cpp',
+        'type_settings.cpp',
+        'type_shard.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base/base',
+        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.Library(
+    target='catalog_manager',
+    source=[
+        'catalog_cache.cpp',
+        'catalog_manager.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base/base',
+        '$BUILD_DIR/mongo/bson/bson',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/s/batch_write_types',
+        '$BUILD_DIR/mongo/s/catalog/catalog_types'
+    ]
+)
+
+env.CppUnitTest(
+    target='catalog_types_test',
+    source=[
+        'type_changelog_test.cpp',
+        'type_chunk_test.cpp',
+        'type_collection_test.cpp',
+        'type_database_test.cpp',
+        'type_settings_test.cpp',
+        'type_shard_test.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/s/catalog/catalog_types'
+    ]
+)
+
+env.Library(
+    target='dist_lock_manager',
+    source=[
+        'dist_lock_manager.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base/base',
+    ],
+)
+

@@ -27,11 +27,14 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/dbmessage.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     string Message::toString() const {
         stringstream ss;
@@ -84,7 +87,7 @@ namespace mongo {
 
             // Validate there is room for a null byte in the buffer
             // Strings can be zero length
-            uassert(18633, "Failed to parse ns string", _nsLen <= (limit - 1));
+            uassert(18633, "Failed to parse ns string", _nsLen < limit);
 
             _nextjsobj += _nsLen + 1; // skip namespace + null
         }
@@ -100,7 +103,7 @@ namespace mongo {
         const char* p = _nsStart + _nsLen + 1;
         checkRead<int>(p, 2);
 
-        return ConstDataView(p).readLE<int32_t>(sizeof(int32_t));
+        return ConstDataView(p).read<LittleEndian<int32_t>>(sizeof(int32_t));
     }
 
     int DbMessage::pullInt() {
@@ -158,7 +161,7 @@ namespace mongo {
     T DbMessage::read() const {
         checkRead<T>(_nextjsobj, 1);
 
-        return ConstDataView(_nextjsobj).readLE<T>();
+        return ConstDataView(_nextjsobj).read<LittleEndian<T>>();
     }
 
     template<typename T> T DbMessage::readAndAdvance() {

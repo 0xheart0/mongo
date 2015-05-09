@@ -30,7 +30,7 @@
  */
 
 #include "mongo/base/init.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/in_memory/in_memory_engine.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage_options.h"
@@ -42,12 +42,25 @@ namespace mongo {
         class InMemoryFactory : public StorageEngine::Factory {
         public:
             virtual ~InMemoryFactory() { }
-            virtual StorageEngine* create(const StorageGlobalParams& params) const {
-                return new KVStorageEngine(new InMemoryEngine());
+            virtual StorageEngine* create(const StorageGlobalParams& params,
+                                          const StorageEngineLockFile& lockFile) const {
+                KVStorageEngineOptions options;
+                options.directoryPerDB = params.directoryperdb;
+                options.forRepair = params.repair;
+                return new KVStorageEngine(new InMemoryEngine(), options);
             }
 
             virtual StringData getCanonicalName() const {
                 return "inMemoryExperiment";
+            }
+
+            virtual Status validateMetadata(const StorageEngineMetadata& metadata,
+                                            const StorageGlobalParams& params) const {
+                return Status::OK();
+            }
+
+            virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const {
+                return BSONObj();
             }
         };
 
@@ -57,7 +70,7 @@ namespace mongo {
                                          ("SetGlobalEnvironment"))
                                          (InitializerContext* context) {
 
-        getGlobalEnvironment()->registerStorageEngine("inMemoryExperiment", new InMemoryFactory());
+        getGlobalServiceContext()->registerStorageEngine("inMemoryExperiment", new InMemoryFactory());
         return Status::OK();
     }
 

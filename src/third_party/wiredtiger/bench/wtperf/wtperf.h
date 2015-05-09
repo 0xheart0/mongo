@@ -1,4 +1,5 @@
 /*-
+ * Public Domain 2014-2015 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -71,6 +72,9 @@ typedef struct __config_thread CONFIG_THREAD;
 #define	BZIP_BLK BLKCMP_PFX "bzip2"
 #define	BZIP_EXT							\
 	EXT_PFX EXTPATH "bzip2/.libs/libwiredtiger_bzip2.so" EXT_SFX
+#define	LZ4_BLK BLKCMP_PFX "lz4"
+#define	LZ4_EXT							\
+	EXT_PFX EXTPATH "lz4/.libs/libwiredtiger_lz4.so" EXT_SFX
 #define	SNAPPY_BLK BLKCMP_PFX "snappy"
 #define	SNAPPY_EXT							\
 	EXT_PFX EXTPATH "snappy/.libs/libwiredtiger_snappy.so" EXT_SFX
@@ -98,7 +102,7 @@ typedef struct {
  * NOTE:  If you add any fields to this structure here, you must also add
  * an initialization in wtperf.c in the default_cfg.
  */
-struct __config {			/* Configuration struction */
+struct __config {			/* Configuration structure */
 	const char *home;		/* WiredTiger home */
 	const char *monitor_dir;	/* Monitor output dir */
 	char *base_uri;			/* Object URI */

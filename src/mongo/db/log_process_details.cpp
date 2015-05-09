@@ -41,9 +41,11 @@
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
-#include "mongo/util/version_reporting.h"
 
 namespace mongo {
+
+    using std::cout;
+    using std::endl;
 
     bool is32bit() {
         return ( sizeof(int*) == 4 );
@@ -53,7 +55,6 @@ namespace mongo {
         log() << mongodVersion() << endl;
         printGitVersion();
         printOpenSSLVersion();
-        printSysInfo();
         printAllocator();
         printCommandLineOpts();
     }

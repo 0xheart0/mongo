@@ -35,6 +35,11 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::list;
+    using std::string;
+    using std::vector;
+
     // static
     const char* MergeSortStage::kStageType = "SORT_MERGE";
 
@@ -151,9 +156,9 @@ namespace mongo {
                 if (PlanStage::NEED_TIME == code) {
                     ++_commonStats.needTime;
                 }
-                else if (PlanStage::NEED_FETCH == code) {
+                else if (PlanStage::NEED_YIELD == code) {
                     *out = id;
-                    ++_commonStats.needFetch;
+                    ++_commonStats.needYield;
                 }
 
                 return code;
@@ -181,7 +186,6 @@ namespace mongo {
 
         // But don't return it if it's flagged.
         if (_ws->isFlagged(*out)) {
-            _ws->free(*out);
             return PlanStage::NEED_TIME;
         }
 
@@ -274,11 +278,11 @@ namespace mongo {
         return ret.release();
     }
 
-    const CommonStats* MergeSortStage::getCommonStats() {
+    const CommonStats* MergeSortStage::getCommonStats() const {
         return &_commonStats;
     }
 
-    const SpecificStats* MergeSortStage::getSpecificStats() {
+    const SpecificStats* MergeSortStage::getSpecificStats() const {
         return &_specificStats;
     }
 

@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -67,6 +68,20 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
 
 	*skipp = 0;
 
+	/* If we have a clean page in memory, attempt to evict it. */
+	if (ref->state == WT_REF_MEM &&
+	    WT_ATOMIC_CAS4(ref->state, WT_REF_MEM, WT_REF_LOCKED)) {
+		if (__wt_page_is_modified(ref->page)) {
+			WT_PUBLISH(ref->state, WT_REF_MEM);
+			return (0);
+		}
+
+		(void)WT_ATOMIC_ADD4(S2BT(session)->evict_busy, 1);
+		ret = __wt_evict_page(session, ref);
+		(void)WT_ATOMIC_SUB4(S2BT(session)->evict_busy, 1);
+		WT_RET_BUSY_OK(ret);
+	}
+
 	/*
 	 * Atomically switch the page's state to lock it.  If the page is not
 	 * on-disk, other threads may be using it, no fast delete.
@@ -117,7 +132,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, int *skipp)
 	 * Record the change in the transaction structure and set the change's
 	 * transaction ID.
 	 */
-	WT_ERR(__wt_calloc_def(session, 1, &ref->page_del));
+	WT_ERR(__wt_calloc_one(session, &ref->page_del));
 	ref->page_del->txnid = session->txn.id;
 
 	WT_ERR(__wt_txn_modify_ref(session, ref));
@@ -224,11 +239,14 @@ __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * the page could switch to an in-memory state at any time.  Lock down
 	 * the structure, just to be safe.
 	 */
+	if (ref->page_del == NULL)
+		return (1);
+
 	if (!WT_ATOMIC_CAS4(ref->state, WT_REF_DELETED, WT_REF_LOCKED))
 		return (0);
 
-	skip = ref->page_del == NULL ||
-	    __wt_txn_visible(session, ref->page_del->txnid) ? 1 : 0;
+	skip = (ref->page_del == NULL ||
+	    __wt_txn_visible(session, ref->page_del->txnid));
 
 	WT_PUBLISH(ref->state, WT_REF_DELETED);
 	return (skip);
@@ -246,6 +264,7 @@ __wt_delete_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 	WT_PAGE *page;
 	WT_PAGE_DELETED *page_del;
 	WT_UPDATE **upd_array, *upd;
+	size_t size;
 	uint32_t i;
 
 	btree = S2BT(session);
@@ -305,8 +324,8 @@ __wt_delete_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * structures, fill in the per-page update array with references to
 	 * deleted items.
 	 */
-	for (i = 0; i < page->pg_row_entries; ++i) {
-		WT_ERR(__wt_calloc_def(session, 1, &upd));
+	for (i = 0, size = 0; i < page->pg_row_entries; ++i) {
+		WT_ERR(__wt_calloc_one(session, &upd));
 		WT_UPDATE_DELETED_SET(upd);
 
 		if (page_del == NULL)
@@ -318,10 +337,11 @@ __wt_delete_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 
 		upd->next = upd_array[i];
 		upd_array[i] = upd;
+
+		size += sizeof(WT_UPDATE *) + WT_UPDATE_MEMSIZE(upd);
 	}
 
-	__wt_cache_page_inmem_incr(session, page,
-	    page->pg_row_entries * (sizeof(WT_UPDATE *) + sizeof(WT_UPDATE)));
+	__wt_cache_page_inmem_incr(session, page, size);
 
 	return (0);
 

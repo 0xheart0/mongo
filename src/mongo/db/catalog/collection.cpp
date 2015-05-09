@@ -34,25 +34,64 @@
 
 #include "mongo/db/catalog/collection.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/counter.h"
 #include "mongo/base/owned_pointer_map.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/mmap_v1/record_store_v1_capped.h"  // XXX-HK/ERH
+#include "mongo/db/ops/update_driver.h"
+#include "mongo/db/ops/update_request.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/record_fetcher.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
 
 #include "mongo/db/auth/user_document_parser.h" // XXX-ANDY
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+namespace {
+    const auto bannedExpressionsInValidators = std::set<StringData>{
+        "$geoNear",
+        "$near",
+        "$nearSphere",
+        "$text",
+        "$where",
+    };
+    Status checkValidatorForBannedExpressions(const BSONObj& validator) {
+        for (auto field : validator) {
+            const auto name = field.fieldNameStringData();
+            if (name[0] == '$' && bannedExpressionsInValidators.count(name)) {
+                return {ErrorCodes::InvalidOptions,
+                        str::stream() << name << " is not allowed in collection validators"};
+            }
+
+            if (field.type() == Object || field.type() == Array) {
+                auto status = checkValidatorForBannedExpressions(field.Obj());
+                if (!status.isOK())
+                    return status;
+            }
+        }
+
+        return Status::OK();
+    }
+}
+
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     using logger::LogComponent;
 
@@ -78,21 +117,24 @@ namespace mongo {
     // ----
 
     Collection::Collection( OperationContext* txn,
-                            const StringData& fullNS,
+                            StringData fullNS,
                             CollectionCatalogEntry* details,
                             RecordStore* recordStore,
-                            Database* database )
+                            DatabaseCatalogEntry* dbce )
         : _ns( fullNS ),
           _details( details ),
           _recordStore( recordStore ),
-          _database( database ),
+          _dbce( dbce ),
           _infoCache( this ),
           _indexCatalog( this ),
-          _cursorCache( fullNS ) {
+          _validatorDoc(_details->getCollectionOptions(txn).validator.getOwned()),
+          _validator(uassertStatusOK(parseValidator(_validatorDoc))),
+          _cursorManager( fullNS ) {
         _magic = 1357924;
         _indexCatalog.init(txn);
         if ( isCapped() )
             _recordStore->setCappedDeleteCallback( this );
+        _infoCache.reset(txn);
     }
 
     Collection::~Collection() {
@@ -133,44 +175,82 @@ namespace mongo {
     RecordIterator* Collection::getIterator( OperationContext* txn,
                                              const RecordId& start,
                                              const CollectionScanParams::Direction& dir) const {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
         invariant( ok() );
+
         return _recordStore->getIterator( txn, start, dir );
     }
 
     vector<RecordIterator*> Collection::getManyIterators( OperationContext* txn ) const {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
+
         return _recordStore->getManyIterators(txn);
     }
 
-    int64_t Collection::countTableScan( OperationContext* txn, const MatchExpression* expression ) {
-        scoped_ptr<RecordIterator> iterator( getIterator( txn,
-                                                          RecordId(),
-                                                          CollectionScanParams::FORWARD ) );
-        int64_t count = 0;
-        while ( !iterator->isEOF() ) {
-            RecordId loc = iterator->getNext();
-            BSONObj obj = docFor( txn, loc );
-            if ( expression->matchesBSON( obj ) )
-                count++;
-        }
-
-        return count;
+    Snapshotted<BSONObj> Collection::docFor(OperationContext* txn, const RecordId& loc) const {
+        return Snapshotted<BSONObj>(txn->recoveryUnit()->getSnapshotId(),
+                                    _recordStore->dataFor( txn, loc ).releaseToBson());
     }
 
-    BSONObj Collection::docFor(OperationContext* txn, const RecordId& loc) const {
-        return  _recordStore->dataFor( txn, loc ).releaseToBson();
-    }
+    bool Collection::findDoc(OperationContext* txn,
+                             const RecordId& loc,
+                             Snapshotted<BSONObj>* out) const {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
 
-    bool Collection::findDoc(OperationContext* txn, const RecordId& loc, BSONObj* out) const {
         RecordData rd;
         if ( !_recordStore->findRecord( txn, loc, &rd ) )
             return false;
-        *out = rd.releaseToBson();
+        *out = Snapshotted<BSONObj>(txn->recoveryUnit()->getSnapshotId(), rd.releaseToBson());
         return true;
     }
 
-    StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
+    Status Collection::checkValidation(OperationContext* txn, const BSONObj& document) const {
+        if (!_validator)
+            return Status::OK();
+
+        if (documentValidationDisabled(txn))
+            return Status::OK();
+
+        if (_validator->matchesBSON(document))
+            return Status::OK();
+
+        return {ErrorCodes::DocumentValidationFailure, "Document failed validation"};
+    }
+
+    StatusWith<std::unique_ptr<MatchExpression>> Collection::parseValidator(
+            const BSONObj& validator) const {
+        if (validator.isEmpty())
+            return {nullptr};
+
+        if (ns().isSystem()) {
+            return {ErrorCodes::InvalidOptions,
+                    "Document validators not allowed on system collections."};
+        }
+
+        if (ns().isOnInternalDb()) {
+            return {ErrorCodes::InvalidOptions,
+                    str::stream() << "Document validators are not allowed on collections in"
+                                  << " the " << ns().db() << " database"};
+        }
+
+        {
+            auto status = checkValidatorForBannedExpressions(validator);
+            if (!status.isOK())
+                return status;
+        }
+
+        auto statusWithRawPtr = MatchExpressionParser::parse(validator);
+        if (!statusWithRawPtr.isOK())
+            return statusWithRawPtr.getStatus();
+
+        return {std::unique_ptr<MatchExpression>(statusWithRawPtr.getValue())};
+    }
+
+    StatusWith<RecordId> Collection::insertDocument(OperationContext* txn,
                                                     const DocWriter* doc,
-                                                    bool enforceQuota ) {
+                                                    bool enforceQuota) {
+        invariant(!_validator || documentValidationDisabled(txn));
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
         invariant( !_indexCatalog.haveAnyIndexes() ); // eventually can implement, just not done
 
         StatusWith<RecordId> loc = _recordStore->insertRecord( txn,
@@ -179,12 +259,24 @@ namespace mongo {
         if ( !loc.isOK() )
             return loc;
 
+        // we cannot call into the OpObserver here because the document being written is not present
+        // fortunately, this is currently only used for adding entries to the oplog.
+
         return StatusWith<RecordId>( loc );
     }
 
-    StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
+    StatusWith<RecordId> Collection::insertDocument(OperationContext* txn,
                                                     const BSONObj& docToInsert,
-                                                    bool enforceQuota ) {
+                                                    bool enforceQuota,
+                                                    bool fromMigrate) {
+        {
+            auto status = checkValidation(txn, docToInsert);
+            if (!status.isOK())
+                return status;
+        }
+
+        const SnapshotId sid = txn->recoveryUnit()->getSnapshotId();
+
         if ( _indexCatalog.findIdIndex( txn ) ) {
             if ( docToInsert["_id"].eoo() ) {
                 return StatusWith<RecordId>( ErrorCodes::InternalError,
@@ -193,13 +285,29 @@ namespace mongo {
             }
         }
 
-        return _insertDocument( txn, docToInsert, enforceQuota );
+        StatusWith<RecordId> res = _insertDocument( txn, docToInsert, enforceQuota );
+        invariant( sid == txn->recoveryUnit()->getSnapshotId() );
+        if (res.isOK()) {
+            getGlobalServiceContext()->getOpObserver()->onInsert(txn,
+                                                                 ns(),
+                                                                 docToInsert,
+                                                                 fromMigrate);
+        }
+        return res;
     }
 
-    StatusWith<RecordId> Collection::insertDocument( OperationContext* txn,
+    StatusWith<RecordId> Collection::insertDocument(OperationContext* txn,
                                                     const BSONObj& doc,
                                                     MultiIndexBlock* indexBlock,
-                                                    bool enforceQuota ) {
+                                                    bool enforceQuota) {
+        {
+            auto status = checkValidation(txn, doc);
+            if (!status.isOK())
+                return status;
+        }
+
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+
         StatusWith<RecordId> loc = _recordStore->insertRecord( txn,
                                                               doc.objdata(),
                                                               doc.objsize(),
@@ -211,6 +319,8 @@ namespace mongo {
         Status status = indexBlock->insert( doc, loc.getValue() );
         if ( !status.isOK() )
             return StatusWith<RecordId>( status );
+
+        getGlobalServiceContext()->getOpObserver()->onInsert(txn, ns(), doc);
 
         return loc;
     }
@@ -224,6 +334,7 @@ namespace mongo {
     StatusWith<RecordId> Collection::_insertDocument( OperationContext* txn,
                                                      const BSONObj& docToInsert,
                                                      bool enforceQuota ) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
         // TODO: for now, capped logic lives inside NamespaceDetails, which is hidden
         //       under the RecordStore, this feels broken since that should be a
@@ -248,91 +359,111 @@ namespace mongo {
         return loc;
     }
 
-    Status Collection::aboutToDeleteCapped( OperationContext* txn, const RecordId& loc ) {
-
-        BSONObj doc = docFor( txn, loc );
+    Status Collection::aboutToDeleteCapped( OperationContext* txn,
+                                            const RecordId& loc,
+                                            RecordData data ) {
 
         /* check if any cursors point to us.  if so, advance them. */
-        _cursorCache.invalidateDocument(txn, loc, INVALIDATION_DELETION);
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_DELETION);
 
+        BSONObj doc = data.releaseToBson();
         _indexCatalog.unindexRecord(txn, doc, loc, false);
 
         return Status::OK();
     }
 
-    void Collection::deleteDocument( OperationContext* txn,
-                                     const RecordId& loc,
-                                     bool cappedOK,
-                                     bool noWarn,
-                                     BSONObj* deletedId ) {
+    void Collection::deleteDocument(OperationContext* txn,
+                                    const RecordId& loc,
+                                    bool cappedOK,
+                                    bool noWarn,
+                                    BSONObj* deletedId) {
         if ( isCapped() && !cappedOK ) {
             log() << "failing remove on a capped ns " << _ns << endl;
             uasserted( 10089,  "cannot remove from a capped collection" );
             return;
         }
 
-        BSONObj doc = docFor( txn, loc );
+        Snapshotted<BSONObj> doc = docFor(txn, loc);
 
-        if ( deletedId ) {
-            BSONElement e = doc["_id"];
-            if ( e.type() ) {
+        BSONElement e = doc.value()["_id"];
+        BSONObj id;
+        if (e.type()) {
+            id = e.wrap();
+            if (deletedId) {
                 *deletedId = e.wrap();
             }
         }
 
         /* check if any cursors point to us.  if so, advance them. */
-        _cursorCache.invalidateDocument(txn, loc, INVALIDATION_DELETION);
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_DELETION);
 
-        _indexCatalog.unindexRecord(txn, doc, loc, noWarn);
+        _indexCatalog.unindexRecord(txn, doc.value(), loc, noWarn);
 
-        _recordStore->deleteRecord( txn, loc );
+        _recordStore->deleteRecord(txn, loc);
 
         _infoCache.notifyOfWriteOp();
+
+        if (!id.isEmpty()) {
+            getGlobalServiceContext()->getOpObserver()->onDelete(txn, ns().ns(), id);
+        }
     }
 
     Counter64 moveCounter;
     ServerStatusMetricField<Counter64> moveCounterDisplay( "record.moves", &moveCounter );
 
     StatusWith<RecordId> Collection::updateDocument( OperationContext* txn,
-                                                    const RecordId& oldLocation,
-                                                    const BSONObj& objNew,
-                                                    bool enforceQuota,
-                                                    OpDebug* debug ) {
-
-        BSONObj objOld = _recordStore->dataFor( txn, oldLocation ).releaseToBson();
-
-        if ( objOld.hasElement( "_id" ) ) {
-            BSONElement oldId = objOld["_id"];
-            BSONElement newId = objNew["_id"];
-            if ( oldId != newId )
-                return StatusWith<RecordId>( ErrorCodes::InternalError,
-                                            "in Collection::updateDocument _id mismatch",
-                                            13596 );
+                                                     const RecordId& oldLocation,
+                                                     const Snapshotted<BSONObj>& oldDoc,
+                                                     const BSONObj& newDoc,
+                                                     bool enforceQuota,
+                                                     bool indexesAffected,
+                                                     OpDebug* debug,
+                                                     oplogUpdateEntryArgs& args) {
+        {
+            auto status = checkValidation(txn, newDoc);
+            if (!status.isOK())
+                return status;
         }
 
-        /* duplicate key check. we descend the btree twice - once for this check, and once for the actual inserts, further
-           below.  that is suboptimal, but it's pretty complicated to do it the other way without rollbacks...
-        */
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+        invariant(oldDoc.snapshotId() == txn->recoveryUnit()->getSnapshotId());
+
+        SnapshotId sid = txn->recoveryUnit()->getSnapshotId();
+
+        BSONElement oldId = oldDoc.value()["_id"];
+        if ( !oldId.eoo() && ( oldId != newDoc["_id"] ) )
+            return StatusWith<RecordId>( ErrorCodes::InternalError,
+                                         "in Collection::updateDocument _id mismatch",
+                                         13596 );
 
         // At the end of this step, we will have a map of UpdateTickets, one per index, which
-        // represent the index updates needed to be done, based on the changes between objOld and
-        // objNew.
+        // represent the index updates needed to be done, based on the changes between oldDoc and
+        // newDoc.
         OwnedPointerMap<IndexDescriptor*,UpdateTicket> updateTickets;
-        IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
-        while ( ii.more() ) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
+        if ( indexesAffected ) {
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
+            while ( ii.more() ) {
+                IndexDescriptor* descriptor = ii.next();
+                IndexCatalogEntry* entry = ii.catalogEntry(descriptor);
+                IndexAccessMethod* iam = ii.accessMethod( descriptor );
 
-            InsertDeleteOptions options;
-            options.logIfError = false;
-            options.dupsAllowed =
-                !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique())
-                || repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor);
-            UpdateTicket* updateTicket = new UpdateTicket();
-            updateTickets.mutableMap()[descriptor] = updateTicket;
-            Status ret = iam->validateUpdate(txn, objOld, objNew, oldLocation, options, updateTicket );
-            if ( !ret.isOK() ) {
-                return StatusWith<RecordId>( ret );
+                InsertDeleteOptions options;
+                options.logIfError = false;
+                options.dupsAllowed =
+                    !(KeyPattern::isIdKeyPattern(descriptor->keyPattern()) || descriptor->unique())
+                    || repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(descriptor);
+                UpdateTicket* updateTicket = new UpdateTicket();
+                updateTickets.mutableMap()[descriptor] = updateTicket;
+                Status ret = iam->validateUpdate(txn,
+                                                 oldDoc.value(),
+                                                 newDoc,
+                                                 oldLocation,
+                                                 options,
+                                                 updateTicket,
+                                                 entry->getFilterExpression());
+                if ( !ret.isOK() ) {
+                    return StatusWith<RecordId>( ret );
+                }
             }
         }
 
@@ -340,8 +471,8 @@ namespace mongo {
         // object is removed from all indexes.
         StatusWith<RecordId> newLocation = _recordStore->updateRecord( txn,
                                                                       oldLocation,
-                                                                      objNew.objdata(),
-                                                                      objNew.objsize(),
+                                                                      newDoc.objdata(),
+                                                                      newDoc.objsize(),
                                                                       _enforceQuota( enforceQuota ),
                                                                       this );
 
@@ -364,9 +495,12 @@ namespace mongo {
                     debug->nmoved += 1;
             }
 
-            Status s = _indexCatalog.indexRecord(txn, objNew, newLocation.getValue());
+            Status s = _indexCatalog.indexRecord(txn, newDoc, newLocation.getValue());
             if (!s.isOK())
                 return StatusWith<RecordId>(s);
+            invariant( sid == txn->recoveryUnit()->getSnapshotId() );
+            args.ns = ns().ns();
+            getGlobalServiceContext()->getOpObserver()->onUpdate(txn, args);
 
             return newLocation;
         }
@@ -376,21 +510,25 @@ namespace mongo {
         if ( debug )
             debug->keyUpdates = 0;
 
-        ii = _indexCatalog.getIndexIterator( txn, true );
-        while ( ii.more() ) {
-            IndexDescriptor* descriptor = ii.next();
-            IndexAccessMethod* iam = _indexCatalog.getIndex( descriptor );
+        if ( indexesAffected ) {
+            IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator( txn, true );
+            while ( ii.more() ) {
+                IndexDescriptor* descriptor = ii.next();
+                IndexAccessMethod* iam = ii.accessMethod(descriptor);
 
-            int64_t updatedKeys;
-            Status ret = iam->update(txn, *updateTickets.mutableMap()[descriptor], &updatedKeys);
-            if ( !ret.isOK() )
-                return StatusWith<RecordId>( ret );
-            if ( debug )
-                debug->keyUpdates += updatedKeys;
+                int64_t updatedKeys;
+                Status ret = iam->update(
+                    txn, *updateTickets.mutableMap()[descriptor], &updatedKeys);
+                if ( !ret.isOK() )
+                    return StatusWith<RecordId>( ret );
+                if ( debug )
+                    debug->keyUpdates += updatedKeys;
+            }
         }
 
-        // Broadcast the mutation so that query results stay correct.
-        _cursorCache.invalidateDocument(txn, oldLocation, INVALIDATION_MUTATION);
+        invariant( sid == txn->recoveryUnit()->getSnapshotId() );
+        args.ns = ns().ns();
+        getGlobalServiceContext()->getOpObserver()->onUpdate(txn, args);
 
         return newLocation;
     }
@@ -400,22 +538,47 @@ namespace mongo {
                                                const char* oldBuffer,
                                                size_t oldSize ) {
         moveCounter.increment();
-        _cursorCache.invalidateDocument(txn, oldLocation, INVALIDATION_DELETION);
+        _cursorManager.invalidateDocument(txn, oldLocation, INVALIDATION_DELETION);
         _indexCatalog.unindexRecord(txn, BSONObj(oldBuffer), oldLocation, true);
         return Status::OK();
     }
 
+    Status Collection::recordStoreGoingToUpdateInPlace( OperationContext* txn,
+                                                        const RecordId& loc ) {
+        // Broadcast the mutation so that query results stay correct.
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
+        return Status::OK();
+    }
+
+
+    bool Collection::updateWithDamagesSupported() const {
+        if (_validator)
+            return false;
+
+        return _recordStore->updateWithDamagesSupported();
+    }
 
     Status Collection::updateDocumentWithDamages( OperationContext* txn,
                                                   const RecordId& loc,
-                                                  const RecordData& oldRec,
+                                                  const Snapshotted<RecordData>& oldRec,
                                                   const char* damageSource,
-                                                  const mutablebson::DamageVector& damages ) {
+                                                  const mutablebson::DamageVector& damages,
+                                                  oplogUpdateEntryArgs& args) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+        invariant(oldRec.snapshotId() == txn->recoveryUnit()->getSnapshotId());
+        invariant(updateWithDamagesSupported());
 
         // Broadcast the mutation so that query results stay correct.
-        _cursorCache.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
+        _cursorManager.invalidateDocument(txn, loc, INVALIDATION_MUTATION);
 
-        return _recordStore->updateWithDamages( txn, loc, oldRec, damageSource, damages );
+        Status status = 
+            _recordStore->updateWithDamages(txn, loc, oldRec.value(), damageSource, damages);
+
+        if (status.isOK()) {
+            args.ns = ns().ns();
+            getGlobalServiceContext()->getOpObserver()->onUpdate(txn, args);
+        }
+        return status;
     }
 
     bool Collection::_enforceQuota( bool userEnforeQuota ) const {
@@ -479,6 +642,7 @@ namespace mongo {
      * 4) re-write indexes
      */
     Status Collection::truncate(OperationContext* txn) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
         massert( 17445, "index build in progress", _indexCatalog.numIndexesInProgress( txn ) == 0 );
 
         // 1) store index specs
@@ -495,7 +659,7 @@ namespace mongo {
         Status status = _indexCatalog.dropAllIndexes(txn, true);
         if ( !status.isOK() )
             return status;
-        _cursorCache.invalidateAll( false );
+        _cursorManager.invalidateAll(false, "collection truncated");
         _infoCache.reset( txn );
 
         // 3) truncate record store
@@ -516,9 +680,28 @@ namespace mongo {
     void Collection::temp_cappedTruncateAfter(OperationContext* txn,
                                               RecordId end,
                                               bool inclusive) {
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
         invariant( isCapped() );
-        reinterpret_cast<CappedRecordStoreV1*>(
-                           _recordStore)->temp_cappedTruncateAfter( txn, end, inclusive );
+
+        _cursorManager.invalidateAll(false, "capped collection truncated");
+        _recordStore->temp_cappedTruncateAfter( txn, end, inclusive );
+    }
+
+    Status Collection::setValidator(OperationContext* txn, BSONObj validatorDoc) {
+        invariant(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
+
+        // Make owned early so that the parsed match expression refers to the owned object.
+        if (!validatorDoc.isOwned()) validatorDoc = validatorDoc.getOwned();
+
+        auto statusWithMatcher = parseValidator(validatorDoc);
+        if (!statusWithMatcher.isOK())
+            return statusWithMatcher.getStatus();
+
+        _details->updateValidator(txn, validatorDoc);
+
+        _validator = std::move(statusWithMatcher.getValue());
+        _validatorDoc = std::move(validatorDoc);
+        return Status::OK();
     }
 
     namespace {
@@ -540,6 +723,7 @@ namespace mongo {
     Status Collection::validate( OperationContext* txn,
                                  bool full, bool scanData,
                                  ValidateResults* results, BSONObjBuilder* output ){
+        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
 
         MyValidateAdaptor adaptor;
         Status status = _recordStore->validate( txn, full, scanData, &adaptor, results, output );
@@ -570,6 +754,14 @@ namespace mongo {
                     iam->validate(txn, full, &keys, bob.get());
                     indexes.appendNumber(descriptor->indexNamespace(),
                                          static_cast<long long>(keys));
+
+                    if (bob) {
+                        BSONObj obj = bob->done();
+                        BSONElement valid = obj["valid"];
+                        if (valid.ok() && !valid.trueValue()) {
+                            results->valid = false;
+                        }
+                    }
                     idxn++;
                 }
 
@@ -597,9 +789,9 @@ namespace mongo {
         if ( touchData ) {
             BSONObjBuilder b;
             Status status = _recordStore->touch( txn, &b );
-            output->append( "data", b.obj() );
             if ( !status.isOK() )
                 return status;
+            output->append( "data", b.obj() );
         }
 
         if ( touchIndexes ) {

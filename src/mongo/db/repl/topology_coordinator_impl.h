@@ -31,13 +31,13 @@
 #include <string>
 #include <vector>
 
-#include "mongo/bson/optime.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/member_heartbeat_data.h"
 #include "mongo/db/repl/member_state.h"
-#include "mongo/db/repl/repl_coordinator.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/topology_coordinator.h"
-#include "mongo/util/concurrency/list.h"
+#include "mongo/db/repl/last_vote.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -128,38 +128,39 @@ namespace repl {
         virtual int getMaintenanceCount() const;
         virtual void setForceSyncSourceIndex(int index);
         virtual HostAndPort chooseNewSyncSource(Date_t now, 
-                                                const OpTime& lastOpApplied);
+                                                const Timestamp& lastOpApplied);
         virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
+        virtual void unblacklistSyncSource(const HostAndPort& host, Date_t now);
         virtual void clearSyncSourceBlacklist();
-        virtual bool shouldChangeSyncSource(const HostAndPort& currentSource) const;
+        virtual bool shouldChangeSyncSource(const HostAndPort& currentSource, Date_t now) const;
         virtual bool becomeCandidateIfStepdownPeriodOverAndSingleNodeSet(Date_t now);
         virtual void setElectionSleepUntil(Date_t newTime);
         virtual void setFollowerMode(MemberState::MS newMode);
         virtual void adjustMaintenanceCountBy(int inc);
         virtual void prepareSyncFromResponse(const ReplicationExecutor::CallbackData& data,
                                              const HostAndPort& target,
-                                             const OpTime& lastOpApplied,
+                                             const Timestamp& lastOpApplied,
                                              BSONObjBuilder* response,
                                              Status* result);
         virtual void prepareFreshResponse(const ReplicationCoordinator::ReplSetFreshArgs& args,
                                           Date_t now,
-                                          OpTime lastOpApplied,
+                                          Timestamp lastOpApplied,
                                           BSONObjBuilder* response,
                                           Status* result);
         virtual void prepareElectResponse(const ReplicationCoordinator::ReplSetElectArgs& args,
                                           Date_t now,
-                                          OpTime lastOpApplied,
+                                          Timestamp lastOpApplied,
                                           BSONObjBuilder* response,
                                           Status* result);
         virtual Status prepareHeartbeatResponse(Date_t now,
                                                 const ReplSetHeartbeatArgs& args,
                                                 const std::string& ourSetName,
-                                                const OpTime& lastOpApplied,
+                                                const Timestamp& lastOpApplied,
                                                 ReplSetHeartbeatResponse* response);
         virtual void prepareStatusResponse(const ReplicationExecutor::CallbackData& data,
                                            Date_t now,
                                            unsigned uptime,
-                                           const OpTime& lastOpApplied,
+                                           const Timestamp& lastOpApplied,
                                            BSONObjBuilder* response,
                                            Status* result);
         virtual void fillIsMasterForReplSet(IsMasterResponse* response);
@@ -167,7 +168,7 @@ namespace repl {
         virtual void updateConfig(const ReplicaSetConfig& newConfig,
                                   int selfIndex,
                                   Date_t now,
-                                  OpTime lastOpApplied);
+                                  Timestamp lastOpApplied);
         virtual std::pair<ReplSetHeartbeatArgs, Milliseconds> prepareHeartbeatRequest(
                 Date_t now,
                 const std::string& ourSetName,
@@ -177,15 +178,26 @@ namespace repl {
                 Milliseconds networkRoundTripTime,
                 const HostAndPort& target,
                 const StatusWith<ReplSetHeartbeatResponse>& hbResponse,
-                OpTime myLastOpApplied);
+                Timestamp myLastOpApplied);
         virtual bool voteForMyself(Date_t now);
-        virtual void processWinElection(OID electionId, OpTime electionOpTime);
+        virtual void processWinElection(OID electionId, Timestamp electionOpTime);
         virtual void processLoseElection();
-        virtual bool checkShouldStandForElection(Date_t now, const OpTime& lastOpApplied);
+        virtual bool checkShouldStandForElection(Date_t now, const Timestamp& lastOpApplied);
         virtual void setMyHeartbeatMessage(const Date_t now, const std::string& message);
-        virtual bool stepDown(Date_t until, bool force, OpTime lastOpApplied);
+        virtual bool stepDown(Date_t until, bool force, Timestamp lastOpApplied);
         virtual bool stepDownIfPending();
         virtual Date_t getStepDownTime() const;
+        virtual void prepareCursorResponseInfo(BSONObjBuilder* objBuilder,
+                                               const Timestamp& lastCommitttedOpTime) const;
+        Status processReplSetDeclareElectionWinner(const ReplSetDeclareElectionWinnerArgs& args,
+                                                   long long* responseTerm);
+        virtual void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
+                                                ReplSetRequestVotesResponse* response,
+                                                const OpTime& lastAppliedOpTime);
+
+        virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
+
+        virtual void loadLastVote(const LastVote& lastVote);
 
         ////////////////////////////////////////////////////////////
         //
@@ -195,10 +207,10 @@ namespace repl {
 
         // Changes _memberState to newMemberState.  Only for testing.
         void changeMemberState_forTest(const MemberState& newMemberState,
-                                       OpTime electionTime = OpTime(0,0));
+                                       Timestamp electionTime = Timestamp(0,0));
 
         // Sets "_electionTime" to "newElectionTime".  Only for testing.
-        void _setElectionTime(const OpTime& newElectionTime);
+        void _setElectionTime(const Timestamp& newElectionTime);
 
         // Sets _currentPrimaryIndex to the given index.  Should only be used in unit tests!
         // TODO(spencer): Remove this once we can easily call for an election in unit tests to
@@ -206,7 +218,7 @@ namespace repl {
         void _setCurrentPrimaryForTest(int primaryIndex);
 
         // Returns _electionTime.  Only used in unittests.
-        OpTime getElectionTime() const;
+        Timestamp getElectionTime() const;
 
         // Returns _electionId.  Only used in unittests.
         OID getElectionId() const;
@@ -242,7 +254,7 @@ namespace repl {
         // If we veto, the errmsg will be filled in with a reason
         bool _shouldVetoMember(const ReplicationCoordinator::ReplSetFreshArgs& args,
                                const Date_t& now,
-                               const OpTime& lastOpApplied,
+                               const Timestamp& lastOpApplied,
                                std::string* errmsg) const;
 
         // Returns the index of the member with the matching id, or -1 if none match.
@@ -251,19 +263,20 @@ namespace repl {
         // Sees if a majority number of votes are held by members who are currently "up"
         bool _aMajoritySeemsToBeUp() const;
 
-        // Is otherOpTime close enough to the latest known optime to qualify for an election
-        bool _isOpTimeCloseEnoughToLatestToElect(const OpTime& otherOpTime,
-                                                 const OpTime& ourLastOpApplied) const;
+        // Is otherOpTime close enough (within 10 seconds) to the latest known optime to qualify
+        // for an election
+        bool _isOpTimeCloseEnoughToLatestToElect(const Timestamp& otherOpTime,
+                                                 const Timestamp& ourLastOpApplied) const;
 
         // Returns reason why "self" member is unelectable
         UnelectableReasonMask _getMyUnelectableReason(
                 const Date_t now,
-                const OpTime lastOpApplied) const;
+                const Timestamp lastOpApplied) const;
 
         // Returns reason why memberIndex is unelectable
         UnelectableReasonMask _getUnelectableReason(
                 int memberIndex,
-                const OpTime& lastOpApplied) const;
+                const Timestamp& lastOpApplied) const;
 
         // Returns the nice text of why the node is unelectable
         std::string _getUnelectableReasonString(UnelectableReasonMask ur) const;
@@ -272,10 +285,10 @@ namespace repl {
         bool _iAmPrimary() const;
 
         // Scans through all members that are 'up' and return the latest known optime.
-        OpTime _latestKnownOpTime(OpTime ourLastOpApplied) const;
+        Timestamp _latestKnownOpTime(Timestamp ourLastOpApplied) const;
 
         // Scans the electable set and returns the highest priority member index
-        int _getHighestPriorityElectableIndex(Date_t now, OpTime lastOpApplied) const;
+        int _getHighestPriorityElectableIndex(Date_t now, Timestamp lastOpApplied) const;
 
         // Returns true if "one" member is higher priority than "two" member
         bool _isMemberHigherPriority(int memberOneIndex, int memberTwoIndex) const;
@@ -291,8 +304,9 @@ namespace repl {
          */
         HeartbeatResponseAction _updateHeartbeatDataImpl(
                 int updatedConfigIndex,
+                const MemberState& originalState,
                 Date_t now,
-                const OpTime& lastOpApplied);
+                const Timestamp& lastOpApplied);
 
         /**
          * Updates _hbdata based on the newConfig, ensuring that every member in the newConfig
@@ -308,6 +322,14 @@ namespace repl {
 
         MemberState _getMyState() const;
 
+        /**
+         * Looks up the provided member in the blacklist and returns true if the member's blacklist
+         * expire time is after 'now'.  If the member is found but the expire time is before 'now',
+         * the function returns false.  If the member is not found in the blacklist, the function
+         * returns false.
+         **/
+        bool _memberIsBlacklisted(const MemberConfig& memberConfig, Date_t now) const;
+
         // This node's role in the replication protocol.
         Role _role;
 
@@ -315,7 +337,11 @@ namespace repl {
         // result of an election.
         OID _electionId;
         // The time at which the current PRIMARY was elected.
-        OpTime _electionTime;
+        Timestamp _electionTime;
+
+        // This node's election term.  The term is used as part of the consensus algorithm to elect
+        // and maintain one primary (leader) node in the cluster.
+        long long _term = -1;
 
         // the index of the member we currently believe is primary, if one exists, otherwise -1
         int _currentPrimaryIndex;
@@ -341,7 +367,8 @@ namespace repl {
 
         int _selfIndex; // this node's index in _members and _currentConfig
 
-        ReplicaSetConfig _currentConfig; // The current config, including a vector of MemberConfigs
+        ReplicaSetConfig _rsConfig; // The current config, including a vector of MemberConfigs
+
         // heartbeat data for each member.  It is guaranteed that this vector will be maintained
         // in the same order as the MemberConfigs in _currentConfig, therefore the member config
         // index can be used to index into this vector as well.
@@ -372,15 +399,18 @@ namespace repl {
         PingMap _pings;
 
         // Last vote info from the election
-        struct LastVote {
+        struct VoteLease {
 
             static const Seconds leaseTime;
 
-            LastVote() : when(0), whoId(-1) { }
+            VoteLease() : when(0), whoId(-1) { }
             Date_t when;
             int whoId;
             HostAndPort whoHostAndPort;
-        } _lastVote;
+        } _voteLease;
+
+        // V1 last vote info for elections
+        LastVote _lastVote;
 
     };
 

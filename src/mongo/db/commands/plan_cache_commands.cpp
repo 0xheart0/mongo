@@ -30,23 +30,26 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <sstream>
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
-#include "mongo/db/client.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/commands/plan_cache_commands.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/plan_cache_commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/util/log.h"
 
 namespace {
 
+    using boost::scoped_ptr;
     using std::string;
     using namespace mongo;
 
@@ -121,8 +124,12 @@ namespace mongo {
           helpText(helpText),
           actionType(actionType) { }
 
-    bool PlanCacheCommand::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
-                               string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+    bool PlanCacheCommand::run(OperationContext* txn,
+                               const string& dbname,
+                               BSONObj& cmdObj,
+                               int options,
+                               string& errmsg,
+                               BSONObjBuilder& result) {
         string ns = parseNs(dbname, cmdObj);
 
         Status status = runPlanCacheCommand(txn, ns, cmdObj, &result);
@@ -152,7 +159,7 @@ namespace mongo {
     Status PlanCacheCommand::checkAuthForCommand(ClientBasic* client,
                                                  const std::string& dbname,
                                                  const BSONObj& cmdObj) {
-        AuthorizationSession* authzSession = client->getAuthorizationSession();
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
         ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
         if (authzSession->isAuthorizedForActionsOnResource(pattern, actionType)) {
@@ -417,14 +424,10 @@ namespace mongo {
             statsBob.doneFast();
             reasonBob.doneFast();
 
-            // BSON object for 'feedback' field is created from query executions
-            // and shows number of executions since this cached solution was
-            // created as well as score data (average and standard deviation).
+            // BSON object for 'feedback' field shows scores from historical executions of the plan.
             BSONObjBuilder feedbackBob(planBob.subobjStart("feedback"));
             if (i == 0U) {
                 feedbackBob.append("nfeedback", int(entry->feedback.size()));
-                feedbackBob.append("averageScore", entry->averageScore.get_value_or(0));
-                feedbackBob.append("stdDevScore",entry->stddevScore.get_value_or(0));
                 BSONArrayBuilder scoresBob(feedbackBob.subarrayStart("scores"));
                 for (size_t i = 0; i < entry->feedback.size(); ++i) {
                     BSONObjBuilder scoreBob(scoresBob.subobjStart());

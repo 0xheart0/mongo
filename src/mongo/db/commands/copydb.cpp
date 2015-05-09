@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -49,11 +49,13 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     /* Usage:
      * admindb.$cmd.findOne( { copydb: 1, fromhost: <connection string>, fromdb: <db>,
@@ -124,8 +126,7 @@ namespace mongo {
                          BSONObj& cmdObj,
                          int,
                          string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+                         BSONObjBuilder& result) {
 
             string fromhost = cmdObj.getStringField("fromhost");
             bool fromSelf = fromhost.empty();
@@ -138,7 +139,6 @@ namespace mongo {
 
             CloneOptions cloneOptions;
             cloneOptions.fromDB = cmdObj.getStringField("fromdb");
-            cloneOptions.logForRepl = !fromRepl;
             cloneOptions.slaveOk = cmdObj["slaveOk"].trueValue();
             cloneOptions.useReplAuth = false;
             cloneOptions.snapshot = true;

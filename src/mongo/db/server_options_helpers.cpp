@@ -36,11 +36,14 @@
 #define SYSLOG_NAMES
 #include <syslog.h>
 #endif
+#include <ios>
+#include <iostream>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/logger/log_component.h"
@@ -53,6 +56,7 @@
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 
+using std::endl;
 using std::string;
 
 namespace mongo {
@@ -111,13 +115,13 @@ namespace {
     Status addGeneralServerOptions(moe::OptionSection* options) {
         StringBuilder portInfoBuilder;
         StringBuilder maxConnInfoBuilder;
-        StringBuilder unixSockPermsBuilder;
+        std::stringstream unixSockPermsBuilder;
 
         portInfoBuilder << "specify port number - " << ServerGlobalParams::DefaultDBPort << " by default";
         maxConnInfoBuilder << "max number of simultaneous connections - "
                            << DEFAULT_MAX_CONN << " by default";
         unixSockPermsBuilder << "permissions to set on UNIX domain socket file - " 
-                             << DEFAULT_UNIX_PERMS << " by default";
+                             << "0" << std::oct << DEFAULT_UNIX_PERMS << " by default";
 
         options->addOptionChaining("help", "help,h", moe::Switch, "show this usage information")
                                   .setSources(moe::SourceAllLegacy);
@@ -275,7 +279,7 @@ namespace {
                 moe::String, "alternative directory for UNIX domain sockets (defaults to /tmp)");
 
         options->addOptionChaining("net.unixDomainSocket.filePermissions", "filePermissions", 
-                moe::Int, unixSockPermsBuilder.str().c_str() );
+                moe::Int, unixSockPermsBuilder.str() );
 
         options->addOptionChaining("processManagement.fork", "fork", moe::Switch,
                 "fork server process");
@@ -468,12 +472,38 @@ namespace {
         }
 #endif
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         Status ret = validateSSLServerOptions(params);
         if (!ret.isOK()) {
             return ret;
         }
 #endif
+
+        bool haveAuthenticationMechanisms = true;
+        bool hasAuthorizationEnabled = false;
+        if (params.count("security.authenticationMechanisms") &&
+            params["security.authenticationMechanisms"].as<std::vector<std::string> >().empty()) {
+            haveAuthenticationMechanisms = false;
+        }
+        if (params.count("setParameter")) {
+            std::map<std::string, std::string> parameters =
+                params["setParameter"].as<std::map<std::string, std::string> >();
+            auto authMechParameter = parameters.find("authenticationMechanisms");
+            if (authMechParameter != parameters.end() && authMechParameter->second.empty()) {
+                haveAuthenticationMechanisms = false;
+            }
+        }
+        if ((params.count("security.authorization") &&
+            params["security.authorization"].as<std::string>() == "enabled") ||
+            params.count("security.clusterAuthMode") ||
+            params.count("security.keyFile") ||
+            params.count("auth")) {
+            hasAuthorizationEnabled = true;
+        }
+        if (hasAuthorizationEnabled && !haveAuthenticationMechanisms) {
+            return Status(ErrorCodes::BadValue,
+                          "Authorization is enabled but no authentication mechanisms are present.");
+        }
 
         return Status::OK();
     }
@@ -939,7 +969,7 @@ namespace {
                 (ServerGlobalParams::ClusterAuthMode_keyFile);
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         ret = storeSSLServerOptions(params);
         if (!ret.isOK()) {
             return ret;
@@ -948,8 +978,5 @@ namespace {
 
         return Status::OK();
     }
-
-    // FIXME: This function will not return the correct value if someone renames the mongos binary
-    bool isMongos() { return serverGlobalParams.binaryName == "mongos"; }
 
 } // namespace mongo

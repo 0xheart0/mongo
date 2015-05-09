@@ -52,16 +52,13 @@ namespace mongo {
             engine("mmapv1"),
             dbpath(kDefaultDbPath),
             upgrade(false),
-            repair(false) {
+            repair(false),
+            noTableScan(false),
+            directoryperdb(false),
+            syncdelay(60.0) {
             dur = false;
-#if defined(_DURABLEDEFAULTON)
-            dur = true;
-#endif
             if (sizeof(void*) == 8)
                 dur = true;
-#if defined(_DURABLEDEFAULTOFF)
-            dur = false;
-#endif
         }
 
         // --storageEngine
@@ -92,12 +89,21 @@ namespace mongo {
         // --notablescan
         // no table scans allowed
         bool noTableScan;
+
+        // --directoryperdb
+        // Stores each database’s files in its own folder in the data directory.
+        // When applied to an existing system, the directoryPerDB option alters
+        // the storage pattern of the data directory.
+        bool directoryperdb;
+
+        // --syncdelay
+        // Controls how much time can pass before MongoDB flushes data to the data files
+        // via an fsync operation.
+        // Do not set this value on production systems.
+        // In almost every situation, you should use the default setting.
+        double syncdelay;      // seconds between fsyncs
     };
 
     extern StorageGlobalParams storageGlobalParams;
-
-    // This is not really related to persistence, but mongos and the other executables share code
-    // and we use this function to determine at runtime which executable we are in.
-    bool isMongos();
 
 } // namespace mongo

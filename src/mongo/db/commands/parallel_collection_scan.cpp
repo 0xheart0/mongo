@@ -33,11 +33,15 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/multi_iterator.h"
 #include "mongo/util/touch_pages.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::string;
 
     class ParallelCollectionScanCmd : public Command {
     public:
@@ -63,14 +67,17 @@ namespace mongo {
             ActionSet actions;
             actions.addAction(ActionType::find);
             Privilege p(parseResourcePattern(dbname, cmdObj), actions);
-            if ( client->getAuthorizationSession()->isAuthorizedForPrivilege(p) )
+            if ( AuthorizationSession::get(client)->isAuthorizedForPrivilege(p) )
                 return Status::OK();
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
-                          string& errmsg, BSONObjBuilder& result,
-                          bool fromRepl = false ) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int options,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
 
             NamespaceString ns( dbname, cmdObj[name].String() );
 
@@ -114,7 +121,7 @@ namespace mongo {
                 // We have to deregister it, as it will be registered with ClientCursor.
                 curExec->deregisterExec();
 
-                // Need to save state while yielding locks between now and newGetMore.
+                // Need to save state while yielding locks between now and getMore().
                 curExec->saveState();
 
                 execs.push_back(curExec.release());
@@ -137,18 +144,15 @@ namespace mongo {
                 for (size_t i = 0; i < execs.size(); i++) {
                     // transfer ownership of an executor to the ClientCursor (which manages its own
                     // lifetime).
-                    ClientCursor* cc = new ClientCursor( collection, execs.releaseAt(i) );
+                    ClientCursor* cc = new ClientCursor( collection->getCursorManager(),
+                                                         execs.releaseAt(i),
+                                                         ns.ns() );
 
-                    // we are mimicking the aggregation cursor output here
-                    // that is why there are ns, ok and empty firstBatch
                     BSONObjBuilder threadResult;
-                    {
-                        BSONObjBuilder cursor;
-                        cursor.appendArray( "firstBatch", BSONObj() );
-                        cursor.append( "ns", ns );
-                        cursor.append( "id", cc->cursorid() );
-                        threadResult.append( "cursor", cursor.obj() );
-                    }
+                    appendCursorResponseObject( cc->cursorid(),
+                                                ns.ns(),
+                                                BSONArray(),
+                                                &threadResult );
                     threadResult.appendBool( "ok", 1 );
 
                     bucketsBuilder.append( threadResult.obj() );

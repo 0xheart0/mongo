@@ -28,20 +28,22 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <sstream>
 
-#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/base/init.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
-#include "mongo/db/client.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/index_filter_commands.h"
 #include "mongo/db/commands/plan_cache_commands.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_parser.h"
 
 
 namespace {
@@ -124,8 +126,12 @@ namespace mongo {
         : Command(name),
           helpText(helpText) { }
 
-    bool IndexFilterCommand::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
-                           string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+    bool IndexFilterCommand::run(OperationContext* txn,
+                                 const string& dbname,
+                                 BSONObj& cmdObj,
+                                 int options,
+                                 string& errmsg,
+                                 BSONObjBuilder& result) {
         string ns = parseNs(dbname, cmdObj);
 
         Status status = runIndexFilterCommand(txn, ns, cmdObj, &result);
@@ -155,7 +161,7 @@ namespace mongo {
     Status IndexFilterCommand::checkAuthForCommand(ClientBasic* client,
                                                    const std::string& dbname,
                                                    const BSONObj& cmdObj) {
-        AuthorizationSession* authzSession = client->getAuthorizationSession();
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
         ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
 
         if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::planCacheIndexFilter)) {
@@ -269,7 +275,7 @@ namespace mongo {
             }
 
             scoped_ptr<CanonicalQuery> cq(cqRaw);
-            querySettings->removeAllowedIndices(*cq);
+            querySettings->removeAllowedIndices(planCache->computeKey(*cq));
 
             // Remove entry from plan cache
             planCache->remove(*cq);
@@ -385,7 +391,7 @@ namespace mongo {
         scoped_ptr<CanonicalQuery> cq(cqRaw);
 
         // Add allowed indices to query settings, overriding any previous entries.
-        querySettings->setAllowedIndices(*cq, indexes);
+        querySettings->setAllowedIndices(*cq, planCache->computeKey(*cq), indexes);
 
         // Remove entry from plan cache.
         planCache->remove(*cq);

@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -6,18 +7,9 @@
  */
 
 /*
- * XXX
- * The server threads use their own WT_SESSION_IMPL handles because they may
- * want to block (for example, the eviction server calls reconciliation, and
- * some of the reconciliation diagnostic code reads pages), and the user's
- * session handle is already blocking on a server thread.  The problem is the
- * server thread needs to reference the correct btree handle, and that's
- * hanging off the application's thread of control.  For now, I'm just making
- * it obvious where that's getting done.
+ * Helpers for calling a function with a data handle in session->dhandle
+ * then restoring afterwards.
  */
-#define	WT_SET_BTREE_IN_SESSION(s, b)	((s)->dhandle = b->dhandle)
-#define	WT_CLEAR_BTREE_IN_SESSION(s)	((s)->dhandle = NULL)
-
 #define	WT_WITH_DHANDLE(s, d, e) do {					\
 	WT_DATA_HANDLE *__saved_dhandle = (s)->dhandle;			\
 	(s)->dhandle = (d);						\
@@ -27,13 +19,23 @@
 
 #define	WT_WITH_BTREE(s, b, e)	WT_WITH_DHANDLE(s, (b)->dhandle, e)
 
+/* Call a function without the caller's data handle, restore afterwards. */
+#define	WT_WITHOUT_DHANDLE(s, e) WT_WITH_DHANDLE(s, NULL, e)
+
+/*
+ * Call a function with the caller's data handle, restore it afterwards in case
+ * it is overwritten.
+ */
+#define	WT_SAVE_DHANDLE(s, e) WT_WITH_DHANDLE(s, (s)->dhandle, e)
+
 /*
  * WT_DATA_HANDLE --
  *	A handle for a generic named data source.
  */
 struct __wt_data_handle {
 	WT_RWLOCK *rwlock;		/* Lock for shared/exclusive ops */
-	SLIST_ENTRY(__wt_data_handle) l;/* Linked list of handles */
+	SLIST_ENTRY(__wt_data_handle) l;
+	SLIST_ENTRY(__wt_data_handle) hashl;
 
 	/*
 	 * Sessions caching a connection's data handle will have a non-zero
@@ -63,10 +65,10 @@ struct __wt_data_handle {
 	WT_DSRC_STATS stats;		/* Data-source statistics */
 
 	/* Flags values over 0xff are reserved for WT_BTREE_* */
-#define	WT_DHANDLE_DISCARD	        0x01	/* Discard on release */
-#define	WT_DHANDLE_DISCARD_CLOSE	0x02	/* Close on release */
-#define	WT_DHANDLE_EXCLUSIVE	        0x04	/* Need exclusive access */
-#define	WT_DHANDLE_HAVE_REF		0x08	/* Already have ref */
+#define	WT_DHANDLE_DEAD		        0x01	/* Dead, awaiting discard */
+#define	WT_DHANDLE_DISCARD	        0x02	/* Discard on release */
+#define	WT_DHANDLE_DISCARD_FORCE	0x04	/* Force discard on release */
+#define	WT_DHANDLE_EXCLUSIVE	        0x08	/* Need exclusive access */
 #define	WT_DHANDLE_LOCK_ONLY	        0x10	/* Handle only used as a lock */
 #define	WT_DHANDLE_OPEN		        0x20	/* Handle is open */
 	uint32_t flags;

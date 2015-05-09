@@ -11,8 +11,8 @@
     replTest.initiate({"_id": name,
                        "members": [
                            { "_id": 0, "host": nodes[0], priority: 3 },
-                           { "_id": 1, "host": nodes[1] },
-                           { "_id": 2, "host": nodes[2] }],
+                           { "_id": 1, "host": nodes[1], priority: 0 },
+                           { "_id": 2, "host": nodes[2], priority: 0 }],
                       });
 
     var master = replTest.getMaster();
@@ -44,6 +44,6 @@
             return (slaves[1].getDB("foo").bar.count() === 2);
         }, "slave should have caught up after syncing to primary.");
 
-    assert.commandWorked(slaves[0].getDB("admin").$cmd.sys.unlock.findOne());
+    assert.commandWorked(slaves[0].getDB("admin").fsyncUnlock());
     replTest.stopSet();
 }());

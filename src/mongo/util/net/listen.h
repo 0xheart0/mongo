@@ -29,12 +29,15 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/condition_variable.hpp>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "mongo/config.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/net/sock.h"
@@ -116,7 +119,7 @@ namespace mongo {
         // Boolean that indicates whether this Listener is ready to accept incoming network requests
         bool _ready;
         
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         SSLManagerInterface* _ssl;
 #endif
         
@@ -140,26 +143,25 @@ namespace mongo {
     class ListeningSockets {
     public:
         ListeningSockets()
-            : _mutex("ListeningSockets")
-            , _sockets( new std::set<int>() )
+            : _sockets( new std::set<int>() )
             , _socketPaths( new std::set<std::string>() )
         { }
         void add( int sock ) {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             _sockets->insert( sock );
         }
         void addPath( const std::string& path ) {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             _socketPaths->insert( path );
         }
         void remove( int sock ) {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             _sockets->erase( sock );
         }
         void closeAll();
         static ListeningSockets* get();
     private:
-        mongo::mutex _mutex;
+        boost::mutex _mutex;
         std::set<int>* _sockets;
         std::set<std::string>* _socketPaths; // for unix domain sockets
         static ListeningSockets* _instance;

@@ -34,9 +34,15 @@ Mongo.prototype.getSlaveOk = function() {
 }
 
 Mongo.prototype.getDB = function( name ){
-    if ((jsTest.options().keyFile || jsTest.options().useX509) && 
+    if ((jsTest.options().keyFile) &&
          ((typeof this.authenticated == 'undefined') || !this.authenticated)) {
         jsTest.authenticate(this)
+    }
+    // There is a weird issue where typeof(db._name) !== "string" when the db name
+    // is created from objects returned from native C++ methods.
+    // This hack ensures that the db._name is always a string.
+    if (typeof(name) === "object") {
+        name = name.toString();
     }
     return new DB( this , name );
 }
@@ -120,6 +126,17 @@ Mongo.prototype.tojson = Mongo.prototype.toString;
  *     Note that this object only keeps a shallow copy of this array.
  */
 Mongo.prototype.setReadPref = function (mode, tagSet) {
+    if ((this._readPrefMode === "primary") &&
+        (typeof(tagSet) !== "undefined") &&
+        (Object.keys(tagSet).length > 0)) {
+        // we allow empty arrays/objects or no tagSet for compatibility reasons
+        throw Error("Can not supply tagSet with readPref mode primary");
+    }
+    this._setReadPrefUnsafe(mode, tagSet);
+};
+
+// Set readPref without validating. Exposed so we can test the server's readPref validation.
+Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet) {
     this._readPrefMode = mode;
     this._readPrefTagSet = tagSet;
 };
@@ -130,6 +147,24 @@ Mongo.prototype.getReadPrefMode = function () {
 
 Mongo.prototype.getReadPrefTagSet = function () {
     return this._readPrefTagSet;
+};
+
+// Returns a readPreference object of the type expected by mongos.
+Mongo.prototype.getReadPref = function () {
+    var obj = {}, mode, tagSet;
+    if (typeof(mode = this.getReadPrefMode()) === "string") {
+        obj.mode = mode;
+    }
+    else {
+        return null;
+    }
+    // Server Selection Spec: - if readPref mode is "primary" then the tags field MUST
+    // be absent. Ensured by setReadPref.
+    if (Array.isArray(tagSet = this.getReadPrefTagSet())) {
+        obj.tags = tagSet;
+    }
+
+    return obj;
 };
 
 connect = function(url, user, pass) {
@@ -252,7 +287,32 @@ Mongo.prototype.writeMode = function() {
     return this._writeMode;
 };
 
+//
+// Whether to use find command versus OP_QUERY style find.
+//
 
+Mongo.prototype.useFindCommand = function() {
+    return (this.readMode() === "commands");
+}
+
+Mongo.prototype.readMode = function() {
+    if ("_readMode" in this) {
+        // We already have determined our read mode. Just return it.
+        return this._readMode;
+    }
+
+    // Determine read mode based on shell params.
+    //
+    // TODO: Detect what to use based on wire protocol version.
+    if (_readMode) {
+        this._readMode = _readMode();
+    }
+    else {
+        this._readMode = "compatibility";
+    }
+
+    return this._readMode;
+}
 
 //
 // Write Concern can be set at the connection level, and is used for all write operations unless

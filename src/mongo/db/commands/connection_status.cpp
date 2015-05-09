@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#include <mongo/pch.h>
+#include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -34,6 +34,10 @@
 #include "mongo/db/commands.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
+
     class CmdConnectionStatus : public Command {
     public:
         CmdConnectionStatus() : Command("connectionStatus") {}
@@ -48,9 +52,9 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg,
-                 BSONObjBuilder& result, bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationSession* authSession =
-                    ClientBasic::getCurrent()->getAuthorizationSession();
+                    AuthorizationSession::get(ClientBasic::getCurrent());
 
             bool showPrivileges;
             Status status = bsonExtractBooleanFieldWithDefault(cmdObj,

@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
@@ -36,6 +36,8 @@
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
 
     const char DocumentSourceSkip::skipName[] = "$skip";
 
@@ -79,6 +81,10 @@ namespace mongo {
 
     Value DocumentSourceSkip::serialize(bool explain) const {
         return Value(DOC(getSourceName() << _skip));
+    }
+
+    intrusive_ptr<DocumentSource> DocumentSourceSkip::optimize() {
+        return _skip == 0 ? nullptr : this;
     }
 
     intrusive_ptr<DocumentSourceSkip> DocumentSourceSkip::create(

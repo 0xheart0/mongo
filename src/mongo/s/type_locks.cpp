@@ -32,6 +32,8 @@
 
 namespace mongo {
 
+    using std::string;
+
     using mongoutils::str::stream;
 
     const std::string LocksType::ConfigNS = "config.locks";
@@ -67,7 +69,7 @@ namespace mongo {
         }
 
         // If the lock is locked check the remaining fields
-        if (_state != 0) {
+        if (_state != UNLOCKED) {
             if (!_isProcessSet) {
                 *errMsg = stream() << "missing " << process.name() << " field";
                 return false;
@@ -144,7 +146,7 @@ namespace mongo {
         _name.clear();
         _isNameSet = false;
 
-        _state = 0;
+        _state = UNLOCKED;
         _isStateSet = false;
 
         _process.clear();

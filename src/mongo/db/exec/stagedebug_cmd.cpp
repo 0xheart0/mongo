@@ -26,12 +26,16 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
+#include "mongo/base/init.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/commands.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
 #include "mongo/db/exec/collection_scan.h"
@@ -50,6 +54,10 @@
 #include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::string;
+    using std::vector;
 
     /**
      * A command for manually constructing a query tree and running it.
@@ -90,22 +98,24 @@ namespace mongo {
     public:
         StageDebugCmd() : Command("stageDebug") { }
 
-        // Boilerplate for commands
         virtual bool isWriteCommandForConfigServer() const { return false; }
-        bool slaveOk() const { return true; }
-        bool slaveOverrideOk() const { return true; }
+        bool slaveOk() const { return false; }
+        bool slaveOverrideOk() const { return false; }
         void help(std::stringstream& h) const { }
 
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::find);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+            // Command is testing-only, and can only be enabled at command line.  Hence, no auth
+            // check needed.
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result,
-                 bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             BSONElement argElt = cmdObj["stageDebug"];
             if (argElt.eoo() || !argElt.isABSONObj()) { return false; }
             BSONObj argObj = argElt.Obj();
@@ -123,11 +133,11 @@ namespace mongo {
             //      execution trees.
             ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
-            Client::Context ctx(txn, dbname);
+            OldClientContext ctx(txn, dbname);
 
             // Make sure the collection is valid.
             Database* db = ctx.db();
-            Collection* collection = db->getCollection(txn, db->name() + '.' + collName);
+            Collection* collection = db->getCollection(db->name() + '.' + collName);
             uassert(17446, "Couldn't find the collection " + collName, NULL != collection);
 
             // Pull out the plan
@@ -150,7 +160,7 @@ namespace mongo {
 
             PlanExecutor* rawExec;
             Status execStatus = PlanExecutor::make(txn, ws.release(), rootFetch, collection,
-                                                   PlanExecutor::YIELD_MANUAL, &rawExec);
+                                                   PlanExecutor::YIELD_AUTO, &rawExec);
             fassert(28536, execStatus);
             boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
@@ -415,6 +425,7 @@ namespace mongo {
 
                 if (!params.query.parse(search,
                                         fam->getSpec().defaultLanguage().str().c_str(),
+                                        fts::FTSQuery::caseSensitiveDefault,
                                         fam->getSpec().getTextIndexVersion()).isOK()) {
                     return NULL;
                 }
@@ -444,6 +455,14 @@ namespace mongo {
                 return NULL;
             }
         }
-    } stageDebugCmd;
+    };
+
+    MONGO_INITIALIZER(RegisterStageDebugCmd)(InitializerContext* context) {
+        if (Command::testCommandsEnabled) {
+            // Leaked intentionally: a Command registers itself when constructed.
+            new StageDebugCmd();
+        }
+        return Status::OK();
+    }
 
 }  // namespace mongo

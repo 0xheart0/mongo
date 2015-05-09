@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -28,7 +29,7 @@ __bloom_init(WT_SESSION_IMPL *session,
 
 	*bloomp = NULL;
 
-	WT_RET(__wt_calloc_def(session, 1, &bloom));
+	WT_RET(__wt_calloc_one(session, &bloom));
 
 	WT_ERR(__wt_strdup(session, uri, &bloom->uri));
 	len = strlen(WT_BLOOM_TABLE_CONFIG) + 2;
@@ -123,7 +124,7 @@ __bloom_open_cursor(WT_BLOOM *bloom, WT_CURSOR *owner)
 		return (0);
 
 	session = bloom->session;
-	cfg[0] = WT_CONFIG_BASE(session, session_open_cursor);
+	cfg[0] = WT_CONFIG_BASE(session, WT_SESSION_open_cursor);
 	cfg[1] = bloom->config;
 	cfg[2] = NULL;
 	c = NULL;

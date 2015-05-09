@@ -29,22 +29,25 @@
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/keep_mutations.h"
 #include "mongo/db/exec/count_scan.h"
+#include "mongo/db/exec/keep_mutations.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_registry.h"
 #include "mongo/util/fail_point_service.h"
 
 namespace QueryStageCountScan {
+
+    using boost::shared_ptr;
 
     class CountBase {
     public:
@@ -53,7 +56,7 @@ namespace QueryStageCountScan {
         }
 
         virtual ~CountBase() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
@@ -88,7 +91,7 @@ namespace QueryStageCountScan {
         }
 
         IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
-            Collection* collection = db->getCollection(&_txn, ns());
+            Collection* collection = db->getCollection(ns());
             return collection->getIndexCatalog()->findIndexByKeyPattern(&_txn, obj);
         }
 
@@ -108,7 +111,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanDups : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert some docs
             insert(BSON("a" << BSON_ARRAY(5 << 7)));
@@ -140,7 +143,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanInclusiveBounds : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert some docs
             for (int i = 0; i < 10; ++i) {
@@ -172,7 +175,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanExclusiveBounds : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert some docs
             for (int i = 0; i < 10; ++i) {
@@ -204,7 +207,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanLowerBound : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert doc, add index
             insert(BSON("a" << 2));
@@ -232,7 +235,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanNothingInInterval : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert documents, add index
             insert(BSON("a" << 2));
@@ -262,7 +265,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanNothingInIntervalFirstMatchTooHigh : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert some documents, add index
             insert(BSON("a" << 2));
@@ -292,7 +295,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanNoChangeDuringYield : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert documents, add index
             for (int i = 0; i < 10; ++i) {
@@ -302,7 +305,7 @@ namespace QueryStageCountScan {
 
             // Set up count stage
             CountScanParams params;
-            params.descriptor = getIndex(ctx.ctx().db(), BSON("a" << 1));
+            params.descriptor = getIndex(ctx.db(), BSON("a" << 1));
             params.startKey = BSON("" << 2);
             params.startKeyInclusive = false;
             params.endKey = BSON("" << 6);
@@ -343,7 +346,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanDeleteDuringYield : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert documents, add index
             for (int i = 0; i < 10; ++i) {
@@ -353,7 +356,7 @@ namespace QueryStageCountScan {
 
             // Set up count stage
             CountScanParams params;
-            params.descriptor = getIndex(ctx.ctx().db(), BSON("a" << 1));
+            params.descriptor = getIndex(ctx.db(), BSON("a" << 1));
             params.startKey = BSON("" << 2);
             params.startKeyInclusive = false;
             params.endKey = BSON("" << 6);
@@ -397,7 +400,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanInsertNewDocsDuringYield : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert documents, add index
             for (int i = 0; i < 10; ++i) {
@@ -407,7 +410,7 @@ namespace QueryStageCountScan {
 
             // Set up count stage
             CountScanParams params;
-            params.descriptor = getIndex(ctx.ctx().db(), BSON("a" << 1));
+            params.descriptor = getIndex(ctx.db(), BSON("a" << 1));
             params.startKey = BSON("" << 2);
             params.startKeyInclusive = false;
             params.endKey = BSON("" << 6);
@@ -454,7 +457,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanBecomesMultiKeyDuringYield : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert documents, add index
             for (int i = 0; i < 10; ++i) {
@@ -464,7 +467,7 @@ namespace QueryStageCountScan {
 
             // Set up count stage
             CountScanParams params;
-            params.descriptor = getIndex(ctx.ctx().db(), BSON("a" << 1));
+            params.descriptor = getIndex(ctx.db(), BSON("a" << 1));
             params.startKey = BSON("" << 2);
             params.startKeyInclusive = false;
             params.endKey = BSON("" << 50);
@@ -507,7 +510,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanUnusedKeys : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert docs, add index
             for (int i = 0; i < 10; ++i) {
@@ -522,7 +525,7 @@ namespace QueryStageCountScan {
 
             // Ensure that count does not include unused keys
             CountScanParams params;
-            params.descriptor = getIndex(ctx.ctx().db(), BSON("a" << 1));
+            params.descriptor = getIndex(ctx.db(), BSON("a" << 1));
             params.startKey = BSON("" << 1);
             params.startKeyInclusive = true;
             params.endKey = BSON("" << 1);
@@ -542,7 +545,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanUnusedEndKey : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert docs, add index
             for (int i = 0; i < 10; ++i) {
@@ -555,7 +558,7 @@ namespace QueryStageCountScan {
 
             // Run count and check
             CountScanParams params;
-            params.descriptor = getIndex(ctx.ctx().db(), BSON("a" << 1));
+            params.descriptor = getIndex(ctx.db(), BSON("a" << 1));
             params.startKey = BSON("" << 0);
             params.startKeyInclusive = true;
             params.endKey = BSON("" << 2);
@@ -575,7 +578,7 @@ namespace QueryStageCountScan {
     class QueryStageCountScanKeyBecomesUnusedDuringYield : public CountBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             // Insert documents, add index
             for (int i = 0; i < 10; ++i) {

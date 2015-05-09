@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -35,7 +36,7 @@ __wt_block_salvage_start(WT_SESSION_IMPL *session, WT_BLOCK *block)
 	if (block->fh->size > allocsize) {
 		len = (block->fh->size / allocsize) * allocsize;
 		if (len != block->fh->size)
-			WT_RET(__wt_ftruncate(session, block->fh, len));
+			WT_RET(__wt_block_truncate(session, block->fh, len));
 	} else
 		len = allocsize;
 	block->live.file_size = len;
@@ -154,7 +155,7 @@ __wt_block_salvage_next(WT_SESSION_IMPL *session,
 	*addr_sizep = WT_PTRDIFF(endp, addr);
 
 done:
-err:	__wt_scr_free(&tmp);
+err:	__wt_scr_free(session, &tmp);
 	return (ret);
 }
 

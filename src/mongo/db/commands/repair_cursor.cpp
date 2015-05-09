@@ -34,9 +34,13 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cursor_responses.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/multi_iterator.h"
 
 namespace mongo {
+
+    using std::string;
 
     class RepairCursorCmd : public Command {
     public:
@@ -51,14 +55,17 @@ namespace mongo {
             ActionSet actions;
             actions.addAction(ActionType::find);
             Privilege p(parseResourcePattern(dbname, cmdObj), actions);
-            if (client->getAuthorizationSession()->isAuthorizedForPrivilege(p))
+            if (AuthorizationSession::get(client)->isAuthorizedForPrivilege(p))
                 return Status::OK();
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        virtual bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int options,
-                          string& errmsg, BSONObjBuilder& result,
-                          bool fromRepl = false ) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int options,
+                         string& errmsg,
+                         BSONObjBuilder& result) {
 
             NamespaceString ns(parseNs(dbname, cmdObj));
 
@@ -94,7 +101,7 @@ namespace mongo {
             invariant(execStatus.isOK());
             std::auto_ptr<PlanExecutor> exec(rawExec);
 
-            // 'exec' will be used in newGetMore(). It was automatically registered on construction
+            // 'exec' will be used in getMore(). It was automatically registered on construction
             // due to the auto yield policy, so it could yield during plan selection. We deregister
             // it now so that it can be registed with ClientCursor.
             exec->deregisterExec();
@@ -102,13 +109,11 @@ namespace mongo {
 
             // ClientCursors' constructor inserts them into a global map that manages their
             // lifetimes. That is why the next line isn't leaky.
-            ClientCursor* cc = new ClientCursor(collection, exec.release());
+            ClientCursor* cc = new ClientCursor(collection->getCursorManager(),
+                                                exec.release(),
+                                                ns.ns());
 
-            BSONObjBuilder cursorObj(result.subobjStart("cursor"));
-            cursorObj.append("id", cc->cursorid());
-            cursorObj.append("ns", ns);
-            cursorObj.append("firstBatch", BSONArray());
-            cursorObj.done();
+            appendCursorResponseObject(cc->cursorid(), ns.ns(), BSONArray(), &result);
 
             return true;
 

@@ -1,4 +1,5 @@
 /*-
+ * Public Domain 2014-2015 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -38,9 +39,6 @@
  * is being built into the WiredTiger library.
  */
 #include "wiredtiger_config.h"
-#ifdef _MSC_VER
-#define	inline __inline
-#endif
 
 /* Local compressor structure. */
 typedef struct {
@@ -62,6 +60,7 @@ wt_snappy_error(WT_COMPRESSOR *compressor,
 
 	wt_api = ((SNAPPY_COMPRESSOR *)compressor)->wt_api;
 
+	msg = "unknown snappy status error";
 	switch (snret) {
 	case SNAPPY_BUFFER_TOO_SMALL:
 		msg = "SNAPPY_BUFFER_TOO_SMALL";
@@ -69,9 +68,8 @@ wt_snappy_error(WT_COMPRESSOR *compressor,
 	case SNAPPY_INVALID_INPUT:
 		msg = "SNAPPY_INVALID_INPUT";
 		break;
-	default:
-		msg = "unknown error";
-		break;
+	case SNAPPY_OK:
+		return (0);
 	}
 
 	(void)wt_api->err_printf(wt_api,

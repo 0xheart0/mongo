@@ -37,10 +37,17 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/syncclusterconnection.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
-#include "mongo/s/shard.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::list;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     // ------ PoolForHost ------
 
@@ -173,8 +180,7 @@ namespace mongo {
     const int PoolForHost::kPoolSizeUnlimited(-1);
 
     DBConnectionPool::DBConnectionPool()
-        : _mutex("DBConnectionPool") , 
-          _name( "dbconnectionpool" ) , 
+        : _name( "dbconnectionpool" ) , 
           _maxPoolSize(PoolForHost::kPoolSizeUnlimited) ,
           _hooks( new list<DBConnectionHook*>() ) {
     }
@@ -182,7 +188,7 @@ namespace mongo {
     DBClientBase* DBConnectionPool::_get(const string& ident , double socketTimeout ) {
         uassert(17382, "Can't use connection pool during shutdown",
                 !inShutdown());
-        scoped_lock L(_mutex);
+        boost::lock_guard<boost::mutex> L(_mutex);
         PoolForHost& p = _pools[PoolKey(ident,socketTimeout)];
         p.setMaxPoolSize(_maxPoolSize);
         p.initializeHostName(ident);
@@ -191,7 +197,7 @@ namespace mongo {
 
     DBClientBase* DBConnectionPool::_finishCreate( const string& host , double socketTimeout , DBClientBase* conn ) {
         {
-            scoped_lock L(_mutex);
+            boost::lock_guard<boost::mutex> L(_mutex);
             PoolForHost& p = _pools[PoolKey(host,socketTimeout)];
             p.setMaxPoolSize(_maxPoolSize);
             p.initializeHostName(host);
@@ -266,7 +272,7 @@ namespace mongo {
     void DBConnectionPool::release(const string& host, DBClientBase *c) {
         onRelease(c);
 
-        scoped_lock L(_mutex);
+        boost::lock_guard<boost::mutex> L(_mutex);
         _pools[PoolKey(host,c->getSoTimeout())].done(this,c);
     }
 
@@ -276,7 +282,7 @@ namespace mongo {
     }
 
     void DBConnectionPool::flush() {
-        scoped_lock L(_mutex);
+        boost::lock_guard<boost::mutex> L(_mutex);
         for ( PoolMap::iterator i = _pools.begin(); i != _pools.end(); i++ ) {
             PoolForHost& p = i->second;
             p.flush();
@@ -284,7 +290,7 @@ namespace mongo {
     }
 
     void DBConnectionPool::clear() {
-        scoped_lock L(_mutex);
+        boost::lock_guard<boost::mutex> L(_mutex);
         LOG(2) << "Removing connections on all pools owned by " << _name  << endl;
         for (PoolMap::iterator iter = _pools.begin(); iter != _pools.end(); ++iter) {
             iter->second.clear();
@@ -292,7 +298,7 @@ namespace mongo {
     }
 
     void DBConnectionPool::removeHost( const string& host ) {
-        scoped_lock L(_mutex);
+        boost::lock_guard<boost::mutex> L(_mutex);
         LOG(2) << "Removing connections from all pools for host: " << host << endl;
         for ( PoolMap::iterator i = _pools.begin(); i != _pools.end(); ++i ) {
             const string& poolHost = i->first.ident;
@@ -344,7 +350,7 @@ namespace mongo {
         
         BSONObjBuilder bb( b.subobjStart( "hosts" ) );
         {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             for ( PoolMap::iterator i=_pools.begin(); i!=_pools.end(); ++i ) {
                 if ( i->second.numCreated() == 0 )
                     continue;
@@ -441,7 +447,7 @@ namespace mongo {
         }
 
         {
-            scoped_lock sl(_mutex);
+            boost::lock_guard<boost::mutex> sl(_mutex);
             PoolForHost& pool = _pools[PoolKey(hostName, conn->getSoTimeout())];
             if (pool.isBadSocketCreationTime(conn->getSockCreationMicroSec())) {
                 return false;
@@ -457,7 +463,7 @@ namespace mongo {
         {
             // we need to get the connections inside the lock
             // but we can actually delete them outside
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
             for ( PoolMap::iterator i=_pools.begin(); i!=_pools.end(); ++i ) {
                 i->second.getStaleConnections( toDelete );
             }

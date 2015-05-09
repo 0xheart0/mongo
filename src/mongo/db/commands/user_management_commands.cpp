@@ -30,8 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/commands/user_management_commands.h"
-
 #include <string>
 #include <vector>
 
@@ -41,6 +39,7 @@
 #include "mongo/bson/mutable/element.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/config.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
@@ -67,6 +66,11 @@
 namespace mongo {
 
     namespace str = mongoutils::str;
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     static void redactPasswordData(mutablebson::Element parent) {
         namespace mmb = mutablebson;
@@ -330,7 +334,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             auth::CreateOrUpdateUserArgs args;
             Status status = auth::parseCreateOrUpdateUserCommands(cmdObj,
                                                                   "createUser",
@@ -355,8 +359,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             auth::CreateOrUpdateUserArgs args;
             Status status = auth::parseCreateOrUpdateUserCommands(cmdObj,
                                                                   "createUser",
@@ -396,7 +399,7 @@ namespace mongo {
                                "\"createUser\" command requires a \"roles\" array"));
             }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
             if (args.userName.getDB() == "$external" &&
                 getSSLManager() &&
                 getSSLManager()->getSSLConfiguration()
@@ -417,26 +420,20 @@ namespace mongo {
                                   args.userName.getUser());
             userObjBuilder.append(AuthorizationManager::USER_DB_FIELD_NAME,
                                   args.userName.getDB());
+
+            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
+            int authzVersion;
+            status = authzManager->getAuthorizationVersion(txn, &authzVersion);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
+            BSONObjBuilder credentialsBuilder(userObjBuilder.subobjStart("credentials"));
             if (!args.hasHashedPassword) {
                 // Must be an external user
-                userObjBuilder.append("credentials", BSON("external" << true));
+                credentialsBuilder.append("external", true);
             }
-            else if (args.mechanism == "SCRAM-SHA-1" ||
-                     args.mechanism == "MONGODB-CR" ||
-                     args.mechanism == "CRAM-MD5" ||
-                     args.mechanism.empty()) {
-
-                // At the moment we are ignoring the mechanism parameter and create
-                // both SCRAM-SHA-1 and MONGODB-CR credentials for all new users.
-                BSONObjBuilder credentialsBuilder(userObjBuilder.subobjStart("credentials"));
-
-                AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-                int authzVersion;
-                Status status = authzManager->getAuthorizationVersion(txn, &authzVersion);
-                if (!status.isOK()) {
-                    return appendCommandStatus(result, status);
-                }
-
+            else {
                 // Add SCRAM credentials for appropriate authSchemaVersions.
                 if (authzVersion > AuthorizationManager::schemaVersion26Final) {
                     BSONObj scramCred = scram::generateCredentials(
@@ -447,14 +444,9 @@ namespace mongo {
                 else { // Otherwise default to MONGODB-CR.
                     credentialsBuilder.append("MONGODB-CR", args.hashedPassword);
                 }
-                credentialsBuilder.done();
             }
-            else {
-                return appendCommandStatus(
-                        result,
-                        Status(ErrorCodes::BadValue,
-                               "Unsupported password authentication mechanism " + args.mechanism));
-            }
+            credentialsBuilder.done();
+
             if (args.hasCustomData) {
                 userObjBuilder.append("customData", args.customData);
             }
@@ -467,7 +459,6 @@ namespace mongo {
                 return appendCommandStatus(result, status);
             }
 
-            AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Create user")) {
                 return appendCommandStatus(
@@ -525,7 +516,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             auth::CreateOrUpdateUserArgs args;
             Status status = auth::parseCreateOrUpdateUserCommands(cmdObj,
                                                                   "updateUser",
@@ -576,8 +567,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             auth::CreateOrUpdateUserArgs args;
             Status status = auth::parseCreateOrUpdateUserCommands(cmdObj,
                                                                   "updateUser",
@@ -696,7 +686,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             UserName userName;
             BSONObj unusedWriteConcern;
             Status status = auth::parseAndValidateDropUserCommand(cmdObj,
@@ -720,8 +710,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Drop user")) {
@@ -793,7 +782,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             if (!authzSession->isAuthorizedForActionsOnResource(
                     ResourcePattern::forDatabaseName(dbname), ActionType::dropUser)) {
                 return Status(ErrorCodes::Unauthorized,
@@ -807,8 +796,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Drop all users from database")) {
@@ -869,7 +857,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             std::vector<RoleName> roles;
             std::string unusedUserNameString;
             BSONObj unusedWriteConcern;
@@ -890,8 +878,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Grant roles to user")) {
@@ -967,7 +954,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             std::vector<RoleName> roles;
             std::string unusedUserNameString;
             BSONObj unusedWriteConcern;
@@ -988,8 +975,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Revoke roles from user")) {
@@ -1069,7 +1055,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             auth::UsersInfoArgs args;
             Status status = auth::parseUsersInfoCommand(cmdObj, dbname, &args);
             if (!status.isOK()) {
@@ -1104,8 +1090,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
 
             auth::UsersInfoArgs args;
             Status status = auth::parseUsersInfoCommand(cmdObj, dbname, &args);
@@ -1209,7 +1194,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             auth::CreateOrUpdateRoleArgs args;
             Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj,
                                                                   "createRole",
@@ -1239,8 +1224,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             auth::CreateOrUpdateRoleArgs args;
             Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj,
                                                                   "createRole",
@@ -1354,7 +1338,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             auth::CreateOrUpdateRoleArgs args;
             Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj,
                                                                   "updateRole",
@@ -1385,8 +1369,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             auth::CreateOrUpdateRoleArgs args;
             Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj,
                                                                   "updateRole",
@@ -1485,7 +1468,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             PrivilegeVector privileges;
             RoleName unusedRoleName;
             BSONObj unusedWriteConcern;
@@ -1507,8 +1490,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Grant privileges to role")) {
@@ -1622,7 +1604,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             PrivilegeVector privileges;
             RoleName unusedRoleName;
             BSONObj unusedWriteConcern;
@@ -1644,8 +1626,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Revoke privileges from role")) {
@@ -1761,7 +1742,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             std::vector<RoleName> roles;
             std::string unusedUserNameString;
             BSONObj unusedWriteConcern;
@@ -1782,8 +1763,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             std::string roleNameString;
             std::vector<RoleName> rolesToAdd;
             BSONObj writeConcern;
@@ -1881,7 +1861,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             std::vector<RoleName> roles;
             std::string unusedUserNameString;
             BSONObj unusedWriteConcern;
@@ -1902,8 +1882,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Revoke roles from role")) {
@@ -1998,7 +1977,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             RoleName roleName;
             BSONObj unusedWriteConcern;
             Status status = auth::parseDropRoleCommand(cmdObj,
@@ -2022,8 +2001,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             AuthzDocumentsUpdateGuard updateGuard(authzManager);
             if (!updateGuard.tryLock("Drop role")) {
@@ -2179,7 +2157,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             if (!authzSession->isAuthorizedForActionsOnResource(
                     ResourcePattern::forDatabaseName(dbname), ActionType::dropRole)) {
                 return Status(ErrorCodes::Unauthorized,
@@ -2193,8 +2171,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             BSONObj writeConcern;
             Status status = auth::parseDropAllRolesFromDatabaseCommand(cmdObj,
                                                                     dbname,
@@ -2314,7 +2291,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             auth::RolesInfoArgs args;
             Status status = auth::parseRolesInfoCommand(cmdObj, dbname, &args);
             if (!status.isOK()) {
@@ -2351,8 +2328,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
 
             auth::RolesInfoArgs args;
             Status status = auth::parseRolesInfoCommand(cmdObj, dbname, &args);
@@ -2420,7 +2396,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             if (!authzSession->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), ActionType::invalidateUserCache)) {
                 return Status(ErrorCodes::Unauthorized, "Not authorized to invalidate user cache");
@@ -2432,8 +2408,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
 
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             authzManager->invalidateUserCache();
@@ -2464,7 +2439,7 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj) {
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             if (!authzSession->isAuthorizedForActionsOnResource(
                     ResourcePattern::forClusterResource(), ActionType::internal)) {
                 return Status(ErrorCodes::Unauthorized, "Not authorized to get cache generation");
@@ -2477,8 +2452,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
 
             AuthorizationManager* authzManager = getGlobalAuthorizationManager();
             result.append("cacheGeneration", authzManager->getCacheGeneration());
@@ -2525,7 +2499,7 @@ namespace mongo {
                 return status;
             }
 
-            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            AuthorizationSession* authzSession = AuthorizationSession::get(client);
             ActionSet actions;
             actions.addAction(ActionType::createUser);
             actions.addAction(ActionType::createRole);
@@ -2671,7 +2645,7 @@ namespace mongo {
          */
         static void addUser(OperationContext* txn,
                             AuthorizationManager* authzManager,
-                            const StringData& db,
+                            StringData db,
                             bool update,
                             const BSONObj& writeConcern,
                             unordered_set<UserName>* usersToDrop,
@@ -2716,7 +2690,7 @@ namespace mongo {
          */
         static void addRole(OperationContext* txn,
                             AuthorizationManager* authzManager,
-                            const StringData& db,
+                            StringData db,
                             bool update,
                             const BSONObj& writeConcern,
                             unordered_set<RoleName>* rolesToDrop,
@@ -2755,8 +2729,8 @@ namespace mongo {
          */
         Status processUsers(OperationContext* txn,
                             AuthorizationManager* authzManager,
-                            const StringData& usersCollName,
-                            const StringData& db,
+                            StringData usersCollName,
+                            StringData db,
                             bool drop,
                             const BSONObj& writeConcern) {
             // When the "drop" argument has been provided, we use this set to store the users
@@ -2838,8 +2812,8 @@ namespace mongo {
          */
         Status processRoles(OperationContext* txn,
                             AuthorizationManager* authzManager,
-                            const StringData& rolesCollName,
-                            const StringData& db,
+                            StringData rolesCollName,
+                            StringData db,
                             bool drop,
                             const BSONObj& writeConcern) {
             // When the "drop" argument has been provided, we use this set to store the roles
@@ -2919,8 +2893,7 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
 
             auth::MergeAuthzCollectionsArgs args;
             Status status = auth::parseMergeAuthzCollectionsCommand(cmdObj, &args);
@@ -2977,27 +2950,4 @@ namespace mongo {
 
     } cmdMergeAuthzCollections;
 
-    CmdAuthSchemaUpgrade::CmdAuthSchemaUpgrade() : Command("authSchemaUpgrade") {}
-    CmdAuthSchemaUpgrade::~CmdAuthSchemaUpgrade() {}
-
-    bool CmdAuthSchemaUpgrade::slaveOk() const { return false; }
-    bool CmdAuthSchemaUpgrade::adminOnly() const { return true; }
-    bool CmdAuthSchemaUpgrade::isWriteCommandForConfigServer() const { return false; }
-
-    void CmdAuthSchemaUpgrade::help(stringstream& ss) const {
-        ss << "Upgrades the auth data storage schema";
-    }
-
-    Status CmdAuthSchemaUpgrade::checkAuthForCommand(ClientBasic* client,
-                                                         const std::string& dbname,
-                                                         const BSONObj& cmdObj) {
-
-        AuthorizationSession* authzSession = client->getAuthorizationSession();
-        if (!authzSession->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forClusterResource(), ActionType::authSchemaUpgrade)) {
-            return Status(ErrorCodes::Unauthorized,
-                          "Not authorized to run authSchemaUpgrade command.");
-        }
-        return Status::OK();
-    }
-}
+} // namespace mongo

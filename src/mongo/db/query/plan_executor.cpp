@@ -28,7 +28,12 @@
 
 #include "mongo/db/query/plan_executor.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/pipeline_proxy.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -36,12 +41,17 @@
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/storage/record_fetcher.h"
 
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
+    using std::string;
+    using std::vector;
 
     namespace {
 
@@ -146,7 +156,7 @@ namespace mongo {
           _qs(qs),
           _root(rt),
           _ns(ns),
-          _killed(false) {
+          _yieldPolicy(new PlanYieldPolicy(this, YIELD_MANUAL)) {
         // We may still need to initialize _ns from either _collection or _cq.
         if (!_ns.empty()) {
             // We already have an _ns set, so there's nothing more to do.
@@ -175,11 +185,19 @@ namespace mongo {
         }
 
         // If we didn't have to do subplanning, we might still have to do regular
-        // multi plan selection.
+        // multi plan selection...
         foundStage = getStageByType(_root.get(), STAGE_MULTI_PLAN);
         if (foundStage) {
             MultiPlanStage* mps = static_cast<MultiPlanStage*>(foundStage);
             return mps->pickBestPlan(_yieldPolicy.get());
+        }
+
+        // ...or, we might have to run a plan from the cache for a trial period, falling back on
+        // regular planning if the cached plan performs poorly.
+        foundStage = getStageByType(_root.get(), STAGE_CACHED_PLAN);
+        if (foundStage) {
+            CachedPlanStage* cachedPlan = static_cast<CachedPlanStage*>(foundStage);
+            return cachedPlan->pickBestPlan(_yieldPolicy.get());
         }
 
         // Either we chose a plan, or no plan selection was required. In both cases,
@@ -201,8 +219,8 @@ namespace mongo {
             return "DEAD";
         }
         else {
-            verify(PlanExecutor::EXEC_ERROR == s);
-            return "EXEC_ERROR";
+            verify(PlanExecutor::FAILURE == s);
+            return "FAILURE";
         }
     }
 
@@ -231,32 +249,78 @@ namespace mongo {
     }
 
     void PlanExecutor::saveState() {
-        if (!_killed) {
+        if (!killed()) {
             _root->saveState();
+        }
+
+        // Doc-locking storage engines drop their transactional context after saving state.
+        // The query stages inside this stage tree might buffer record ids (e.g. text, geoNear,
+        // mergeSort, sort) which are no longer protected by the storage engine's transactional
+        // boundaries. Force-fetch the documents for any such record ids so that we have our
+        // own copy in the working set.
+        if (supportsDocLocking()) {
+            WorkingSetCommon::prepareForSnapshotChange(_workingSet.get());
         }
 
         _opCtx = NULL;
     }
 
     bool PlanExecutor::restoreState(OperationContext* opCtx) {
+        try {
+            return restoreStateWithoutRetrying(opCtx);
+        }
+        catch (const WriteConflictException& wce) {
+            if (!_yieldPolicy->allowedToYield())
+                throw;
+
+            // Handles retries by calling restoreStateWithoutRetrying() in a loop.
+            return _yieldPolicy->yield(NULL);
+        }
+    }
+
+    bool PlanExecutor::restoreStateWithoutRetrying(OperationContext* opCtx) {
         invariant(NULL == _opCtx);
         invariant(opCtx);
 
         _opCtx = opCtx;
 
-        if (!_killed) {
+        // We're restoring after a yield or getMore now. If we're a yielding plan executor, reset
+        // the yield timer in order to prevent from yielding again right away.
+        _yieldPolicy->resetTimer();
+
+        if (!killed()) {
             _root->restoreState(opCtx);
         }
 
-        return !_killed;
+        return !killed();
     }
 
     void PlanExecutor::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
-        if (!_killed) { _root->invalidate(txn, dl, type); }
+        if (!killed()) { _root->invalidate(txn, dl, type); }
     }
 
     PlanExecutor::ExecState PlanExecutor::getNext(BSONObj* objOut, RecordId* dlOut) {
-        if (_killed) { return PlanExecutor::DEAD; }
+        Snapshotted<BSONObj> snapshotted;
+        ExecState state = getNextSnapshotted(objOut ? &snapshotted : NULL, dlOut);
+
+        if (objOut) {
+            *objOut = snapshotted.value();
+        }
+
+        return state;
+    }
+
+    PlanExecutor::ExecState PlanExecutor::getNextSnapshotted(Snapshotted<BSONObj>* objOut,
+                                                             RecordId* dlOut) {
+        if (killed()) { 
+            if (NULL != objOut) {
+                Status status(ErrorCodes::OperationFailed,
+                              str::stream() << "Operation aborted because: " << *_killReason);
+                *objOut = Snapshotted<BSONObj>(SnapshotId(),
+                                               WorkingSetCommon::buildMemberStatusObject(status));
+            }
+            return PlanExecutor::DEAD; 
+        }
 
         // When a stage requests a yield for document fetch, it gives us back a RecordFetcher*
         // to use to pull the record into memory. We take ownership of the RecordFetcher here,
@@ -264,18 +328,27 @@ namespace mongo {
         // just pass a NULL fetcher.
         boost::scoped_ptr<RecordFetcher> fetcher;
 
+        // Incremented on every writeConflict, reset to 0 on any successful call to _root->work.
+        size_t writeConflictsInARow = 0;
+
         for (;;) {
-            // There are two conditions which cause us to yield if we have an YIELD_AUTO
-            // policy:
+            // These are the conditions which can cause us to yield:
             //   1) The yield policy's timer elapsed, or
-            //   2) some stage requested a yield due to a document fetch (NEED_FETCH).
-            // In both cases, the actual yielding happens here.
-            if (NULL != _yieldPolicy.get() && (_yieldPolicy->shouldYield()
-                                               || NULL != fetcher.get())) {
-                // Here's where we yield.
+            //   2) some stage requested a yield due to a document fetch, or
+            //   3) we need to yield and retry due to a WriteConflictException.
+            // In all cases, the actual yielding happens here.
+            if (_yieldPolicy->shouldYield()) {
                 _yieldPolicy->yield(fetcher.get());
 
-                if (_killed) {
+                if (killed()) {
+                    if (NULL != objOut) {
+                        Status status(ErrorCodes::OperationFailed, 
+                                      str::stream() << "Operation aborted because: " 
+                                                    << *_killReason);
+                        *objOut = Snapshotted<BSONObj>(
+                            SnapshotId(),
+                            WorkingSetCommon::buildMemberStatusObject(status));
+                    }
                     return PlanExecutor::DEAD;
                 }
             }
@@ -286,6 +359,9 @@ namespace mongo {
 
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState code = _root->work(&id);
+
+            if (code != PlanStage::NEED_YIELD)
+                writeConflictsInARow = 0;
 
             if (PlanStage::ADVANCED == code) {
                 // Fast count.
@@ -305,7 +381,10 @@ namespace mongo {
                             hasRequestedData = false;
                         }
                         else {
-                            *objOut = member->keyData[0].keyData;
+                            // TODO: currently snapshot ids are only associated with documents, and
+                            // not with index keys.
+                            *objOut = Snapshotted<BSONObj>(SnapshotId(),
+                                                           member->keyData[0].keyData);
                         }
                     }
                     else if (member->hasObj()) {
@@ -333,13 +412,26 @@ namespace mongo {
                 }
                 // This result didn't have the data the caller wanted, try again.
             }
-            else if (PlanStage::NEED_FETCH == code) {
-                // Yielding on a NEED_FETCH is handled above, so there's not much to do here.
-                // Just verify that the NEED_FETCH gave us back a WSM that is actually fetchable.
-                WorkingSetMember* member = _workingSet->get(id);
-                invariant(member->hasFetcher());
-                // Transfer ownership of the fetcher. Next time around the loop a yield will happen.
-                fetcher.reset(member->releaseFetcher());
+            else if (PlanStage::NEED_YIELD == code) {
+                if (id == WorkingSet::INVALID_ID) {
+                    if (!_yieldPolicy->allowedToYield()) throw WriteConflictException();
+                    _opCtx->getCurOp()->debug().writeConflicts++;
+                    writeConflictsInARow++;
+                    WriteConflictException::logAndBackoff(writeConflictsInARow,
+                                                          "plan execution",
+                                                          _collection->ns().ns());
+
+                }
+                else {
+                    WorkingSetMember* member = _workingSet->get(id);
+                    invariant(member->hasFetcher());
+                    // Transfer ownership of the fetcher. Next time around the loop a yield will
+                    // happen.
+                    fetcher.reset(member->releaseFetcher());
+                }
+
+                // If we're allowed to, we will yield next time through the loop.
+                if (_yieldPolicy->allowedToYield()) _yieldPolicy->forceYield();
             }
             else if (PlanStage::NEED_TIME == code) {
                 // Fall through to yield check at end of large conditional.
@@ -348,20 +440,27 @@ namespace mongo {
                 return PlanExecutor::IS_EOF;
             }
             else if (PlanStage::DEAD == code) {
+                if (NULL != objOut) {
+                    BSONObj statusObj;
+                    WorkingSetCommon::getStatusMemberObject(*_workingSet, id, &statusObj);
+                    *objOut = Snapshotted<BSONObj>(SnapshotId(), statusObj);
+                }
                 return PlanExecutor::DEAD;
             }
             else {
                 verify(PlanStage::FAILURE == code);
                 if (NULL != objOut) {
-                    WorkingSetCommon::getStatusMemberObject(*_workingSet, id, objOut);
+                    BSONObj statusObj;
+                    WorkingSetCommon::getStatusMemberObject(*_workingSet, id, &statusObj);
+                    *objOut = Snapshotted<BSONObj>(SnapshotId(), statusObj);
                 }
-                return PlanExecutor::EXEC_ERROR;
+                return PlanExecutor::FAILURE;
             }
         }
     }
 
     bool PlanExecutor::isEOF() {
-        return _killed || _root->isEOF();
+        return killed() || _root->isEOF();
     }
 
     void PlanExecutor::registerExec() {
@@ -372,8 +471,8 @@ namespace mongo {
         _safety.reset();
     }
 
-    void PlanExecutor::kill() {
-        _killed = true;
+    void PlanExecutor::kill(std::string reason) {
+        _killReason = std::move(reason);
         _collection = NULL;
 
         // XXX: PlanExecutor is designed to wrap a single execution tree. In the case of
@@ -383,12 +482,19 @@ namespace mongo {
         // the "inner" executor. This is bad, and hopefully can be fixed down the line with the
         // unification of agg and query.
         //
+        // The CachedPlanStage is another special case. It needs to update the plan cache from
+        // its destructor. It needs to know whether it has been killed so that it can avoid
+        // touching a potentially invalid plan cache in this case.
+        //
         // TODO: get rid of this code block.
-        if (STAGE_PIPELINE_PROXY == _root->stageType()) {
-            PipelineProxyStage* proxyStage = static_cast<PipelineProxyStage*>(_root.get());
-            shared_ptr<PlanExecutor> childExec = proxyStage->getChildExecutor();
-            if (childExec) {
-                childExec->kill();
+        {
+            PlanStage* foundStage = getStageByType(_root.get(), STAGE_PIPELINE_PROXY);
+            if (foundStage) {
+                PipelineProxyStage* proxyStage = static_cast<PipelineProxyStage*>(foundStage);
+                shared_ptr<PlanExecutor> childExec = proxyStage->getChildExecutor();
+                if (childExec) {
+                    childExec->kill(*_killReason);
+                }
             }
         }
     }
@@ -403,7 +509,7 @@ namespace mongo {
         if (PlanExecutor::DEAD == state) {
             return Status(ErrorCodes::OperationFailed, "Exec error: PlanExecutor killed");
         }
-        else if (PlanExecutor::EXEC_ERROR == state) {
+        else if (PlanExecutor::FAILURE == state) {
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "Exec error: "
                                         << WorkingSetCommon::toStatusString(obj));
@@ -418,17 +524,13 @@ namespace mongo {
     }
 
     void PlanExecutor::setYieldPolicy(YieldPolicy policy, bool registerExecutor) {
-        if (PlanExecutor::YIELD_MANUAL == policy) {
-            _yieldPolicy.reset();
-        }
-        else {
-            invariant(PlanExecutor::YIELD_AUTO == policy);
-            _yieldPolicy.reset(new PlanYieldPolicy(this));
-
+        _yieldPolicy->setPolicy(policy);
+        if (PlanExecutor::YIELD_AUTO == policy) {
             // Runners that yield automatically generally need to be registered so that
             // after yielding, they receive notifications of events like deletions and
             // index drops. The only exception is that a few PlanExecutors get registered
-            // by ClientCursor instead of being registered here.
+            // by ClientCursor instead of being registered here. This is unneeded if we only do
+            // partial "yields" for WriteConflict retrying.
             if (registerExecutor) {
                 this->registerExec();
             }
@@ -444,13 +546,13 @@ namespace mongo {
         // Collection can be null for an EOFStage plan, or other places where registration
         // is not needed.
         if (_exec->collection()) {
-            _exec->collection()->cursorCache()->registerExecutor(exec);
+            _exec->collection()->getCursorManager()->registerExecutor(exec);
         }
     }
 
     PlanExecutor::ScopedExecutorRegistration::~ScopedExecutorRegistration() {
         if (_exec->collection()) {
-            _exec->collection()->cursorCache()->deregisterExecutor(_exec);
+            _exec->collection()->getCursorManager()->deregisterExecutor(_exec);
         }
     }
 

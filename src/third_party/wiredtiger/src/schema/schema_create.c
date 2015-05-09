@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -122,7 +123,7 @@ __create_file(WT_SESSION_IMPL *session,
 	else
 		WT_ERR(__wt_session_release_btree(session));
 
-err:	__wt_scr_free(&val);
+err:	__wt_scr_free(session, &val);
 	__wt_free(session, fileconf);
 	return (ret);
 }
@@ -179,10 +180,11 @@ __create_colgroup(WT_SESSION_IMPL *session,
 	const char **cfgp, *cfg[4] =
 	    { WT_CONFIG_BASE(session, colgroup_meta), config, NULL, NULL };
 	const char *sourcecfg[] = { config, NULL, NULL };
-	const char *cgname, *source, *tablename;
-	char *cgconf, *sourceconf, *oldconf;
+	const char *cgname, *source, *sourceconf, *tablename;
+	char *cgconf, *oldconf;
 
-	cgconf = sourceconf = oldconf = NULL;
+	sourceconf = NULL;
+	cgconf = oldconf = NULL;
 	WT_CLEAR(fmt);
 	WT_CLEAR(confbuf);
 	WT_CLEAR(namebuf);
@@ -243,7 +245,7 @@ __create_colgroup(WT_SESSION_IMPL *session,
 		    table, cval.str, cval.len, NULL, 1, &fmt));
 	}
 	sourcecfg[1] = fmt.data;
-	WT_ERR(__wt_config_concat(session, sourcecfg, &sourceconf));
+	WT_ERR(__wt_config_merge(session, sourcecfg, NULL, &sourceconf));
 
 	WT_ERR(__wt_schema_create(session, source, sourceconf));
 
@@ -321,13 +323,14 @@ __create_index(WT_SESSION_IMPL *session,
 	const char *cfg[4] =
 	    { WT_CONFIG_BASE(session, index_meta), NULL, NULL, NULL };
 	const char *sourcecfg[] = { config, NULL, NULL };
-	const char *source, *idxname, *tablename;
-	char *sourceconf, *idxconf;
+	const char *source, *sourceconf, *idxname, *tablename;
+	char *idxconf;
 	size_t tlen;
 	int have_extractor;
 	u_int i, npublic_cols;
 
-	idxconf = sourceconf = NULL;
+	sourceconf = NULL;
+	idxconf = NULL;
 	WT_CLEAR(confbuf);
 	WT_CLEAR(fmt);
 	WT_CLEAR(extra_cols);
@@ -367,8 +370,8 @@ __create_index(WT_SESSION_IMPL *session,
 		    ",source=\"%s\"", source));
 	}
 
-	if (__wt_config_getones(session, config, "extractor", &cval) == 0 &&
-	    cval.len != 0) {
+	if (__wt_config_getones_none(
+	    session, config, "extractor", &cval) == 0 && cval.len != 0) {
 		have_extractor = 1;
 		/* Custom extractors must supply a key format. */
 		if ((ret = __wt_config_getones(
@@ -457,7 +460,7 @@ __create_index(WT_SESSION_IMPL *session,
 	    session, &fmt, ",index_key_columns=%u", npublic_cols));
 
 	sourcecfg[1] = fmt.data;
-	WT_ERR(__wt_config_concat(session, sourcecfg, &sourceconf));
+	WT_ERR(__wt_config_merge(session, sourcecfg, NULL, &sourceconf));
 
 	WT_ERR(__wt_schema_create(session, source, sourceconf));
 
@@ -572,22 +575,22 @@ __create_data_source(WT_SESSION_IMPL *session,
 {
 	WT_CONFIG_ITEM cval;
 	const char *cfg[] = {
-	    WT_CONFIG_BASE(session, session_create), config, NULL };
+	    WT_CONFIG_BASE(session, WT_SESSION_create), config, NULL };
 
 	/*
 	 * Check to be sure the key/value formats are legal: the underlying
 	 * data source doesn't have access to the functions that check.
 	 */
 	WT_RET(__wt_config_gets(session, cfg, "key_format", &cval));
-	WT_RET(__wt_struct_check(session, cval.str, cval.len, NULL, NULL));
+	WT_RET(__wt_struct_confchk(session, &cval));
 	WT_RET(__wt_config_gets(session, cfg, "value_format", &cval));
-	WT_RET(__wt_struct_check(session, cval.str, cval.len, NULL, NULL));
+	WT_RET(__wt_struct_confchk(session, &cval));
 
 	/*
 	 * User-specified collators aren't supported for data-source objects.
 	 */
-	if (__wt_config_getones(
-	    session, config, "collator", &cval) != WT_NOTFOUND)
+	if (__wt_config_getones_none(
+	    session, config, "collator", &cval) != WT_NOTFOUND && cval.len != 0)
 		WT_RET_MSG(session, EINVAL,
 		    "WT_DATA_SOURCE objects do not support WT_COLLATOR "
 		    "ordering");
@@ -636,7 +639,7 @@ __wt_schema_create(
 		ret = __wt_bad_object_type(session, uri);
 
 	session->dhandle = NULL;
-	WT_TRET(__wt_meta_track_off(session, ret != 0));
+	WT_TRET(__wt_meta_track_off(session, 1, ret != 0));
 
 	return (ret);
 }

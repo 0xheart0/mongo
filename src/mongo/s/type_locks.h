@@ -61,6 +61,12 @@ namespace mongo {
         MONGO_DISALLOW_COPYING(LocksType);
     public:
 
+        enum State {
+            UNLOCKED = 0,
+            LOCK_PREP, // Only for legacy 3 config servers.
+            LOCKED,
+        };
+
         //
         // schema declarations
         //
@@ -120,7 +126,7 @@ namespace mongo {
         //
 
         // Mandatory Fields
-        void setName(const StringData& name) {
+        void setName(StringData name) {
             _name = name.toString();
             _isNameSet = true;
         }

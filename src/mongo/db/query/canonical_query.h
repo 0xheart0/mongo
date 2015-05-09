@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
@@ -36,9 +38,6 @@
 #include "mongo/db/query/parsed_projection.h"
 
 namespace mongo {
-
-    // TODO: Is this binary data really?
-    typedef std::string PlanCacheKey;
 
     class CanonicalQuery {
     public:
@@ -163,17 +162,9 @@ namespace mongo {
         const LiteParsedQuery& getParsed() const { return *_pq; }
         const ParsedProjection* getProj() const { return _proj.get(); }
 
-        /**
-         * Get the cache key for this canonical query.
-         */
-        const PlanCacheKey& getPlanCacheKey() const;
-
         // Debugging
         std::string toString() const;
         std::string toStringShort() const;
-
-        bool isForWrite() const { return _isForWrite; }
-        void setIsForWrite( bool w ) { _isForWrite = w; }
 
         /**
          * Validates match expression, checking for certain
@@ -195,7 +186,7 @@ namespace mongo {
 
         /**
          * Traverses expression tree post-order.
-         * Sorts children at each non-leaf node by (MatchType, path(), cacheKey)
+         * Sorts children at each non-leaf node by (MatchType, path(), children, number of children)
          */
         static void sortTree(MatchExpression* tree);
 
@@ -218,32 +209,18 @@ namespace mongo {
         CanonicalQuery() { }
 
         /**
-         * Computes and stores the cache key / query shape
-         * for this query.
-         */
-        void generateCacheKey(void);
-
-        /**
          * Takes ownership of 'root' and 'lpq'.
          */
         Status init(LiteParsedQuery* lpq,
                     const MatchExpressionParser::WhereCallback& whereCallback,
                     MatchExpression* root);
 
-        scoped_ptr<LiteParsedQuery> _pq;
+        boost::scoped_ptr<LiteParsedQuery> _pq;
 
         // _root points into _pq->getFilter()
-        scoped_ptr<MatchExpression> _root;
+        boost::scoped_ptr<MatchExpression> _root;
 
-        scoped_ptr<ParsedProjection> _proj;
-
-        /**
-         * Cache key is a string-ified combination of the query and sort obfuscated
-         * for minimal user comprehension.
-         */
-        PlanCacheKey _cacheKey;
-
-        bool _isForWrite;
+        boost::scoped_ptr<ParsedProjection> _proj;
     };
 
 }  // namespace mongo

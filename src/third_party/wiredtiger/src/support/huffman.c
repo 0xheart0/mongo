@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -95,8 +96,8 @@ typedef struct __indexed_byte {
 	uint32_t frequency;
 } INDEXED_SYMBOL;
 
-static int  indexed_freq_compare(const void *, const void *);
-static int  indexed_symbol_compare(const void *, const void *);
+static int WT_CDECL indexed_freq_compare(const void *, const void *);
+static int WT_CDECL indexed_symbol_compare(const void *, const void *);
 static void make_table(
 	WT_SESSION_IMPL *, uint8_t *, uint16_t, WT_HUFFMAN_CODE *, u_int);
 static void node_queue_close(WT_SESSION_IMPL *, NODE_QUEUE *);
@@ -116,7 +117,7 @@ static void set_codes(WT_FREQTREE_NODE *, WT_HUFFMAN_CODE *, uint16_t, uint8_t);
  * indexed_symbol_compare --
  *	Qsort comparator to order the table by symbol, lowest to highest.
  */
-static int
+static int WT_CDECL
 indexed_symbol_compare(const void *a, const void *b)
 {
 	return (((INDEXED_SYMBOL *)a)->symbol >
@@ -130,7 +131,7 @@ indexed_symbol_compare(const void *a, const void *b)
  *	Qsort comparator to order the table by frequency (the most frequent
  * symbols will be at the end of the array).
  */
-static int
+static int WT_CDECL
 indexed_freq_compare(const void *a, const void *b)
 {
 	return (((INDEXED_SYMBOL *)a)->frequency >
@@ -301,12 +302,11 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	uint64_t w1, w2;
 	uint16_t i;
 
-	indexed_freqs = symbol_frequency_array;
-
+	indexed_freqs = NULL;
 	combined_nodes = leaves = NULL;
 	node = node2 = tempnode = NULL;
 
-	WT_RET(__wt_calloc_def(session, 1, &huffman));
+	WT_RET(__wt_calloc_one(session, &huffman));
 
 	/*
 	 * The frequency table is 4B pairs of symbol and frequency.  The symbol
@@ -329,26 +329,24 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	 * Order the array by symbol and check for invalid symbols and
 	 * duplicates.
 	 */
-	qsort((void *)indexed_freqs,
-	    symcnt, sizeof(INDEXED_SYMBOL), indexed_symbol_compare);
+	sym = symbol_frequency_array;
+	qsort(sym, symcnt, sizeof(INDEXED_SYMBOL), indexed_symbol_compare);
 	for (i = 0; i < symcnt; ++i) {
-		if (i > 0 &&
-		    indexed_freqs[i].symbol == indexed_freqs[i - 1].symbol)
+		if (i > 0 && sym[i].symbol == sym[i - 1].symbol)
 			WT_ERR_MSG(session, EINVAL,
-			    "duplicate symbol %" PRIx32
-			    " specified in a huffman table",
-			    indexed_freqs[i].symbol);
-		if (indexed_freqs[i].symbol > huffman->numSymbols)
+			    "duplicate symbol %" PRIu32 " (%#" PRIx32 ") "
+			    "specified in a huffman table",
+			    sym[i].symbol, sym[i].symbol);
+		if (sym[i].symbol > huffman->numSymbols)
 			WT_ERR_MSG(session, EINVAL,
-			    "illegal symbol %" PRIx32
-			    " specified in a huffman table",
-			    indexed_freqs[i].symbol);
+			    "out-of-range symbol %" PRIu32 " (%#" PRIx32 ") "
+			    "specified in a huffman table",
+			    sym[i].symbol, sym[i].symbol);
 	}
 
 	/*
 	 * Massage frequencies.
 	 */
-	indexed_freqs = NULL;
 	WT_ERR(__wt_calloc_def(session, 256, &indexed_freqs));
 
 	/*
@@ -381,8 +379,8 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	    symcnt, sizeof(INDEXED_SYMBOL), indexed_freq_compare);
 
 	/* We need two node queues to build the tree. */
-	WT_ERR(__wt_calloc_def(session, 1, &leaves));
-	WT_ERR(__wt_calloc_def(session, 1, &combined_nodes));
+	WT_ERR(__wt_calloc_one(session, &leaves));
+	WT_ERR(__wt_calloc_one(session, &combined_nodes));
 
 	/*
 	 * Adding the leaves to the queue.
@@ -393,7 +391,7 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 	 */
 	for (i = 0; i < symcnt; ++i)
 		if (indexed_freqs[i].frequency > 0) {
-			WT_ERR(__wt_calloc_def(session, 1, &tempnode));
+			WT_ERR(__wt_calloc_one(session, &tempnode));
 			tempnode->symbol = (uint8_t)indexed_freqs[i].symbol;
 			tempnode->weight = indexed_freqs[i].frequency;
 			WT_ERR(node_queue_enqueue(session, leaves, tempnode));
@@ -431,7 +429,7 @@ __wt_huffman_open(WT_SESSION_IMPL *session,
 		 * In every second run, we have both node and node2 initialized.
 		 */
 		if (node != NULL && node2 != NULL) {
-			WT_ERR(__wt_calloc_def(session, 1, &tempnode));
+			WT_ERR(__wt_calloc_one(session, &tempnode));
 
 			/* The new weight is the sum of the two weights. */
 			tempnode->weight = node->weight + node2->weight;
@@ -686,7 +684,7 @@ __wt_huffman_encode(WT_SESSION_IMPL *session, void *huffman_arg,
 	    max_len, outlen);
 #endif
 
-err:	__wt_scr_free(&tmp);
+err:	__wt_scr_free(session, &tmp);
 	return (ret);
 
 }
@@ -809,7 +807,7 @@ __wt_huffman_decode(WT_SESSION_IMPL *session, void *huffman_arg,
 	    max_len, outlen);
 #endif
 
-err:	__wt_scr_free(&tmp);
+err:	__wt_scr_free(session, &tmp);
 	return (ret);
 }
 
@@ -845,7 +843,7 @@ node_queue_enqueue(
 	NODE_QUEUE_ELEM *elem;
 
 	/* Allocating a new linked list element */
-	WT_RET(__wt_calloc_def(session, 1, &elem));
+	WT_RET(__wt_calloc_one(session, &elem));
 
 	/* It holds the tree node, and has no next element yet */
 	elem->node = node;

@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -44,7 +45,7 @@ util_printlog(WT_SESSION *session, int argc, char *argv[])
 
 	if (ret != 0) {
 		fprintf(stderr, "%s: printlog failed: %s\n",
-		    progname, wiredtiger_strerror(ret));
+		    progname, session->strerror(session, ret));
 		goto err;
 	}
 

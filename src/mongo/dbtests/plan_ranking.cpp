@@ -30,16 +30,19 @@
  * This file tests db/query/plan_ranker.cpp and db/query/multi_plan_runner.cpp.
  */
 
+#include <boost/scoped_ptr.hpp>
+#include <iostream>
+
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
@@ -58,6 +61,9 @@ namespace mongo {
 
 namespace PlanRankingTests {
 
+    using boost::scoped_ptr;
+    using std::vector;
+
     static const char* ns = "unittests.PlanRankingTests";
 
     class PlanRankingTestBase {
@@ -70,7 +76,7 @@ namespace PlanRankingTests {
             // Run all tests with hash-based intersection enabled.
             internalQueryPlannerEnableHashIntersection = true;
 
-            Client::WriteContext ctx(&_txn, ns);
+            OldClientWriteContext ctx(&_txn, ns);
             _client.dropCollection(ns);
         }
 
@@ -81,7 +87,7 @@ namespace PlanRankingTests {
         }
 
         void insert(const BSONObj& obj) {
-            Client::WriteContext ctx(&_txn, ns);
+            OldClientWriteContext ctx(&_txn, ns);
             _client.insert(ns, obj);
         }
 
@@ -121,9 +127,9 @@ namespace PlanRankingTests {
                 // Takes ownership of all (actually some) arguments.
                 _mps->addPlan(solutions[i], root, ws.get());
             }
-            // This is what sets a backup plan, should we test for it. NULL means that there
-            // is no yield policy for this MultiPlanStage's plan selection.
-            _mps->pickBestPlan(NULL);
+            // This is what sets a backup plan, should we test for it.
+            PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+            _mps->pickBestPlan(&yieldPolicy);
             ASSERT(_mps->bestPlanChosen());
 
             size_t bestPlanIdx = _mps->bestPlanIdx();
@@ -208,7 +214,7 @@ namespace PlanRankingTests {
             // Takes ownership of cq.
             soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                             "{fetch: {filter: null, node: {andSorted: {nodes: ["
+                             "{fetch: {node: {andSorted: {nodes: ["
                                      "{ixscan: {filter: null, pattern: {a:1}}},"
                                      "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                              soln->root.get()));
@@ -244,7 +250,7 @@ namespace PlanRankingTests {
             // Takes ownership of cq.
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                             "{fetch: {filter: null, node: {andHash: {nodes: ["
+                             "{fetch: {node: {andHash: {nodes: ["
                                      "{ixscan: {filter: null, pattern: {a:1}}},"
                                      "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                              soln->root.get()));
@@ -618,7 +624,7 @@ namespace PlanRankingTests {
 
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                "{fetch: {filter: null, node: {andSorted: {nodes: ["
+                "{fetch: {node: {andSorted: {nodes: ["
                     "{ixscan: {filter: null, pattern: {a:1}}},"
                     "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                 soln->root.get()));
@@ -660,7 +666,7 @@ namespace PlanRankingTests {
             // Choose the index intersection plan.
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                "{fetch: {filter: null, node: {andSorted: {nodes: ["
+                "{fetch: {node: {andSorted: {nodes: ["
                     "{ixscan: {filter: null, pattern: {a:1}}},"
                     "{ixscan: {filter: null, pattern: {b:1}}}]}}}}",
                 soln->root.get()));
@@ -704,7 +710,7 @@ namespace PlanRankingTests {
             // other plans are busy fetching documents.
             QuerySolution* soln = pickBestPlan(cq);
             ASSERT(QueryPlannerTestLib::solutionMatches(
-                "{fetch: {filter: {a:1}, node: {andSorted: {nodes: ["
+                "{fetch: {node: {andSorted: {nodes: ["
                     "{ixscan: {filter: null, pattern: {b:1}}},"
                     "{ixscan: {filter: null, pattern: {c:1}}}]}}}}",
                 soln->root.get()));
@@ -777,7 +783,6 @@ namespace PlanRankingTests {
 
             // Use index on 'b'.
             QuerySolution* soln = pickBestPlan(cq);
-            std::cerr << "PlanRankingWorkPlansLongEnough: soln=" << soln->toString() << std::endl;
             ASSERT(QueryPlannerTestLib::solutionMatches(
                         "{fetch: {node: {ixscan: {pattern: {b: 1}}}}}",
                         soln->root.get()));

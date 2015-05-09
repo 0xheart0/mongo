@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -69,46 +70,65 @@ int
 __wt_lsm_get_chunk_to_flush(WT_SESSION_IMPL *session,
     WT_LSM_TREE *lsm_tree, int force, WT_LSM_CHUNK **chunkp)
 {
-	u_int i, end;
+	WT_DECL_RET;
+	WT_LSM_CHUNK *chunk, *evict_chunk, *flush_chunk;
+	u_int i;
 
 	*chunkp = NULL;
+	chunk = evict_chunk = flush_chunk = NULL;
 
 	WT_ASSERT(session, lsm_tree->queue_ref > 0);
 	WT_RET(__wt_lsm_tree_readlock(session, lsm_tree));
-	if (!F_ISSET(lsm_tree, WT_LSM_TREE_ACTIVE))
+	if (!F_ISSET(lsm_tree, WT_LSM_TREE_ACTIVE) || lsm_tree->nchunks == 0)
 		return (__wt_lsm_tree_readunlock(session, lsm_tree));
 
-	/*
-	 * Normally we don't want to force out the last chunk.  But if we're
-	 * doing a forced flush, likely from a compact call, then we want
-	 * to include the final chunk.
-	 */
-	end = force ? lsm_tree->nchunks : lsm_tree->nchunks - 1;
-	for (i = 0; i < end; i++) {
-		if (!F_ISSET(lsm_tree->chunk[i], WT_LSM_CHUNK_ONDISK) ||
-		    (*chunkp == NULL &&
-		    !F_ISSET(lsm_tree->chunk[i], WT_LSM_CHUNK_STABLE) &&
-		    !lsm_tree->chunk[i]->evicted)) {
-			(void)WT_ATOMIC_ADD4(lsm_tree->chunk[i]->refcnt, 1);
-			WT_RET(__wt_verbose(session, WT_VERB_LSM,
-			    "Flush%s: return chunk %u of %u: %s",
-			    force ? " w/ force" : "", i, end - 1,
-			    lsm_tree->chunk[i]->uri));
-			*chunkp = lsm_tree->chunk[i];
+	/* Search for a chunk to evict and/or a chunk to flush. */
+	for (i = 0; i < lsm_tree->nchunks; i++) {
+		chunk = lsm_tree->chunk[i];
+		if (F_ISSET(chunk, WT_LSM_CHUNK_ONDISK)) {
 			/*
-			 * Discards are opportunistic, flip a coin to decide
-			 * whether to try, but take the first real flush we
-			 * find.
+			 * Normally we don't want to force out the last chunk.
+			 * But if we're doing a forced flush on behalf of a
+			 * compact, then we want to include the final chunk.
 			 */
-			if (!F_ISSET(lsm_tree->chunk[i], WT_LSM_CHUNK_ONDISK) ||
-			    __wt_random(session->rnd) & 1)
-				break;
-		}
+			if (evict_chunk == NULL &&
+			    !chunk->evicted &&
+			    !F_ISSET(chunk, WT_LSM_CHUNK_STABLE))
+				evict_chunk = chunk;
+		} else if (flush_chunk == NULL &&
+		    chunk->switch_txn != 0 &&
+		    (force || i < lsm_tree->nchunks - 1))
+			flush_chunk = chunk;
 	}
 
-	WT_RET(__wt_lsm_tree_readunlock(session, lsm_tree));
+	/*
+	 * Don't be overly zealous about pushing old chunks from cache.
+	 * Attempting too many drops can interfere with checkpoints.
+	 *
+	 * If retrying a discard push an additional work unit so there are
+	 * enough to trigger checkpoints.
+	 */
+	if (evict_chunk != NULL && flush_chunk != NULL) {
+		chunk = (__wt_random(session->rnd) & 1) ?
+		    evict_chunk : flush_chunk;
+		WT_ERR(__wt_lsm_manager_push_entry(
+		    session, WT_LSM_WORK_FLUSH, 0, lsm_tree));
+	} else
+		chunk = (evict_chunk != NULL) ? evict_chunk : flush_chunk;
 
-	return (0);
+	if (chunk != NULL) {
+		WT_ERR(__wt_verbose(session, WT_VERB_LSM,
+		    "Flush%s: return chunk %u of %u: %s",
+		    force ? " w/ force" : "",
+		    i, lsm_tree->nchunks, chunk->uri));
+
+		(void)WT_ATOMIC_ADD4(chunk->refcnt, 1);
+	}
+
+err:	WT_RET(__wt_lsm_tree_readunlock(session, lsm_tree));
+
+	*chunkp = chunk;
+	return (ret);
 }
 
 /*
@@ -261,7 +281,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 	}
 
 	/* Stop if a running transaction needs the chunk. */
-	__wt_txn_update_oldest(session);
+	__wt_txn_update_oldest(session, 1);
 	if (chunk->switch_txn == WT_TXN_NONE ||
 	    !__wt_txn_visible_all(session, chunk->switch_txn)) {
 		WT_RET(__wt_verbose(session, WT_VERB_LSM,
@@ -324,7 +344,7 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 		WT_RET_MSG(session, ret, "LSM metadata write");
 
 	/*
-	 * Clear the "cache resident" flag so the primary can be evicted and
+	 * Clear the no-eviction flag so the primary can be evicted and
 	 * eventually closed.  Only do this once the checkpoint has succeeded:
 	 * otherwise, accessing the leaf page during the checkpoint can trigger
 	 * forced eviction.
@@ -338,8 +358,8 @@ __wt_lsm_checkpoint_chunk(WT_SESSION_IMPL *session,
 
 	WT_RET(__wt_verbose(session, WT_VERB_LSM, "LSM worker checkpointed %s",
 	    chunk->uri));
-	/*
-	 * Schedule a bloom filter create for our newly flushed chunk */
+
+	/* Schedule a bloom filter create for our newly flushed chunk. */
 	if (!FLD_ISSET(lsm_tree->bloom, WT_LSM_BLOOM_OFF))
 		WT_RET(__wt_lsm_manager_push_entry(
 		    session, WT_LSM_WORK_BLOOM, 0, lsm_tree));
@@ -381,7 +401,13 @@ __lsm_bloom_create(WT_SESSION_IMPL *session,
 	F_SET(src, WT_CURSTD_RAW);
 	WT_ERR(__wt_clsm_init_merge(src, chunk_off, chunk->id, 1));
 
-	F_SET(session, WT_SESSION_NO_CACHE);
+	/*
+	 * Setup so that we don't hold pages we read into cache, and so
+	 * that we don't get stuck if the cache is full. If we allow
+	 * ourselves to get stuck creating bloom filters, the entire tree
+	 * can stall since there may be no worker threads available to flush.
+	 */
+	F_SET(session, WT_SESSION_NO_CACHE | WT_SESSION_NO_CACHE_CHECK);
 	for (insert_count = 0; (ret = src->next(src)) == 0; insert_count++) {
 		WT_ERR(src->get_key(src, &key));
 		WT_ERR(__wt_bloom_insert(bloom, &key));
@@ -394,15 +420,7 @@ __lsm_bloom_create(WT_SESSION_IMPL *session,
 
 	F_CLR(session, WT_SESSION_NO_CACHE);
 
-	/*
-	 * Load the new Bloom filter into cache.
-	 *
-	 * We're doing advisory reads to fault the new trees into cache.
-	 * Don't block if the cache is full: our next unit of work may be to
-	 * discard some trees to free space.
-	 */
-	F_SET(session, WT_SESSION_NO_CACHE_CHECK);
-
+	/* Load the new Bloom filter into cache. */
 	WT_CLEAR(key);
 	WT_ERR_NOTFOUND_OK(__wt_bloom_get(bloom, &key));
 
@@ -439,7 +457,7 @@ __lsm_discard_handle(
 	WT_RET(__wt_session_get_btree(session, uri, checkpoint, NULL,
 	    WT_DHANDLE_EXCLUSIVE | WT_DHANDLE_LOCK_ONLY));
 
-	F_SET(session->dhandle, WT_DHANDLE_DISCARD);
+	F_SET(session->dhandle, WT_DHANDLE_DISCARD_FORCE);
 	return (__wt_session_release_btree(session));
 }
 
@@ -451,9 +469,8 @@ static int
 __lsm_drop_file(WT_SESSION_IMPL *session, const char *uri)
 {
 	WT_DECL_RET;
-	const char *drop_cfg[] = {
-	    WT_CONFIG_BASE(session, session_drop), "remove_files=false", NULL
-	};
+	const char *drop_cfg[] = { WT_CONFIG_BASE(
+	    session, WT_SESSION_drop), "remove_files=false", NULL };
 
 	/*
 	 * We need to grab the schema lock to drop the file, so first try to

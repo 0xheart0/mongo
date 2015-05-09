@@ -9,7 +9,7 @@ env.Library(
         "working_set.cpp",
     ],
     LIBDEPS = [
-        "$BUILD_DIR/mongo/bson",
+        "$BUILD_DIR/mongo/bson/bson",
     ],
 )
 
@@ -17,16 +17,6 @@ env.CppUnitTest(
     target = "working_set_test",
     source = [
         "working_set_test.cpp"
-    ],
-    LIBDEPS = [
-        "working_set",
-    ],
-)
-
-env.Library(
-    target = "mock_stage",
-    source = [
-        "mock_stage.cpp",
     ],
     LIBDEPS = [
         "working_set",
@@ -70,6 +60,7 @@ env.Library(
         "pipeline_proxy.cpp",
         "projection.cpp",
         "projection_exec.cpp",
+        "queued_data_stage.cpp",
         "shard_filter.cpp",
         "skip.cpp",
         "sort.cpp",
@@ -81,22 +72,21 @@ env.Library(
     ],
     LIBDEPS = [
         "scoped_timer",
-        "$BUILD_DIR/mongo/bson",
+        "$BUILD_DIR/mongo/bson/bson",
     ],
 )
 
 env.CppUnitTest(
-    target = "mock_stage_test",
+    target = "queued_data_stage_test",
     source = [
-        "mock_stage_test.cpp",
+        "queued_data_stage_test.cpp",
     ],
     LIBDEPS = [
         "exec",
-        "mock_stage",
-        "$BUILD_DIR/mongo/serveronly",
-        "$BUILD_DIR/mongo/coreserver",
-        "$BUILD_DIR/mongo/coredb",
-        "$BUILD_DIR/mongo/mocklib",
+        "$BUILD_DIR/mongo/db/serveronly",
+        "$BUILD_DIR/mongo/db/coredb",
+        "$BUILD_DIR/mongo/dbtests/mocklib",
+        "$BUILD_DIR/mongo/util/ntservice_mock",
     ],
     NO_CRUTCH = True,
 )
@@ -108,11 +98,10 @@ env.CppUnitTest(
     ],
     LIBDEPS = [
         "exec",
-        "mock_stage",
-        "$BUILD_DIR/mongo/serveronly",
-        "$BUILD_DIR/mongo/coreserver",
-        "$BUILD_DIR/mongo/coredb",
-        "$BUILD_DIR/mongo/mocklib",
+        "$BUILD_DIR/mongo/db/serveronly",
+        "$BUILD_DIR/mongo/db/coredb",
+        "$BUILD_DIR/mongo/dbtests/mocklib",
+        "$BUILD_DIR/mongo/util/ntservice_mock",
     ],
     NO_CRUTCH = True,
 )
@@ -124,10 +113,9 @@ env.CppUnitTest(
     ],
     LIBDEPS = [
         "exec",
-        "mock_stage",
-        "$BUILD_DIR/mongo/serveronly",
-        "$BUILD_DIR/mongo/coreserver",
-        "$BUILD_DIR/mongo/coredb",
+        "$BUILD_DIR/mongo/db/serveronly",
+        "$BUILD_DIR/mongo/db/coredb",
+        "$BUILD_DIR/mongo/util/ntservice_mock",
     ],
     NO_CRUTCH = True,
 )

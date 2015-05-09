@@ -55,6 +55,38 @@ namespace mongo {
         checkRoundTrip( options );
     }
 
+    TEST(CollectionOptions, IsValid) {
+        CollectionOptions options;
+        ASSERT_TRUE(options.isValid());
+
+        options.storageEngine = fromjson("{storageEngine1: 1}");
+        ASSERT_FALSE(options.isValid());
+    }
+
+    TEST(CollectionOptions, Validate) {
+        CollectionOptions options;
+        ASSERT_OK(options.validate());
+
+        options.storageEngine = fromjson("{storageEngine1: 1}");
+        ASSERT_NOT_OK(options.validate());
+    }
+
+    TEST(CollectionOptions, Validator) {
+        CollectionOptions options;
+
+        ASSERT_NOT_OK(options.parse(fromjson("{validator: 'notAnObject'}")));
+
+        ASSERT_OK(options.parse(fromjson("{validator: {a: 1}}")));
+        ASSERT_EQ(options.validator, fromjson("{a: 1}"));
+
+        options.validator = fromjson("{b: 1}");
+        ASSERT_EQ(options.toBSON()["validator"].Obj(), fromjson("{b: 1}"));
+
+        options.reset();
+        ASSERT_EQ(options.validator, BSONObj());
+        ASSERT(!options.toBSON()["validator"]);
+    }
+
     TEST( CollectionOptions, ErrorBadSize ) {
         ASSERT_NOT_OK( CollectionOptions().parse( fromjson( "{capped: true, size: -1}" ) ) );
         ASSERT_NOT_OK( CollectionOptions().parse( fromjson( "{capped: false, size: -1}" ) ) );
@@ -87,29 +119,19 @@ namespace mongo {
 
     TEST(CollectionOptions, InvalidStorageEngineField) {
         // "storageEngine" field has to be an object if present.
-        ASSERT_NOT_OK( CollectionOptions().parse(fromjson("{storageEngine: 1}")));
+        ASSERT_NOT_OK(CollectionOptions().parse(fromjson("{storageEngine: 1}")));
 
         // Every field under "storageEngine" has to be an object.
-        ASSERT_NOT_OK( CollectionOptions().parse(fromjson(
-            "{storageEngine: {storageEngine1: 1}}")));
+        ASSERT_NOT_OK(CollectionOptions().parse(fromjson("{storageEngine: {storageEngine1: 1}}")));
 
-        // "storageEngine" must contain exactly one field.
-        ASSERT_NOT_OK( CollectionOptions().parse(fromjson(
-            "{storageEngine: {}}")));
-        ASSERT_NOT_OK( CollectionOptions().parse(fromjson(
-            "{storageEngine: {storageEngine1: {}, storageEngine2: {}}}")));
-
-        // Field under "storageEngine" must match storage engine name argument of parse.
-        ASSERT_NOT_OK( CollectionOptions().parse(fromjson(
-            "{storageEngine: {unknownStorageEngine: {}}}"), "storageEngine1"));
-        ASSERT_OK( CollectionOptions().parse(fromjson(
-            "{storageEngine: {storageEngine1: {}}}"), "storageEngine1"));
+        // Empty "storageEngine" not allowed
+        ASSERT_OK(CollectionOptions().parse(fromjson("{storageEngine: {}}")));
     }
 
     TEST(CollectionOptions, ParseEngineField) {
         CollectionOptions opts;
         ASSERT_OK(opts.parse(fromjson("{unknownField: 1, "
-            "storageEngine: {storageEngine1: {x: 1, y: 2}}}"), "storageEngine1"));
+            "storageEngine: {storageEngine1: {x: 1, y: 2}, storageEngine2: {a: 1, b:2}}}")));
         checkRoundTrip(opts);
 
         // Unrecognized field should not be present in BSON representation.
@@ -126,6 +148,12 @@ namespace mongo {
         BSONObj storageEngine1 = storageEngine.getObjectField("storageEngine1");
         ASSERT_EQUALS(1, storageEngine1.getIntField("x"));
         ASSERT_EQUALS(2, storageEngine1.getIntField("y"));
+
+        ASSERT_TRUE(storageEngine.getField("storageEngine2").isABSONObj());
+        BSONObj storageEngine2 = storageEngine.getObjectField("storageEngine2");
+        ASSERT_EQUALS(1, storageEngine2.getIntField("a"));
+        ASSERT_EQUALS(2, storageEngine2.getIntField("b"));
+
     }
 
     TEST(CollectionOptions, ResetStorageEngineField) {

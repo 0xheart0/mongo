@@ -69,8 +69,8 @@ namespace mongo {
         //
 
         virtual PlanStageStats* getStats() { return NULL; }
-        virtual CommonStats* getCommonStats() { return NULL; }
-        virtual SpecificStats* getSpecificStats() { return NULL; }
+        virtual CommonStats* getCommonStats() const { return NULL; }
+        virtual SpecificStats* getSpecificStats() const { return NULL; }
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -78,10 +78,7 @@ namespace mongo {
 
     private:
 
-        /**
-         * @return if more data
-         */
-        RecordId _advance();
+        void _advance();
 
         OperationContext* _txn;
         Collection* _collection;

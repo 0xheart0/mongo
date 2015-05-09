@@ -41,6 +41,7 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/config.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -55,6 +56,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/random.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
@@ -62,6 +64,10 @@
 #include "mongo/util/text.h"
 
 namespace mongo {
+
+    using std::hex;
+    using std::string;
+    using std::stringstream;
 
     static bool _isCRAuthDisabled;
     static bool _isX509AuthDisabled;
@@ -107,13 +113,19 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
-        bool run(OperationContext* txn, const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string&,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result) {
             nonce64 n = getNextNonce();
             stringstream ss;
             ss << hex << n;
             result.append("nonce", ss.str() );
-            ClientBasic::getCurrent()->resetAuthenticationSession(
-                    new MongoAuthenticationSession(n));
+            AuthenticationSession::set(
+                    ClientBasic::getCurrent(),
+                    stdx::make_unique<MongoAuthenticationSession>(n));
             return true;
         }
 
@@ -145,8 +157,7 @@ namespace mongo {
                               BSONObj& cmdObj,
                               int,
                               string& errmsg,
-                              BSONObjBuilder& result,
-                              bool fromRepl) {
+                              BSONObjBuilder& result) {
 
         if (!serverGlobalParams.quiet) {
             mutablebson::Document cmdToLog(cmdObj, mutablebson::Document::kInPlaceDisabled);
@@ -202,7 +213,7 @@ namespace mongo {
         if (mechanism == "MONGODB-CR") {
             return _authenticateCR(txn, user, cmdObj);
         }
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         if (mechanism == "MONGODB-X509") {
             return _authenticateX509(txn, user, cmdObj);
         }
@@ -241,8 +252,8 @@ namespace mongo {
 
         {
             ClientBasic *client = ClientBasic::getCurrent();
-            boost::scoped_ptr<AuthenticationSession> session;
-            client->swapAuthenticationSession(session);
+            std::unique_ptr<AuthenticationSession> session;
+            AuthenticationSession::swap(client, session);
             if (!session || session->getType() != AuthenticationSession::SESSION_TYPE_MONGO) {
                 sleepmillis(30);
                 return Status(ErrorCodes::ProtocolError, "No pending nonce");
@@ -268,6 +279,11 @@ namespace mongo {
         string pwd = userObj->getCredentials().password;
         getGlobalAuthorizationManager()->releaseUser(userObj);
 
+        if (pwd.empty()) {
+            return Status(ErrorCodes::AuthenticationFailed,
+                          "MONGODB-CR credentials missing in the user document");
+        }
+
         md5digest d;
         {
             digestBuilder << user.getUser() << pwd;
@@ -286,7 +302,7 @@ namespace mongo {
         }
 
         AuthorizationSession* authorizationSession =
-            ClientBasic::getCurrent()->getAuthorizationSession();
+            AuthorizationSession::get(ClientBasic::getCurrent());
         status = authorizationSession->addAndAuthorizeUser(txn, user);
         if (!status.isOK()) {
             return status;
@@ -295,7 +311,7 @@ namespace mongo {
         return Status::OK();
     }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
     void canonicalizeClusterDN(std::vector<std::string>* dn) {
         // remove all RDNs we don't care about
         for (size_t i=0; i<dn->size(); i++) {
@@ -343,7 +359,7 @@ namespace mongo {
         }
 
         ClientBasic *client = ClientBasic::getCurrent();
-        AuthorizationSession* authorizationSession = client->getAuthorizationSession();
+        AuthorizationSession* authorizationSession = AuthorizationSession::get(client);
         std::string subjectName = client->port()->getX509SubjectName();
 
         if (!getSSLManager()->getSSLConfiguration().hasCA) {
@@ -401,10 +417,9 @@ namespace mongo {
                  BSONObj& cmdObj,
                  int options,
                  string& errmsg,
-                 BSONObjBuilder& result,
-                 bool fromRepl) {
+                 BSONObjBuilder& result) {
             AuthorizationSession* authSession =
-                    ClientBasic::getCurrent()->getAuthorizationSession();
+                    AuthorizationSession::get(ClientBasic::getCurrent());
             authSession->logoutDatabase(dbname);
             if (Command::testCommandsEnabled && dbname == "admin") {
                 // Allows logging out as the internal user against the admin database, however

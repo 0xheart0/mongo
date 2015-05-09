@@ -47,11 +47,13 @@ namespace mongo {
     private:
         virtual bool isWriteCommandForConfigServer() const { return false; }
 
+        virtual bool maintenanceOk() const { return false; }
+
         virtual bool slaveOk() const { return false; }
 
         virtual bool slaveOverrideOk() const { return true; }
 
-        virtual void help(stringstream& help) const {
+        virtual void help(std::stringstream& help) const {
             help << "http://dochub.mongodb.org/core/aggregation";
         }
 
@@ -66,8 +68,7 @@ namespace mongo {
                          BSONObj& jsobj,
                          int,
                          std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl);
+                         BSONObjBuilder& result);
 
         virtual Status explain(OperationContext* txn,
                                const std::string& dbname,
@@ -82,7 +83,7 @@ namespace mongo {
          *
          * If a parsing error is encountered, returns an error Status.
          */
-        Status parseRequest(const string& dbname,
+        Status parseRequest(const std::string& dbname,
                             const BSONObj& cmdObj,
                             GroupRequest* request) const; 
     };

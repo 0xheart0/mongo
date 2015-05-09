@@ -1,4 +1,5 @@
 /*-
+ * Copyright (c) 2014-2015 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -499,12 +500,12 @@ __config_process_value(WT_CONFIG *conf, WT_CONFIG_ITEM *value)
 		return (0);
 
 	if (value->type == WT_CONFIG_ITEM_ID) {
-		if (strncasecmp(value->str, "true", value->len) == 0) {
-			value->type = WT_CONFIG_ITEM_BOOL;
-			value->val = 1;
-		} else if (strncasecmp(value->str, "false", value->len) == 0) {
+		if (WT_STRING_MATCH("false", value->str, value->len)) {
 			value->type = WT_CONFIG_ITEM_BOOL;
 			value->val = 0;
+		} else if (WT_STRING_MATCH("true", value->str, value->len)) {
+			value->type = WT_CONFIG_ITEM_BOOL;
+			value->val = 1;
 		}
 	} else if (value->type == WT_CONFIG_ITEM_NUM) {
 		errno = 0;
@@ -559,8 +560,7 @@ __config_process_value(WT_CONFIG *conf, WT_CONFIG_ITEM *value)
 
 	return (0);
 
-range:
-	return (__config_err(conf, "Number out of range", ERANGE));
+range:	return (__config_err(conf, "Number out of range", ERANGE));
 }
 
 /*
@@ -592,12 +592,11 @@ __config_getraw(
 		if (k.type != WT_CONFIG_ITEM_STRING &&
 		    k.type != WT_CONFIG_ITEM_ID)
 			continue;
-		if (k.len == key->len &&
-		    strncasecmp(key->str, k.str, k.len) == 0) {
+		if (k.len == key->len && strncmp(key->str, k.str, k.len) == 0) {
 			*value = v;
 			found = 1;
 		} else if (k.len < key->len && key->str[k.len] == '.' &&
-		    strncasecmp(key->str, k.str, k.len) == 0) {
+		    strncmp(key->str, k.str, k.len) == 0) {
 			subk.str = key->str + k.len + 1;
 			subk.len = (key->len - k.len) - 1;
 			WT_RET(__wt_config_initn(
@@ -622,21 +621,31 @@ __config_getraw(
  */
 int
 __wt_config_get(WT_SESSION_IMPL *session,
-    const char **cfg, WT_CONFIG_ITEM *key, WT_CONFIG_ITEM *value)
+    const char **cfg_arg, WT_CONFIG_ITEM *key, WT_CONFIG_ITEM *value)
 {
 	WT_CONFIG cparser;
 	WT_DECL_RET;
-	int found;
+	const char **cfg;
 
-	for (found = 0; *cfg != NULL; cfg++) {
+	if (cfg_arg[0] == NULL)
+		return (WT_NOTFOUND);
+
+	/*
+	 * Search the strings in reverse order, that way the first hit wins
+	 * and we don't search the base set until there's no other choice.
+	 */
+	for (cfg = cfg_arg; *cfg != NULL; ++cfg)
+		;
+	do {
+		--cfg;
+
 		WT_RET(__wt_config_init(session, &cparser, *cfg));
 		if ((ret = __config_getraw(&cparser, key, value, 1)) == 0)
-			found = 1;
-		else if (ret != WT_NOTFOUND)
-			return (ret);
-	}
+			return (0);
+		WT_RET_NOTFOUND_OK(ret);
+	} while (cfg != cfg_arg);
 
-	return (found ? 0 : WT_NOTFOUND);
+	return (WT_NOTFOUND);
 }
 
 /*
@@ -652,6 +661,21 @@ __wt_config_gets(WT_SESSION_IMPL *session,
 	    { key, strlen(key), 0, WT_CONFIG_ITEM_STRING };
 
 	return (__wt_config_get(session, cfg, &key_item, value));
+}
+
+/*
+ * __wt_config_gets_none --
+ *	Given a NULL-terminated list of configuration strings, find the final
+ *	value for a given string key.  Treat "none" as empty.
+ */
+int
+__wt_config_gets_none(WT_SESSION_IMPL *session,
+    const char **cfg, const char *key, WT_CONFIG_ITEM *value)
+{
+	WT_RET(__wt_config_gets(session, cfg, key, value));
+	if (WT_STRING_MATCH("none", value->str, value->len))
+		value->len = 0;
+	return (0);
 }
 
 /*
@@ -682,6 +706,21 @@ __wt_config_getones(WT_SESSION_IMPL *session,
 
 	WT_RET(__wt_config_init(session, &cparser, config));
 	return (__config_getraw(&cparser, &key_item, value, 1));
+}
+
+/*
+ * __wt_config_getones_none --
+ *	Get the value for a given string key from a single config string.
+ * Treat "none" as empty.
+ */
+int
+__wt_config_getones_none(WT_SESSION_IMPL *session,
+    const char *config, const char *key, WT_CONFIG_ITEM *value)
+{
+	WT_RET(__wt_config_getones(session, config, key, value));
+	if (WT_STRING_MATCH("none", value->str, value->len))
+		value->len = 0;
+	return (0);
 }
 
 /*

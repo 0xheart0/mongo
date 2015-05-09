@@ -76,8 +76,8 @@ namespace mongo {
      * Prerequisites: None; is a leaf node.
      * Output type: LOC_AND_OBJ_UNOWNED.
      *
-     * TODO: Should the TextStage ever generate NEED_FETCH requests? Right now this stage could
-     * reduce concurrency by failing to request a yield during fetch.
+     * TODO: Should the TextStage ever generate NEED_YIELD requests for fetching MMAP v1 records?
+     * Right now this stage could reduce concurrency by failing to request a yield during fetch.
      */
     class TextStage : public PlanStage {
     public:
@@ -118,9 +118,9 @@ namespace mongo {
 
         PlanStageStats* getStats();
 
-        virtual const CommonStats* getCommonStats();
+        virtual const CommonStats* getCommonStats() const;
 
-        virtual const SpecificStats* getSpecificStats();
+        virtual const SpecificStats* getSpecificStats() const;
 
         static const char* kStageType;
 
@@ -141,7 +141,7 @@ namespace mongo {
          * score) pair for this document.  Also rejects documents that don't match this stage's
          * filter.
          */
-        void addTerm(const BSONObj& key, const RecordId& loc);
+        StageState addTerm(WorkingSetID wsid, WorkingSetID* out);
 
         /**
          * Possibly return a result.  FYI, this may perform a fetch directly if it is needed to
@@ -178,10 +178,20 @@ namespace mongo {
         // Which _scanners are we currently reading from?
         size_t _currentIndexScanner;
 
+        // If not Null, we use this rather than asking our child what to do next.
+        WorkingSetID _idRetrying;
+
+        // Map each buffered record id to this data.
+        struct TextRecordData {
+            TextRecordData() : wsid(WorkingSet::INVALID_ID), score(0.0) { }
+            WorkingSetID wsid;
+            double score;
+        };
+
         // Temporary score data filled out by sub-scans.  Used in READING_TERMS and
         // RETURNING_RESULTS.
-        // Maps from diskloc -> aggregate score for doc.
-        typedef unordered_map<RecordId, double, RecordId::Hasher> ScoreMap;
+        // Maps from diskloc -> (aggregate score for doc, wsid).
+        typedef unordered_map<RecordId, TextRecordData, RecordId::Hasher> ScoreMap;
         ScoreMap _scores;
         ScoreMap::const_iterator _scoreIterator;
     };

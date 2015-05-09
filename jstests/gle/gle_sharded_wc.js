@@ -5,8 +5,7 @@
 
 // Options for a cluster with two replica set shards, the first with two nodes the second with one
 // This lets us try a number of GLE scenarios
-var options = { separateConfig : true,
-                rs : true,
+var options = { rs : true,
                 rsOptions : { nojournal : "" },
                 // Options for each replica set shard
                 rs0 : { nodes : 3 },
@@ -66,7 +65,8 @@ assert.eq(coll.count(), 1);
 
 //
 // Successful remove on one shard, write concern timeout on the other
-st.rs0.stop(2);
+var s0Id = st.rs0.getNodeId(st.rs0.liveNodes.slaves[0]);
+st.rs0.stop(s0Id);
 coll.remove({});
 st.rs1.awaitReplication(); // To ensure the first shard won't timeout
 printjson(gle = coll.getDB().runCommand({ getLastError : 1, w : 3, wtimeout : 5 * 1000 }));
@@ -79,7 +79,8 @@ assert.eq(coll.count(), 0);
 //
 // Successful remove on two hosts, write concern timeout on both
 // We don't aggregate two timeouts together
-st.rs1.stop(2);
+var s1Id = st.rs1.getNodeId(st.rs1.liveNodes.slaves[0]);
+st.rs1.stop(s1Id);
 // new writes to both shards to ensure that remove will do something on both of them
 coll.insert({ _id : -1 });
 coll.insert({ _id : 1 });

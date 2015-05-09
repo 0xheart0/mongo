@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/scripting/engine.h"
 
@@ -98,9 +100,9 @@ namespace mongo {
 
         virtual PlanStageStats* getStats();
 
-        virtual const CommonStats* getCommonStats();
+        virtual const CommonStats* getCommonStats() const;
 
-        virtual const SpecificStats* getSpecificStats();
+        virtual const SpecificStats* getSpecificStats() const;
 
         static const char* kStageType;
 
@@ -142,7 +144,7 @@ namespace mongo {
         CommonStats _commonStats;
         GroupStats _specificStats;
 
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         // Current state for this stage.
         GroupState _groupState;

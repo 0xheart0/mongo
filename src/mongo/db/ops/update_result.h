@@ -43,7 +43,7 @@ namespace mongo {
                       bool modifiers_,
                       unsigned long long numDocsModified_,
                       unsigned long long numMatched_,
-                      const BSONObj& upsertedObject_ );
+                      const BSONObj& upsertedObject_);
 
 
         // if existing objects were modified
