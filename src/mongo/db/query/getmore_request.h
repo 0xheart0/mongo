@@ -28,46 +28,71 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    struct GetMoreRequest {
-        /**
-         * Construct an empty request.
-         */
-        GetMoreRequest();
+struct GetMoreRequest {
+    static const char kGetMoreCommandName[];
 
-        /**
-         * Construct a GetMoreRequesst from the command specification and db name.
-         */
-        static StatusWith<GetMoreRequest> parseFromBSON(const std::string& dbname,
-                                                        const BSONObj& cmdObj);
+    /**
+     * Construct an empty request.
+     */
+    GetMoreRequest();
 
-        static std::string parseNs(const std::string& dbname, const BSONObj& cmdObj);
+    /**
+     * Construct from values for each field.
+     */
+    GetMoreRequest(NamespaceString namespaceString,
+                   CursorId id,
+                   boost::optional<long long> sizeOfBatch,
+                   boost::optional<Milliseconds> awaitDataTimeout,
+                   boost::optional<long long> term,
+                   boost::optional<repl::OpTime> lastKnownCommittedOpTime);
 
-        const NamespaceString nss;
-        const CursorId cursorid;
-        const int batchSize;
+    /**
+     * Construct a GetMoreRequest from the command specification and db name.
+     */
+    static StatusWith<GetMoreRequest> parseFromBSON(const std::string& dbname,
+                                                    const BSONObj& cmdObj);
 
-        static const int kDefaultBatchSize;
+    /**
+     * Serializes this object into a BSON representation. Fields that are not set will not be
+     * part of the the serialized object.
+     */
+    BSONObj toBSON() const;
 
-    private:
-        /**
-         * Construct from parsed BSON
-         */
-        GetMoreRequest(const std::string& fullns, CursorId id, int batch);
+    static NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj);
 
-        /**
-         * Returns a non-OK status if there are semantic errors in the parsed request
-         * (e.g. a negative batchSize).
-         */
-        Status isValid() const;
-    };
+    const NamespaceString nss;
+    const CursorId cursorid;
 
-} // namespace mongo
+    // The batch size is optional. If not provided, we will put as many documents into the batch
+    // as fit within the byte limit.
+    const boost::optional<long long> batchSize;
+
+    // The number of milliseconds for which a getMore on a tailable, awaitData query should block.
+    const boost::optional<Milliseconds> awaitDataTimeout;
+
+    // Only internal queries from replication will typically have a term.
+    const boost::optional<long long> term;
+
+    // Only internal queries from replication will have a last known committed optime.
+    const boost::optional<repl::OpTime> lastKnownCommittedOpTime;
+
+private:
+    /**
+     * Returns a non-OK status if there are semantic errors in the parsed request
+     * (e.g. a negative batchSize).
+     */
+    Status isValid() const;
+};
+
+}  // namespace mongo

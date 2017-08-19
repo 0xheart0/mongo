@@ -26,43 +26,109 @@
 *    it in the license file.
 */
 
+#pragma once
+
+#include "mongo/base/disallow_copying.h"
+#include "mongo/bson/bsonobjbuilder.h"
+
 namespace mongo {
 
+/**
+ * The 'WireVersion' captures all "protocol events" the write protocol went through.  A
+ * protocol event is a change in the syntax of messages on the wire or the semantics of
+ * existing messages. We may also add "logical" entries for releases, although that's not
+ * mandatory.
+ *
+ * We use the wire version to determine if two agents (a driver, a mongos, or a mongod) can
+ * interact. Each agent carries two versions, a 'max' and a 'min' one. If the two agents
+ * are on the same 'max' number, they stricly speak the same wire protocol and it is safe
+ * to allow them to communicate. If two agents' ranges do not intersect, they should not be
+ * allowed to communicate.
+ *
+ * If two agents have at least one version in common they can communicate, but one of the
+ * sides has to be ready to compensate for not being on its partner version.
+ */
+enum WireVersion {
+    // Everything before we started tracking.
+    RELEASE_2_4_AND_BEFORE = 0,
+
+    // The aggregation command may now be requested to return cursors.
+    AGG_RETURNS_CURSORS = 1,
+
+    // insert, update, and delete batch command
+    BATCH_COMMANDS = 2,
+
+    // support SCRAM-SHA1, listIndexes, listCollections, new explain
+    RELEASE_2_7_7 = 3,
+
+    // Support find and getMore commands, as well as OP_COMMAND in mongod (but not mongos).
+    FIND_COMMAND = 4,
+
+    // Supports all write commands take a write concern.
+    COMMANDS_ACCEPT_WRITE_CONCERN = 5,
+
+    // Supports the new OP_MSG wireprotocol (3.6+).
+    SUPPORTS_OP_MSG = 6,
+
+    // Set this to the highest value in this enum - it will be the default maxWireVersion for
+    // the WireSpec values.
+    LATEST_WIRE_VERSION = SUPPORTS_OP_MSG,
+};
+
+/**
+ * Struct to pass around information about wire version.
+ */
+struct WireVersionInfo {
+    int minWireVersion;
+    int maxWireVersion;
+};
+
+struct WireSpec {
+    MONGO_DISALLOW_COPYING(WireSpec);
+
+    static WireSpec& instance();
+
     /**
-     * The 'WireVersion' captures all "protocol events" the write protocol went through.  A
-     * protocol event is a change in the syntax of messages on the wire or the semantics of
-     * existing messages. We may also add "logical" entries for releases, although that's not
-     * mandatory.
+     * Appends the min and max versions in 'wireVersionInfo' to 'builder' in the format expected for
+     * reporting information about the internal client.
      *
-     * We use the wire version to determine if two agents (a driver, a mongos, or a mongod) can
-     * interact. Each agent carries two versions, a 'max' and a 'min' one. If the two agents
-     * are on the same 'max' number, they stricly speak the same wire protocol and it is safe
-     * to allow them to communicate. If two agents' ranges do not intersect, they should not be
-     * allowed to communicate.
+     * Intended for use as part of performing the isMaster handshake with a remote node. When an
+     * internal clients make a connection to another node in the cluster, it includes internal
+     * client information as a parameter to the isMaster command. This parameter has the following
+     * format:
      *
-     * If two agents have at least one version in common they can communicate, but one of the
-     * sides has to be ready to compensate for not being on its partner version.
+     *    internalClient: {
+     *        minWireVersion: <int>,
+     *        maxWireVersion: <int>
+     *    }
+     *
+     * This information can be used to ensure correctness during upgrade in mixed version clusters.
      */
-    enum WireVersion {
-        // Everything before we started tracking.
-        RELEASE_2_4_AND_BEFORE = 0,
+    static void appendInternalClientWireVersion(WireVersionInfo wireVersionInfo,
+                                                BSONObjBuilder* builder);
 
-        // The aggregation command may now be requested to return cursors.
-        AGG_RETURNS_CURSORS = 1,
+    // incoming.minWireVersion - Minimum version that the server accepts on incoming requests. We
+    // should bump this whenever we don't want to allow incoming connections from clients that are
+    // too old.
 
-        // insert, update, and delete batch command
-        BATCH_COMMANDS = 2,
+    // incoming.maxWireVersion - Latest version that the server accepts on incoming requests. This
+    // should always be at the latest entry in WireVersion.
+    WireVersionInfo incoming = {RELEASE_2_4_AND_BEFORE, LATEST_WIRE_VERSION};
 
-        // support SCRAM-SHA1, listIndexes, listCollections, new explain
-        RELEASE_2_7_7 = 3
-    };
+    // outgoing.minWireVersion - Minimum version allowed on remote nodes when the server sends
+    // requests. We should bump this whenever we don't want to connect to clients that are too old.
 
-    // Latest version that the server accepts. This should always be at the latest entry in
-    // WireVersion.
-    static const int maxWireVersion = RELEASE_2_7_7;
+    // outgoing.maxWireVersion - Latest version allowed on remote nodes when the server sends
+    // requests.
+    WireVersionInfo outgoing = {RELEASE_2_4_AND_BEFORE, LATEST_WIRE_VERSION};
 
-    // Minimum version that the server accepts. We should bump this whenever we don't want
-    // to allow communication with too old agents.
-    static const int minWireVersion = RELEASE_2_4_AND_BEFORE;
+    // Set to true if the client is internal to the cluster---this is a mongod or mongos connecting
+    // to another mongod.
+    bool isInternalClient = false;
 
-} // namespace mongo
+private:
+    WireSpec() = default;
+};
+
+
+}  // namespace mongo

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,23 +14,25 @@
  */
 static int
 __schema_add_table(WT_SESSION_IMPL *session,
-    const char *name, size_t namelen, int ok_incomplete, WT_TABLE **tablep)
+    const char *name, size_t namelen, bool ok_incomplete, WT_TABLE **tablep)
 {
 	WT_DECL_RET;
 	WT_TABLE *table;
 	uint64_t bucket;
 
-	/* Make sure the metadata is open before getting other locks. */
-	WT_RET(__wt_metadata_open(session));
+	table = NULL;			/* -Wconditional-uninitialized */
 
-	WT_WITH_TABLE_LOCK(session,
+	/* Make sure the metadata is open before getting other locks. */
+	WT_RET(__wt_metadata_cursor(session, NULL));
+
+	WT_WITH_TABLE_READ_LOCK(session,
 	    ret = __wt_schema_open_table(
 	    session, name, namelen, ok_incomplete, &table));
 	WT_RET(ret);
 
 	bucket = table->name_hash % WT_HASH_ARRAY_SIZE;
-	SLIST_INSERT_HEAD(&session->tables, table, l);
-	SLIST_INSERT_HEAD(&session->tablehash[bucket], table, hashl);
+	TAILQ_INSERT_HEAD(&session->tables, table, q);
+	TAILQ_INSERT_HEAD(&session->tablehash[bucket], table, hashq);
 	*tablep = table;
 
 	return (0);
@@ -51,7 +53,7 @@ __schema_find_table(WT_SESSION_IMPL *session,
 	bucket = __wt_hash_city64(name, namelen) % WT_HASH_ARRAY_SIZE;
 
 restart:
-	SLIST_FOREACH(table, &session->tablehash[bucket], hashl) {
+	TAILQ_FOREACH(table, &session->tablehash[bucket], hashq) {
 		tablename = table->name;
 		(void)WT_PREFIX_SKIP(tablename, "table:");
 		if (WT_STRING_MATCH(tablename, name, namelen)) {
@@ -64,7 +66,8 @@ restart:
 			 * between checking the generation and opening the
 			 * first column group.
 			 */
-			if (table->schema_gen != S2C(session)->schema_gen) {
+			if (table->schema_gen !=
+			    __wt_gen(session, WT_GEN_SCHEMA)) {
 				if (table->refcnt == 0) {
 					WT_RET(__wt_schema_remove_table(
 					    session, table));
@@ -86,7 +89,7 @@ restart:
  */
 int
 __wt_schema_get_table(WT_SESSION_IMPL *session,
-    const char *name, size_t namelen, int ok_incomplete, WT_TABLE **tablep)
+    const char *name, size_t namelen, bool ok_incomplete, WT_TABLE **tablep)
 {
 	WT_DECL_RET;
 	WT_TABLE *table;
@@ -122,8 +125,14 @@ __wt_schema_release_table(WT_SESSION_IMPL *session, WT_TABLE *table)
  *	Free a column group handle.
  */
 void
-__wt_schema_destroy_colgroup(WT_SESSION_IMPL *session, WT_COLGROUP *colgroup)
+__wt_schema_destroy_colgroup(WT_SESSION_IMPL *session, WT_COLGROUP **colgroupp)
 {
+	WT_COLGROUP *colgroup;
+
+	if ((colgroup = *colgroupp) == NULL)
+		return;
+	*colgroupp = NULL;
+
 	__wt_free(session, colgroup->name);
 	__wt_free(session, colgroup->source);
 	__wt_free(session, colgroup->config);
@@ -135,9 +144,14 @@ __wt_schema_destroy_colgroup(WT_SESSION_IMPL *session, WT_COLGROUP *colgroup)
  *	Free an index handle.
  */
 int
-__wt_schema_destroy_index(WT_SESSION_IMPL *session, WT_INDEX *idx)
+__wt_schema_destroy_index(WT_SESSION_IMPL *session, WT_INDEX **idxp)
 {
 	WT_DECL_RET;
+	WT_INDEX *idx;
+
+	if ((idx = *idxp) == NULL)
+		return (0);
+	*idxp = NULL;
 
 	/* If there is a custom collator configured, terminate it. */
 	if (idx->collator != NULL &&
@@ -175,12 +189,15 @@ __wt_schema_destroy_index(WT_SESSION_IMPL *session, WT_INDEX *idx)
  *	Free a table handle.
  */
 int
-__wt_schema_destroy_table(WT_SESSION_IMPL *session, WT_TABLE *table)
+__wt_schema_destroy_table(WT_SESSION_IMPL *session, WT_TABLE **tablep)
 {
-	WT_COLGROUP *colgroup;
 	WT_DECL_RET;
-	WT_INDEX *idx;
+	WT_TABLE *table;
 	u_int i;
+
+	if ((table = *tablep) == NULL)
+		return (0);
+	*tablep = NULL;
 
 	__wt_free(session, table->name);
 	__wt_free(session, table->config);
@@ -188,19 +205,15 @@ __wt_schema_destroy_table(WT_SESSION_IMPL *session, WT_TABLE *table)
 	__wt_free(session, table->key_format);
 	__wt_free(session, table->value_format);
 	if (table->cgroups != NULL) {
-		for (i = 0; i < WT_COLGROUPS(table); i++) {
-			if ((colgroup = table->cgroups[i]) == NULL)
-				continue;
-			__wt_schema_destroy_colgroup(session, colgroup);
-		}
+		for (i = 0; i < WT_COLGROUPS(table); i++)
+			__wt_schema_destroy_colgroup(
+			    session, &table->cgroups[i]);
 		__wt_free(session, table->cgroups);
 	}
 	if (table->indices != NULL) {
-		for (i = 0; i < table->nindices; i++) {
-			if ((idx = table->indices[i]) == NULL)
-				continue;
-			WT_TRET(__wt_schema_destroy_index(session, idx));
-		}
+		for (i = 0; i < table->nindices; i++)
+			WT_TRET(__wt_schema_destroy_index(
+			    session, &table->indices[i]));
 		__wt_free(session, table->indices);
 	}
 	__wt_free(session, table);
@@ -218,9 +231,9 @@ __wt_schema_remove_table(WT_SESSION_IMPL *session, WT_TABLE *table)
 	WT_ASSERT(session, table->refcnt <= 1);
 
 	bucket = table->name_hash % WT_HASH_ARRAY_SIZE;
-	SLIST_REMOVE(&session->tables, table, __wt_table, l);
-	SLIST_REMOVE(&session->tablehash[bucket], table, __wt_table, hashl);
-	return (__wt_schema_destroy_table(session, table));
+	TAILQ_REMOVE(&session->tables, table, q);
+	TAILQ_REMOVE(&session->tablehash[bucket], table, hashq);
+	return (__wt_schema_destroy_table(session, &table));
 }
 
 /*
@@ -231,9 +244,42 @@ int
 __wt_schema_close_tables(WT_SESSION_IMPL *session)
 {
 	WT_DECL_RET;
-	WT_TABLE *table;
+	WT_TABLE *table, *table_tmp;
 
-	while ((table = SLIST_FIRST(&session->tables)) != NULL)
+	WT_TAILQ_SAFE_REMOVE_BEGIN(table, &session->tables, q, table_tmp) {
 		WT_TRET(__wt_schema_remove_table(session, table));
+	} WT_TAILQ_SAFE_REMOVE_END
+
 	return (ret);
+}
+
+/*
+ * __wt_schema_sweep_tables --
+ *	Close all idle, obsolete tables in a session.
+ */
+int
+__wt_schema_sweep_tables(WT_SESSION_IMPL *session)
+{
+	WT_TABLE *table, *next;
+	uint64_t schema_gen;
+	bool old_table_busy;
+
+	schema_gen = __wt_gen(session, WT_GEN_SCHEMA);
+	if (schema_gen == session->table_sweep_gen)
+		return (0);
+
+	old_table_busy = false;
+	TAILQ_FOREACH_SAFE(table, &session->tables, q, next)
+		if (table->schema_gen != schema_gen) {
+			if (table->refcnt == 0)
+				WT_RET(__wt_schema_remove_table(
+				    session, table));
+			else
+				old_table_busy = true;
+		}
+
+	if (!old_table_busy)
+		session->table_sweep_gen = schema_gen;
+
+	return (0);
 }

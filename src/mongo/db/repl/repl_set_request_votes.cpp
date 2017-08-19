@@ -28,44 +28,63 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_command.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/executor/network_interface.h"
+#include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace repl {
 
-    class CmdReplSetRequestVotes : public ReplSetCommand {
-    public:
-        CmdReplSetRequestVotes() : ReplSetCommand("replSetRequestVotes") { }
-    private:
-        bool run(OperationContext* txn,
-                 const std::string&,
-                 BSONObj& cmdObj,
-                 int,
-                 std::string& errmsg,
-                 BSONObjBuilder& result) final {
+class CmdReplSetRequestVotes : public ReplSetCommand {
+public:
+    CmdReplSetRequestVotes() : ReplSetCommand("replSetRequestVotes") {}
 
-            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            ReplSetRequestVotesArgs parsedArgs;
-            status = parsedArgs.initialize(cmdObj);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            ReplSetRequestVotesResponse response;
-            status = getGlobalReplicationCoordinator()->processReplSetRequestVotes(txn,
-                                                                                   parsedArgs,
-                                                                                   &response);
-            response.addToBSON(&result);
+private:
+    bool run(OperationContext* opCtx,
+             const std::string&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) final {
+        Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+        if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
-    } cmdReplSetRequestVotes;
 
-} // namespace repl
-} // namespace mongo
+        ReplSetRequestVotesArgs parsedArgs;
+        status = parsedArgs.initialize(cmdObj);
+        if (!status.isOK()) {
+            return appendCommandStatus(result, status);
+        }
+
+        // We want to keep request vote connection open when relinquishing primary.
+        // Tag it here.
+        transport::Session::TagMask originalTag = 0;
+        auto session = opCtx->getClient()->session();
+        if (session) {
+            originalTag = session->getTags();
+            session->replaceTags(originalTag | transport::Session::kKeepOpen);
+        }
+
+        // Untag the connection on exit.
+        ON_BLOCK_EXIT([session, originalTag]() {
+            if (session) {
+                session->replaceTags(originalTag);
+            }
+        });
+
+        ReplSetRequestVotesResponse response;
+        status = getGlobalReplicationCoordinator()->processReplSetRequestVotes(
+            opCtx, parsedArgs, &response);
+        response.addToBSON(&result);
+        return appendCommandStatus(result, status);
+    }
+} cmdReplSetRequestVotes;
+
+}  // namespace repl
+}  // namespace mongo

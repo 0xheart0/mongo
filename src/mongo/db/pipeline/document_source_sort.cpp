@@ -28,342 +28,405 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
-
-#include <boost/make_shared.hpp>
-#include <boost/scoped_ptr.hpp>
+#include "mongo/db/pipeline/document_source_sort.h"
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using boost::scoped_ptr;
-    using std::make_pair;
-    using std::string;
-    using std::vector;
+using boost::intrusive_ptr;
+using std::unique_ptr;
+using std::make_pair;
+using std::string;
+using std::vector;
 
-    const char DocumentSourceSort::sortName[] = "$sort";
+DocumentSourceSort::DocumentSourceSort(const intrusive_ptr<ExpressionContext>& pExpCtx)
+    : DocumentSource(pExpCtx), _mergingPresorted(false) {}
 
-    const char *DocumentSourceSort::getSourceName() const {
-        return sortName;
-    }
+REGISTER_DOCUMENT_SOURCE(sort,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceSort::createFromBson);
 
-    boost::optional<Document> DocumentSourceSort::getNext() {
-        pExpCtx->checkForInterrupt();
+const char* DocumentSourceSort::getSourceName() const {
+    return "$sort";
+}
 
-        if (!populated)
-            populate();
+DocumentSource::GetNextResult DocumentSourceSort::getNext() {
+    pExpCtx->checkForInterrupt();
 
-        if (!_output || !_output->more())
-            return boost::none;
-
-        return _output->next().second;
-    }
-
-    void DocumentSourceSort::serializeToArray(vector<Value>& array, bool explain) const {
-        if (explain) { // always one Value for combined $sort + $limit
-            array.push_back(Value(DOC(getSourceName() <<
-                DOC("sortKey" << serializeSortKey(explain)
-                 << "mergePresorted" << (_mergingPresorted ? Value(true) : Value())
-                 << "limit" << (limitSrc ? Value(limitSrc->getLimit()) : Value())))));
+    if (!_populated) {
+        const auto populationResult = populate();
+        if (populationResult.isPaused()) {
+            return populationResult;
         }
-        else { // one Value for $sort and maybe a Value for $limit
-            MutableDocument inner (serializeSortKey(explain));
-            if (_mergingPresorted)
-                inner["$mergePresorted"] = Value(true);
-            array.push_back(Value(DOC(getSourceName() << inner.freeze())));
-
-            if (limitSrc) {
-                limitSrc->serializeToArray(array);
-            }
-        }
+        invariant(populationResult.isEOF());
     }
 
-    void DocumentSourceSort::dispose() {
-        _output.reset();
-        pSource->dispose();
+    if (!_output || !_output->more()) {
+        // Need to be sure connections are marked as done so they can be returned to the connection
+        // pool. This only needs to happen in the _mergingPresorted case, but it doesn't hurt to
+        // always do it.
+        dispose();
+        return GetNextResult::makeEOF();
     }
 
-    DocumentSourceSort::DocumentSourceSort(const intrusive_ptr<ExpressionContext> &pExpCtx)
-        : DocumentSource(pExpCtx)
-        , populated(false)
-        , _mergingPresorted(false)
-    {}
+    return _output->next().second;
+}
 
-    long long DocumentSourceSort::getLimit() const {
-        return limitSrc ? limitSrc->getLimit() : -1;
-    }
+void DocumentSourceSort::serializeToArray(
+    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
+    if (explain) {  // always one Value for combined $sort + $limit
+        array.push_back(Value(
+            DOC(getSourceName() << DOC(
+                    "sortKey" << serializeSortKey(static_cast<bool>(explain)) << "mergePresorted"
+                              << (_mergingPresorted ? Value(true) : Value())
+                              << "limit"
+                              << (limitSrc ? Value(limitSrc->getLimit()) : Value())))));
+    } else {  // one Value for $sort and maybe a Value for $limit
+        MutableDocument inner(serializeSortKey(static_cast<bool>(explain)));
+        if (_mergingPresorted)
+            inner["$mergePresorted"] = Value(true);
+        array.push_back(Value(DOC(getSourceName() << inner.freeze())));
 
-    bool DocumentSourceSort::coalesce(const intrusive_ptr<DocumentSource> &pNextSource) {
-        if (!limitSrc) {
-            limitSrc = dynamic_cast<DocumentSourceLimit*>(pNextSource.get());
-            return limitSrc.get(); // false if next is not a $limit
-        }
-        else {
-            return limitSrc->coalesce(pNextSource);
+        if (limitSrc) {
+            limitSrc->serializeToArray(array);
         }
     }
+}
 
-    void DocumentSourceSort::addKey(const string& fieldPath, bool ascending) {
-        VariablesIdGenerator idGenerator;
-        VariablesParseState vps(&idGenerator);
-        vSortKey.push_back(ExpressionFieldPath::parse("$$ROOT." + fieldPath, vps));
-        vAscending.push_back(ascending);
-    }
+void DocumentSourceSort::doDispose() {
+    _output.reset();
+}
 
-    Document DocumentSourceSort::serializeSortKey(bool explain) const {
-        MutableDocument keyObj;
-        // add the key fields
-        const size_t n = vSortKey.size();
-        for(size_t i = 0; i < n; ++i) {
-            if (ExpressionFieldPath* efp = dynamic_cast<ExpressionFieldPath*>(vSortKey[i].get())) {
-                // ExpressionFieldPath gets special syntax that includes direction
-                const FieldPath& withVariable = efp->getFieldPath();
-                verify(withVariable.getPathLength() > 1);
-                verify(withVariable.getFieldName(0) == "ROOT");
-                const string fieldPath = withVariable.tail().getPath(false);
+long long DocumentSourceSort::getLimit() const {
+    return limitSrc ? limitSrc->getLimit() : -1;
+}
 
-                // append a named integer based on the sort order
-                keyObj.setField(fieldPath, Value(vAscending[i] ? 1 : -1));
-            }
-            else {
-                // other expressions use a made-up field name
-                keyObj[string(str::stream() << "$computed" << i)] = vSortKey[i]->serialize(explain);
-            }
-        }
-        return keyObj.freeze();
-    }
-
-    DocumentSource::GetDepsReturn DocumentSourceSort::getDependencies(DepsTracker* deps) const {
-        for(size_t i = 0; i < vSortKey.size(); ++i) {
-            vSortKey[i]->addDependencies(deps);
-        }
-
-        return SEE_NEXT;
-    }
-
-
-    intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        uassert(15973, str::stream() << " the " <<
-                sortName << " key specification must be an object",
-                elem.type() == Object);
-
-        return create(pExpCtx, elem.embeddedObject());
-    }
-
-    intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
-            const intrusive_ptr<ExpressionContext> &pExpCtx,
-            BSONObj sortOrder,
-            long long limit) {
-
-        intrusive_ptr<DocumentSourceSort> pSort = new DocumentSourceSort(pExpCtx);
-
-        /* check for then iterate over the sort object */
-        BSONForEach(keyField, sortOrder) {
-            const char* fieldName = keyField.fieldName();
-
-            if (str::equals(fieldName, "$mergePresorted")) {
-                verify(keyField.Bool());
-                pSort->_mergingPresorted = true;
-                continue;
-            }
-
-            if (keyField.type() == Object) {
-                // this restriction is due to needing to figure out sort direction
-                uassert(17312,
-                        "the only expression supported by $sort right now is {$meta: 'textScore'}",
-                        keyField.Obj() == BSON("$meta" << "textScore"));
-
-                pSort->vSortKey.push_back(new ExpressionMeta());
-                pSort->vAscending.push_back(false); // best scoring documents first
-                continue;
-            }
-                
-            uassert(15974,
-                    "$sort key ordering must be specified using a number or {$meta: 'textScore'}",
-                    keyField.isNumber());
-
-            int sortOrder = keyField.numberInt();
-
-            uassert(15975, "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
-                    ((sortOrder == 1) || (sortOrder == -1)));
-
-            pSort->addKey(fieldName, (sortOrder > 0));
-        }
-
-        uassert(15976, str::stream() << sortName << " must have at least one sort key",
-                !pSort->vSortKey.empty());
-
-        if (limit > 0) {
-            bool coalesced = pSort->coalesce(DocumentSourceLimit::create(pExpCtx, limit));
-            verify(coalesced); // should always coalesce
-            verify(pSort->getLimit() == limit);
-        }
-
-        return pSort;
-    }
-
-    SortOptions DocumentSourceSort::makeSortOptions() const {
-        /* make sure we've got a sort key */
-        verify(vSortKey.size());
-
-        SortOptions opts;
-        if (limitSrc)
-            opts.limit = limitSrc->getLimit();
-
-        opts.maxMemoryUsageBytes = 100*1024*1024;
-        if (pExpCtx->extSortAllowed && !pExpCtx->inRouter) {
-            opts.extSortAllowed = true;
-            opts.tempDir = pExpCtx->tempDir;
-        }
-
-        return opts;
-    }
-
-    void DocumentSourceSort::populate() {
-        if (_mergingPresorted) {
-            typedef DocumentSourceMergeCursors DSCursors;
-            typedef DocumentSourceCommandShards DSCommands;
-            if (DSCursors* castedSource = dynamic_cast<DSCursors*>(pSource)) {
-                populateFromCursors(castedSource->getCursors());
-            } else if (DSCommands* castedSource = dynamic_cast<DSCommands*>(pSource)) {
-                populateFromBsonArrays(castedSource->getArrays());
-            } else {
-                msgasserted(17196, "can only mergePresorted from MergeCursors and CommandShards");
-            }
+Document DocumentSourceSort::serializeSortKey(bool explain) const {
+    MutableDocument keyObj;
+    const size_t n = _sortPattern.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (_sortPattern[i].fieldPath) {
+            // Append a named integer based on whether the sort is ascending/descending.
+            keyObj.setField(_sortPattern[i].fieldPath->fullPath(),
+                            Value(_sortPattern[i].isAscending ? 1 : -1));
         } else {
-            scoped_ptr<MySorter> sorter (MySorter::make(makeSortOptions(), Comparator(*this)));
-            while (boost::optional<Document> next = pSource->getNext()) {
-                sorter->add(extractKey(*next), *next);
-            }
-            _output.reset(sorter->done());
+            // For sorts that are not simply on a field path, use a made-up field name.
+            keyObj[string(str::stream() << "$computed" << i)] =
+                _sortPattern[i].expression->serialize(explain);
         }
-        populated = true;
+    }
+    return keyObj.freeze();
+}
+
+Pipeline::SourceContainer::iterator DocumentSourceSort::doOptimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    invariant(*itr == this);
+
+    auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
+
+    if (nextLimit) {
+        // If the following stage is a $limit, we can combine it with ourselves.
+        setLimitSrc(nextLimit);
+        container->erase(std::next(itr));
+        return itr;
+    }
+    return std::next(itr);
+}
+
+DocumentSource::GetDepsReturn DocumentSourceSort::getDependencies(DepsTracker* deps) const {
+    for (auto&& keyPart : _sortPattern) {
+        if (keyPart.expression) {
+            keyPart.expression->addDependencies(deps);
+        } else {
+            deps->fields.insert(keyPart.fieldPath->fullPath());
+        }
     }
 
-    class DocumentSourceSort::IteratorFromCursor : public MySorter::Iterator {
-    public:
-        IteratorFromCursor(DocumentSourceSort* sorter, DBClientCursor* cursor)
-            : _sorter(sorter)
-            , _cursor(cursor)
-        {}
+    return SEE_NEXT;
+}
 
-        bool more() { return _cursor->more(); }
-        Data next() {
-            const Document doc = DocumentSourceMergeCursors::nextSafeFrom(_cursor);
-            return make_pair(_sorter->extractKey(doc), doc);
+
+intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
+    uassert(15973, "the $sort key specification must be an object", elem.type() == Object);
+    return create(pExpCtx, elem.embeddedObject());
+}
+
+intrusive_ptr<DocumentSourceSort> DocumentSourceSort::create(
+    const intrusive_ptr<ExpressionContext>& pExpCtx,
+    BSONObj sortOrder,
+    long long limit,
+    uint64_t maxMemoryUsageBytes) {
+    intrusive_ptr<DocumentSourceSort> pSort(new DocumentSourceSort(pExpCtx));
+    pSort->_maxMemoryUsageBytes = maxMemoryUsageBytes;
+    pSort->_rawSort = sortOrder.getOwned();
+
+    for (auto&& keyField : sortOrder) {
+        auto fieldName = keyField.fieldNameStringData();
+
+        if ("$mergePresorted" == fieldName) {
+            verify(keyField.Bool());
+            pSort->_mergingPresorted = true;
+            continue;
         }
-    private:
-        DocumentSourceSort* _sorter;
-        DBClientCursor* _cursor;
-    };
 
-    void DocumentSourceSort::populateFromCursors(const vector<DBClientCursor*>& cursors) {
-        vector<boost::shared_ptr<MySorter::Iterator> > iterators;
-        for (size_t i = 0; i < cursors.size(); i++) {
-            iterators.push_back(boost::make_shared<IteratorFromCursor>(this, cursors[i]));
+        SortPatternPart patternPart;
+
+        if (keyField.type() == Object) {
+            BSONObj metaDoc = keyField.Obj();
+            // this restriction is due to needing to figure out sort direction
+            uassert(17312,
+                    "$meta is the only expression supported by $sort right now",
+                    metaDoc.firstElement().fieldNameStringData() == "$meta");
+
+            uassert(ErrorCodes::FailedToParse,
+                    "Cannot have additional keys in a $meta sort specification",
+                    metaDoc.nFields() == 1);
+
+            VariablesParseState vps = pExpCtx->variablesParseState;
+            patternPart.expression = ExpressionMeta::parse(pExpCtx, metaDoc.firstElement(), vps);
+
+            // If sorting by textScore, sort highest scores first. If sorting by randVal, order
+            // doesn't matter, so just always use descending.
+            patternPart.isAscending = false;
+
+            pSort->_sortPattern.push_back(std::move(patternPart));
+            continue;
         }
 
-        _output.reset(MySorter::Iterator::merge(iterators, makeSortOptions(), Comparator(*this)));
+        uassert(15974,
+                "$sort key ordering must be specified using a number or {$meta: 'textScore'}",
+                keyField.isNumber());
+
+        int sortOrder = keyField.numberInt();
+
+        uassert(15975,
+                "$sort key ordering must be 1 (for ascending) or -1 (for descending)",
+                ((sortOrder == 1) || (sortOrder == -1)));
+
+        patternPart.fieldPath = FieldPath{fieldName};
+        patternPart.isAscending = (sortOrder > 0);
+        pSort->_paths.insert(patternPart.fieldPath->fullPath());
+        pSort->_sortPattern.push_back(std::move(patternPart));
     }
 
-    class DocumentSourceSort::IteratorFromBsonArray : public MySorter::Iterator {
-    public:
-        IteratorFromBsonArray(DocumentSourceSort* sorter, const BSONArray& array)
-            : _sorter(sorter)
-            , _iterator(array)
-        {}
+    uassert(15976, "$sort stage must have at least one sort key", !pSort->_sortPattern.empty());
 
-        bool more() { return _iterator.more(); }
-        Data next() {
-            Document doc(_iterator.next().Obj());
-            return make_pair(_sorter->extractKey(doc), doc);
-        }
-    private:
-        DocumentSourceSort* _sorter;
-        BSONObjIterator _iterator;
-    };
+    const bool isExplain = false;
+    pSort->_sortKeyGen =
+        SortKeyGenerator{pSort->serializeSortKey(isExplain).toBson(), pExpCtx->getCollator()};
 
-    void DocumentSourceSort::populateFromBsonArrays(const vector<BSONArray>& arrays) {
-        vector<boost::shared_ptr<MySorter::Iterator> > iterators;
-        for (size_t i = 0; i < arrays.size(); i++) {
-            iterators.push_back(boost::make_shared<IteratorFromBsonArray>(this, arrays[i]));
-        }
-
-        _output.reset(MySorter::Iterator::merge(iterators, makeSortOptions(), Comparator(*this)));
+    if (limit > 0) {
+        pSort->setLimitSrc(DocumentSourceLimit::create(pExpCtx, limit));
     }
 
-    Value DocumentSourceSort::extractKey(const Document& d) const {
-        Variables vars(0, d);
-        if (vSortKey.size() == 1) {
-            return vSortKey[0]->evaluate(&vars);
-        }
+    return pSort;
+}
 
-        vector<Value> keys;
-        keys.reserve(vSortKey.size());
-        for (size_t i=0; i < vSortKey.size(); i++) {
-            keys.push_back(vSortKey[i]->evaluate(&vars));
-        }
-        return Value(std::move(keys));
+SortOptions DocumentSourceSort::makeSortOptions() const {
+    /* make sure we've got a sort key */
+    verify(_sortPattern.size());
+
+    SortOptions opts;
+    if (limitSrc)
+        opts.limit = limitSrc->getLimit();
+
+    opts.maxMemoryUsageBytes = _maxMemoryUsageBytes;
+    if (pExpCtx->extSortAllowed && !pExpCtx->inRouter) {
+        opts.extSortAllowed = true;
+        opts.tempDir = pExpCtx->tempDir;
     }
 
-    int DocumentSourceSort::compare(const Value& lhs, const Value& rhs) const {
+    return opts;
+}
 
-        /*
-          populate() already checked that there is a non-empty sort key,
-          so we shouldn't have to worry about that here.
+DocumentSource::GetNextResult DocumentSourceSort::populate() {
+    if (_mergingPresorted) {
+        typedef DocumentSourceMergeCursors DSCursors;
+        if (DSCursors* castedSource = dynamic_cast<DSCursors*>(pSource)) {
+            populateFromCursors(castedSource->getCursors());
+        } else {
+            msgasserted(17196, "can only mergePresorted from MergeCursors");
+        }
+        return DocumentSource::GetNextResult::makeEOF();
+    } else {
+        auto nextInput = pSource->getNext();
+        for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
+            loadDocument(nextInput.releaseDocument());
+        }
+        if (nextInput.isEOF()) {
+            loadingDone();
+        }
+        return nextInput;
+    }
+}
 
-          However, the tricky part is what to do is none of the sort keys are
-          present.  In this case, consider the document less.
-        */
-        const size_t n = vSortKey.size();
-        if (n == 1) { // simple fast case
-            if (vAscending[0])
-                return  Value::compare(lhs, rhs);
-            else
-                return -Value::compare(lhs, rhs);
+void DocumentSourceSort::loadDocument(const Document& doc) {
+    invariant(!_populated);
+    if (!_sorter) {
+        _sorter.reset(MySorter::make(makeSortOptions(), Comparator(*this)));
+    }
+    _sorter->add(extractKey(doc), doc);
+}
+
+void DocumentSourceSort::loadingDone() {
+    if (!_sorter) {
+        _sorter.reset(MySorter::make(makeSortOptions(), Comparator(*this)));
+    }
+    _output.reset(_sorter->done());
+    _sorter.reset();
+    _populated = true;
+}
+
+class DocumentSourceSort::IteratorFromCursor : public MySorter::Iterator {
+public:
+    IteratorFromCursor(DocumentSourceSort* sorter, DBClientCursor* cursor)
+        : _sorter(sorter), _cursor(cursor) {}
+
+    bool more() {
+        return _cursor->more();
+    }
+    Data next() {
+        const Document doc = DocumentSourceMergeCursors::nextSafeFrom(_cursor);
+        return make_pair(_sorter->extractKey(doc), doc);
+    }
+
+private:
+    DocumentSourceSort* _sorter;
+    DBClientCursor* _cursor;
+};
+
+void DocumentSourceSort::populateFromCursors(const vector<DBClientCursor*>& cursors) {
+    vector<std::shared_ptr<MySorter::Iterator>> iterators;
+    for (size_t i = 0; i < cursors.size(); i++) {
+        iterators.push_back(std::make_shared<IteratorFromCursor>(this, cursors[i]));
+    }
+
+    _output.reset(MySorter::Iterator::merge(iterators, makeSortOptions(), Comparator(*this)));
+    _populated = true;
+}
+
+StatusWith<Value> DocumentSourceSort::extractKeyPart(const Document& doc,
+                                                     const SortPatternPart& patternPart) const {
+    if (patternPart.fieldPath) {
+        invariant(!patternPart.expression);
+        return document_path_support::extractElementAlongNonArrayPath(doc, *patternPart.fieldPath);
+    } else {
+        invariant(patternPart.expression);
+        return patternPart.expression->evaluate(doc);
+    }
+}
+
+StatusWith<Value> DocumentSourceSort::extractKeyFast(const Document& doc) const {
+    if (_sortPattern.size() == 1u) {
+        return extractKeyPart(doc, _sortPattern[0]);
+    }
+
+    vector<Value> keys;
+    keys.reserve(_sortPattern.size());
+    for (auto&& keyPart : _sortPattern) {
+        auto extractedKey = extractKeyPart(doc, keyPart);
+        if (!extractedKey.isOK()) {
+            // We can't use the fast path, so bail out.
+            return extractedKey;
         }
 
-        // compound sort
-        for (size_t i = 0; i < n; i++) {
-            int cmp = Value::compare(lhs[i], rhs[i]);
-            if (cmp) {
-                /* if necessary, adjust the return value by the key ordering */
-                if (!vAscending[i])
-                    cmp = -cmp;
+        keys.push_back(std::move(extractedKey.getValue()));
+    }
+    return Value{std::move(keys)};
+}
 
-                return cmp;
-            }
+Value DocumentSourceSort::extractKeyWithArray(const Document& doc) const {
+    SortKeyGenerator::Metadata metadata;
+    if (doc.hasTextScore()) {
+        metadata.textScore = doc.getTextScore();
+    }
+    if (doc.hasRandMetaField()) {
+        metadata.randVal = doc.getRandMetaField();
+    }
+
+    // Convert the Document to a BSONObj, but only do the conversion for the paths we actually need.
+    // Then run the result through the SortKeyGenerator to obtain the final sort key.
+    auto bsonDoc = document_path_support::documentToBsonWithPaths(doc, _paths);
+    auto bsonKey = uassertStatusOK(_sortKeyGen->getSortKey(std::move(bsonDoc), &metadata));
+
+    // Convert BSON sort key, which is an object with empty field names, into the corresponding
+    // array of keys representation as a Value. BSONObj {'': 1, '': [2, 3]} becomes Value [1, [2,
+    // 3]].
+    vector<Value> keys;
+    keys.reserve(_sortPattern.size());
+    for (auto&& elt : bsonKey) {
+        keys.push_back(Value{elt});
+    }
+    return Value{std::move(keys)};
+}
+
+Value DocumentSourceSort::extractKey(const Document& doc) const {
+    auto key = extractKeyFast(doc);
+    if (key.isOK()) {
+        return key.getValue();
+    }
+
+    return extractKeyWithArray(doc);
+}
+
+int DocumentSourceSort::compare(const Value& lhs, const Value& rhs) const {
+    /*
+      populate() already checked that there is a non-empty sort key,
+      so we shouldn't have to worry about that here.
+
+      However, the tricky part is what to do is none of the sort keys are
+      present.  In this case, consider the document less.
+    */
+    const size_t n = _sortPattern.size();
+    if (n == 1) {  // simple fast case
+        if (_sortPattern[0].isAscending)
+            return pExpCtx->getValueComparator().compare(lhs, rhs);
+        else
+            return -pExpCtx->getValueComparator().compare(lhs, rhs);
+    }
+
+    // compound sort
+    for (size_t i = 0; i < n; i++) {
+        int cmp = pExpCtx->getValueComparator().compare(lhs[i], rhs[i]);
+        if (cmp) {
+            /* if necessary, adjust the return value by the key ordering */
+            if (!_sortPattern[i].isAscending)
+                cmp = -cmp;
+
+            return cmp;
         }
-
-        /*
-          If we got here, everything matched (or didn't exist), so we'll
-          consider the documents equal for purposes of this sort.
-        */
-        return 0;
     }
 
-    intrusive_ptr<DocumentSource> DocumentSourceSort::getShardSource() {
-        verify(!_mergingPresorted);
-        return this;
-    }
+    /*
+      If we got here, everything matched (or didn't exist), so we'll
+      consider the documents equal for purposes of this sort.
+    */
+    return 0;
+}
 
-    intrusive_ptr<DocumentSource> DocumentSourceSort::getMergeSource() {
-        verify(!_mergingPresorted);
-        intrusive_ptr<DocumentSourceSort> other = new DocumentSourceSort(pExpCtx);
-        other->vAscending = vAscending;
-        other->vSortKey = vSortKey;
-        other->limitSrc = limitSrc;
-        other->_mergingPresorted = true;
-        return other;
-    }
+intrusive_ptr<DocumentSource> DocumentSourceSort::getShardSource() {
+    verify(!_mergingPresorted);
+    return this;
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceSort::getMergeSource() {
+    verify(!_mergingPresorted);
+    intrusive_ptr<DocumentSourceSort> other = new DocumentSourceSort(pExpCtx);
+    other->_sortPattern = _sortPattern;
+    other->limitSrc = limitSrc;
+    other->_mergingPresorted = true;
+    other->_rawSort = _rawSort;
+    return other;
+}
 }
 
 #include "mongo/db/sorter/sorter.cpp"

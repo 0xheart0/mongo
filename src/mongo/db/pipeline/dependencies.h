@@ -35,43 +35,74 @@
 #include "mongo/db/pipeline/document.h"
 
 namespace mongo {
-    class ParsedDeps;
+class ParsedDeps;
+
+/**
+ * This struct allows components in an agg pipeline to report what they need from their input.
+ */
+struct DepsTracker {
+    /**
+     * Represents what metadata is available on documents that are input to the pipeline.
+     */
+    enum MetadataAvailable { kNoMetadata = 0, kTextScore = 1 };
+
+    DepsTracker(MetadataAvailable metadataAvailable = kNoMetadata)
+        : needWholeDocument(false), _metadataAvailable(metadataAvailable), _needTextScore(false) {}
 
     /**
-     * This struct allows components in an agg pipeline to report what they need from their input.
+     * Returns a projection object covering the dependencies tracked by this class.
      */
-    struct DepsTracker {
-        DepsTracker()
-            : needWholeDocument(false)
-            , needTextScore(false)
-        {}
+    BSONObj toProjection() const;
 
-        /**
-         * Returns a projection object covering the dependencies tracked by this class.
-         */
-        BSONObj toProjection() const;
+    boost::optional<ParsedDeps> toParsedDeps() const;
 
-        boost::optional<ParsedDeps> toParsedDeps() const;
+    std::set<std::string> fields;  // names of needed fields in dotted notation
+    bool needWholeDocument;        // if true, ignore fields and assume the whole document is needed
 
-        std::set<std::string> fields; // names of needed fields in dotted notation
-        bool needWholeDocument; // if true, ignore fields and assume the whole document is needed
-        bool needTextScore;
-    };
 
-    /**
-     * This class is designed to quickly extract the needed fields from a BSONObj into a Document.
-     * It should only be created by a call to DepsTracker::ParsedDeps
-     */
-    class ParsedDeps {
-    public:
-        Document extractFields(const BSONObj& input) const;
+    bool hasNoRequirements() const {
+        return fields.empty() && !needWholeDocument && !_needTextScore;
+    }
 
-    private:
-        friend struct DepsTracker; // so it can call constructor
-        explicit ParsedDeps(const Document& fields)
-            : _fields(fields)
-        {}
+    MetadataAvailable getMetadataAvailable() const {
+        return _metadataAvailable;
+    }
 
-        Document _fields;
-    };
+    bool isTextScoreAvailable() const {
+        return _metadataAvailable & MetadataAvailable::kTextScore;
+    }
+
+    bool getNeedTextScore() const {
+        return _needTextScore;
+    }
+
+    void setNeedTextScore(bool needTextScore) {
+        if (needTextScore && !isTextScoreAvailable()) {
+            uasserted(
+                40218,
+                "pipeline requires text score metadata, but there is no text score available");
+        }
+        _needTextScore = needTextScore;
+    }
+
+private:
+    MetadataAvailable _metadataAvailable;
+    bool _needTextScore;
+};
+
+/**
+ * This class is designed to quickly extract the needed fields from a BSONObj into a Document.
+ * It should only be created by a call to DepsTracker::ParsedDeps
+ */
+class ParsedDeps {
+public:
+    Document extractFields(const BSONObj& input) const;
+
+private:
+    friend struct DepsTracker;  // so it can call constructor
+    explicit ParsedDeps(Document&& fields) : _fields(std::move(fields)), _nFields(_fields.size()) {}
+
+    Document _fields;
+    int _nFields;  // Cache the number of top-level fields needed.
+};
 }

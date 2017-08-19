@@ -31,55 +31,40 @@
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/db/service_context.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-    class OperationContext;
-
-namespace threadpool {
-
-    class ThreadPool;
-
-} // namespace threadpool
+class Client;
+class OldThreadPool;
+class OperationContext;
 
 namespace repl {
 
-    class TaskRunner;
+class TaskRunner;
 
-    /**
-     * Test fixture for tests that require a TaskRunner and/or
-     * ThreadPool.
-     */
-    class TaskRunnerTest : public unittest::Test {
-    public:
-        static Status getDefaultStatus();
+/**
+ * Test fixture for tests that require a TaskRunner and/or
+ * ThreadPool.
+ */
+class TaskRunnerTest : public unittest::Test {
+public:
+    static Status getDetectableErrorStatus();
 
-        /**
-         * Returns ID of mock operation context returned from createOperationContext().
-         * Returns -1 if txn is null.
-         * Returns -2 if txn cannot be converted to a mock operation context containing an ID.
-         */
-        static int getOperationContextId(OperationContext* txn);
+    OldThreadPool& getThreadPool() const;
+    TaskRunner& getTaskRunner() const;
 
-        /**
-         * Returns an noop operation context with an embedded numerical ID.
-         */
-        virtual OperationContext* createOperationContext() const;
+    void destroyTaskRunner();
 
-        threadpool::ThreadPool& getThreadPool() const;
-        TaskRunner& getTaskRunner() const;
+protected:
+    void setUp() override;
+    void tearDown() override;
 
-        void resetTaskRunner(TaskRunner* taskRunner);
-        void destroyTaskRunner();
+private:
+    std::unique_ptr<OldThreadPool> _threadPool;
+    std::unique_ptr<TaskRunner> _taskRunner;
+};
 
-        void setUp() override;
-        void tearDown() override;
-
-    private:
-        std::unique_ptr<threadpool::ThreadPool> _threadPool;
-        std::unique_ptr<TaskRunner> _taskRunner;
-    };
-
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

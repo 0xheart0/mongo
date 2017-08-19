@@ -29,57 +29,98 @@
 #pragma once
 
 #include <boost/intrusive_ptr.hpp>
-#include <boost/shared_ptr.hpp>
+#include <memory>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/query/plan_executor.h"
 
 namespace mongo {
-    class Collection;
-    class DocumentSourceCursor;
-    struct ExpressionContext;
-    class OperationContext;
-    class Pipeline;
-    class PlanExecutor;
+class Collection;
+class DocumentSourceCursor;
+class DocumentSourceSort;
+class ExpressionContext;
+class OperationContext;
+class Pipeline;
+struct PlanSummaryStats;
+class BSONObj;
+struct DepsTracker;
 
-    /*
-      PipelineD is an extension of the Pipeline class, but with additional
-      material that references symbols that are not available in mongos,
-      where the remainder of the Pipeline class also functions.  PipelineD
-      is a friend of Pipeline so that it can have equal access to Pipeline's
-      members.
+/*
+  PipelineD is an extension of the Pipeline class, but with additional
+  material that references symbols that are not available in mongos,
+  where the remainder of the Pipeline class also functions.  PipelineD
+  is a friend of Pipeline so that it can have equal access to Pipeline's
+  members.
 
-      See the friend declaration in Pipeline.
+  See the friend declaration in Pipeline.
+ */
+class PipelineD {
+public:
+    /**
+     * Create a Cursor wrapped in a DocumentSourceCursor, which is suitable
+     * to be the first source for a pipeline to begin with.  This source
+     * will feed the execution of the pipeline.
+     *
+     * This method looks for early pipeline stages that can be folded into
+     * the underlying cursor, and when a cursor can absorb those, they
+     * are removed from the head of the pipeline.  For example, an
+     * early match can be removed and replaced with a Cursor that will
+     * do an index scan.
+     *
+     * The cursor is added to the front of the pipeline's sources.
+     *
+     * Callers must take care to ensure that 'nss' is locked in at least IS-mode.
+     *
+     * When not null, 'aggRequest' provides access to pipeline command options such as hint.
      */
-    class PipelineD {
-    public:
+    static void prepareCursorSource(Collection* collection,
+                                    const NamespaceString& nss,
+                                    const AggregationRequest* aggRequest,
+                                    Pipeline* pipeline);
 
-        /**
-         * Create a Cursor wrapped in a DocumentSourceCursor, which is suitable
-         * to be the first source for a pipeline to begin with.  This source
-         * will feed the execution of the pipeline.
-         *
-         * This method looks for early pipeline stages that can be folded into
-         * the underlying cursor, and when a cursor can absorb those, they
-         * are removed from the head of the pipeline.  For example, an
-         * early match can be removed and replaced with a Cursor that will
-         * do an index scan.
-         *
-         * The cursor is added to the front of the pipeline's sources.
-         *
-         * Must have a AutoGetCollectionForRead before entering.
-         *
-         * If the returned PlanExecutor is non-null, you are responsible for ensuring
-         * it receives appropriate invalidate and kill messages.
-         *
-         * @param pPipeline the logical "this" for this operation
-         * @param pExpCtx the expression context for this pipeline
-         */
-        static boost::shared_ptr<PlanExecutor> prepareCursorSource(
-            OperationContext* txn,
-            Collection* collection,
-            const boost::intrusive_ptr<Pipeline> &pPipeline,
-            const boost::intrusive_ptr<ExpressionContext> &pExpCtx);
+    static std::string getPlanSummaryStr(const Pipeline* pipeline);
 
-    private:
-        PipelineD(); // does not exist:  prevent instantiation
-    };
+    static void getPlanSummaryStats(const Pipeline* pipeline, PlanSummaryStats* statsOut);
 
-} // namespace mongo
+private:
+    PipelineD();  // does not exist:  prevent instantiation
+
+    /**
+     * Creates a PlanExecutor to be used in the initial cursor source. If the query system can use
+     * an index to provide a more efficient sort or projection, the sort and/or projection will be
+     * incorporated into the PlanExecutor.
+     *
+     * 'sortObj' will be set to an empty object if the query system cannot provide a non-blocking
+     * sort, and 'projectionObj' will be set to an empty object if the query system cannot provide a
+     * covered projection.
+     */
+    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> prepareExecutor(
+        OperationContext* opCtx,
+        Collection* collection,
+        const NamespaceString& nss,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
+        const DepsTracker& deps,
+        const BSONObj& queryObj,
+        const AggregationRequest* aggRequest,
+        BSONObj* sortObj,
+        BSONObj* projectionObj);
+
+    /**
+     * Creates a DocumentSourceCursor from the given PlanExecutor and adds it to the front of the
+     * Pipeline.
+     */
+    static void addCursorSource(Collection* collection,
+                                Pipeline* pipeline,
+                                const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                                DepsTracker deps,
+                                const BSONObj& queryObj = BSONObj(),
+                                const BSONObj& sortObj = BSONObj(),
+                                const BSONObj& projectionObj = BSONObj());
+};
+
+}  // namespace mongo

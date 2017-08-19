@@ -34,90 +34,100 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/replica_set_config.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
+#include "mongo/db/repl/scatter_gather_runner.h"
+#include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/functional.h"
 
 namespace mongo {
 
-    class Status;
+class Status;
 
 namespace repl {
 
-    class ScatterGatherRunner;
-    class ReplSetDeclareRequestVotesArgs;
+class VoteRequester {
+    MONGO_DISALLOW_COPYING(VoteRequester);
 
-    class VoteRequester {
-        MONGO_DISALLOW_COPYING(VoteRequester);
+public:
+    enum class Result { kSuccessfullyElected, kStaleTerm, kInsufficientVotes, kPrimaryRespondedNo };
+
+    class Algorithm : public ScatterGatherAlgorithm {
     public:
-
-        class Algorithm : public ScatterGatherAlgorithm {
-        public:
-            Algorithm(const ReplicaSetConfig& rsConfig,
-                      long long candidateId,
-                      long long term,
-                      OpTime lastOplogEntry);
-            virtual ~Algorithm();
-            virtual std::vector<ReplicationExecutor::RemoteCommandRequest> getRequests() const;
-            virtual void processResponse(
-                    const ReplicationExecutor::RemoteCommandRequest& request,
-                    const ResponseStatus& response);
-            virtual bool hasReceivedSufficientResponses() const;
-
-            /**
-             * Returns BadValue if the term for which we are running is statel, IllegalOperation if
-             * insufficient votes are received, and Status::OK if we've won the election.
-             * 
-             * It is invalid to call this before hasReceivedSufficeintResponses returns true.
-             */
-            Status getStatus() const { return _status; }
-
-        private:
-            const ReplicaSetConfig _rsConfig;
-            const long long _candidateId;
-            const long long _term;
-            const OpTime _lastOplogEntry;
-            std::vector<HostAndPort> _targets;
-            bool _failed = false;
-            long long _responsesProcessed = 0;
-            long long _votes = 1;
-            Status _status = Status::OK();
-        };
-
-        VoteRequester();
-        virtual ~VoteRequester();
+        Algorithm(const ReplSetConfig& rsConfig,
+                  long long candidateIndex,
+                  long long term,
+                  bool dryRun,
+                  OpTime lastDurableOpTime,
+                  int primaryIndex);
+        virtual ~Algorithm();
+        virtual std::vector<executor::RemoteCommandRequest> getRequests() const;
+        virtual void processResponse(const executor::RemoteCommandRequest& request,
+                                     const executor::RemoteCommandResponse& response);
+        virtual bool hasReceivedSufficientResponses() const;
 
         /**
-         * Begins the process of sending replSetRequestVotes commands to all non-DOWN nodes
-         * in currentConfig, in attempt to receive sufficient votes to win the election.
+         * Returns a VoteRequest::Result indicating the result of the election.
          *
-         * evh can be used to schedule a callback when the process is complete.
-         * This function must be run in the executor, as it must be synchronous with the command
-         * callbacks that it schedules.
-         * If this function returns Status::OK(), evh is then guaranteed to be signaled.
-         **/
-        StatusWith<ReplicationExecutor::EventHandle> start(
-            ReplicationExecutor* executor,
-            const ReplicaSetConfig& rsConfig,
-            long long candidateId,
-            long long term,
-            OpTime lastOplogEntry,
-            const stdx::function<void ()>& onCompletion = stdx::function<void ()>());
-
-        /**
-         * Informs the VoteRequester to cancel further processing.  The "executor"
-         * argument must point to the same executor passed to "start()".
-         *
-         * Like start(), this method must run in the executor context.
+         * It is invalid to call this before hasReceivedSufficientResponses returns true.
          */
-        void cancel(ReplicationExecutor* executor);
+        Result getResult() const;
+
+        /**
+         * Returns the list of nodes that responded to the VoteRequest command.
+         */
+        unordered_set<HostAndPort> getResponders() const;
 
     private:
-        std::unique_ptr<Algorithm> _algorithm;
-        std::unique_ptr<ScatterGatherRunner> _runner;
-        bool _isCanceled = false;
+        enum class PrimaryVote { Pending, Yes, No };
+
+        const ReplSetConfig _rsConfig;
+        const long long _candidateIndex;
+        const long long _term;
+        bool _dryRun = false;  // this bool indicates this is a mock election when true
+        const OpTime _lastDurableOpTime;
+        std::vector<HostAndPort> _targets;
+        unordered_set<HostAndPort> _responders;
+        bool _staleTerm = false;
+        long long _responsesProcessed = 0;
+        long long _votes = 1;
+        boost::optional<HostAndPort> _primaryHost;
+        PrimaryVote _primaryVote = PrimaryVote::Pending;
     };
+
+    VoteRequester();
+    virtual ~VoteRequester();
+
+    /**
+     * Begins the process of sending replSetRequestVotes commands to all non-DOWN nodes
+     * in currentConfig, in attempt to receive sufficient votes to win the election.
+     * If primaryIndex is not -1, then it means that the primary's vote is required
+     * to win the elction.
+     *
+     * evh can be used to schedule a callback when the process is complete.
+     * If this function returns Status::OK(), evh is then guaranteed to be signaled.
+     **/
+    StatusWith<executor::TaskExecutor::EventHandle> start(executor::TaskExecutor* executor,
+                                                          const ReplSetConfig& rsConfig,
+                                                          long long candidateIndex,
+                                                          long long term,
+                                                          bool dryRun,
+                                                          OpTime lastDurableOpTime,
+                                                          int primaryIndex);
+
+    /**
+     * Informs the VoteRequester to cancel further processing.
+     */
+    void cancel();
+
+    Result getResult() const;
+    unordered_set<HostAndPort> getResponders() const;
+
+private:
+    std::unique_ptr<Algorithm> _algorithm;
+    std::unique_ptr<ScatterGatherRunner> _runner;
+    bool _isCanceled = false;
+};
 
 }  // namespace repl
 }  // namespace mongo

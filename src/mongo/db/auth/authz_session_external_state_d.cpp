@@ -32,8 +32,6 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/client.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
@@ -43,29 +41,28 @@
 
 namespace mongo {
 
-    AuthzSessionExternalStateMongod::AuthzSessionExternalStateMongod(
-            AuthorizationManager* authzManager) :
-                AuthzSessionExternalStateServerCommon(authzManager) {}
-    AuthzSessionExternalStateMongod::~AuthzSessionExternalStateMongod() {}
+AuthzSessionExternalStateMongod::AuthzSessionExternalStateMongod(AuthorizationManager* authzManager)
+    : AuthzSessionExternalStateServerCommon(authzManager) {}
+AuthzSessionExternalStateMongod::~AuthzSessionExternalStateMongod() {}
 
-    void AuthzSessionExternalStateMongod::startRequest(OperationContext* txn) {
-        // No locks should be held as this happens before any database accesses occur
-        dassert(!txn->lockState()->isLocked());
+void AuthzSessionExternalStateMongod::startRequest(OperationContext* opCtx) {
+    // No locks should be held as this happens before any database accesses occur
+    dassert(!opCtx->lockState()->isLocked());
 
-        _checkShouldAllowLocalhost(txn);
-    }
+    _checkShouldAllowLocalhost(opCtx);
+}
 
-    bool AuthzSessionExternalStateMongod::shouldIgnoreAuthChecks() const {
-        // TODO(spencer): get "isInDirectClient" from OperationContext
-        return cc().isInDirectClient() ||
-               AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks();
-    }
+bool AuthzSessionExternalStateMongod::shouldIgnoreAuthChecks() const {
+    // TODO(spencer): get "isInDirectClient" from OperationContext
+    return cc().isInDirectClient() ||
+        AuthzSessionExternalStateServerCommon::shouldIgnoreAuthChecks();
+}
 
-    bool AuthzSessionExternalStateMongod::serverIsArbiter() const {
-        // Arbiters have access to extra privileges under localhost. See SERVER-5479.
-        return (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+bool AuthzSessionExternalStateMongod::serverIsArbiter() const {
+    // Arbiters have access to extra privileges under localhost. See SERVER-5479.
+    return (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
                 repl::ReplicationCoordinator::modeReplSet &&
-                repl::getGlobalReplicationCoordinator()->getMemberState().arbiter());
-    }
+            repl::getGlobalReplicationCoordinator()->getMemberState().arbiter());
+}
 
-} // namespace mongo
+}  // namespace mongo

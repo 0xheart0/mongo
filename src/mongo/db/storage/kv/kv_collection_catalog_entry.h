@@ -30,66 +30,80 @@
 
 #pragma once
 
+#include <memory>
+
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
 #include "mongo/db/storage/record_store.h"
 
 namespace mongo {
 
-    class KVCatalog;
-    class KVEngine;
+class KVCatalog;
+class KVEngine;
 
-    class KVCollectionCatalogEntry final : public BSONCollectionCatalogEntry {
-    public:
-        KVCollectionCatalogEntry( KVEngine* engine,
-                                  KVCatalog* catalog,
-                                  StringData ns,
-                                  StringData ident,
-                                  RecordStore* rs );
+class KVCollectionCatalogEntry final : public BSONCollectionCatalogEntry {
+public:
+    KVCollectionCatalogEntry(KVEngine* engine,
+                             KVCatalog* catalog,
+                             StringData ns,
+                             StringData ident,
+                             std::unique_ptr<RecordStore> rs);
 
-        ~KVCollectionCatalogEntry() final;
+    ~KVCollectionCatalogEntry() final;
 
-        int getMaxAllowedIndexes() const final { return 64; };
-
-        bool setIndexIsMultikey(OperationContext* txn,
-                                StringData indexName,
-                                bool multikey = true) final;
-
-        void setIndexHead( OperationContext* txn,
-                           StringData indexName,
-                           const RecordId& newHead ) final;
-
-        Status removeIndex( OperationContext* txn,
-                            StringData indexName ) final;
-
-        Status prepareForIndexBuild( OperationContext* txn,
-                                     const IndexDescriptor* spec ) final;
-
-        void indexBuildSuccess( OperationContext* txn,
-                                StringData indexName ) final;
-
-        void updateTTLSetting( OperationContext* txn,
-                               StringData idxName,
-                               long long newExpireSeconds ) final;
-
-        void updateFlags(OperationContext* txn, int newValue) final;
-
-        void updateValidator(OperationContext* txn, const BSONObj& validator) final;
-
-        RecordStore* getRecordStore() { return _recordStore.get(); }
-        const RecordStore* getRecordStore() const { return _recordStore.get(); }
-
-    protected:
-        MetaData _getMetaData( OperationContext* txn ) const final;
-
-    private:
-        class AddIndexChange;
-        class RemoveIndexChange;
-
-        KVEngine* _engine; // not owned
-        KVCatalog* _catalog; // not owned
-        std::string _ident;
-        boost::scoped_ptr<RecordStore> _recordStore; // owned
+    int getMaxAllowedIndexes() const final {
+        return 64;
     };
 
+    bool setIndexIsMultikey(OperationContext* opCtx,
+                            StringData indexName,
+                            const MultikeyPaths& multikeyPaths) final;
+
+    void setIndexHead(OperationContext* opCtx, StringData indexName, const RecordId& newHead) final;
+
+    Status removeIndex(OperationContext* opCtx, StringData indexName) final;
+
+    Status prepareForIndexBuild(OperationContext* opCtx, const IndexDescriptor* spec) final;
+
+    void indexBuildSuccess(OperationContext* opCtx, StringData indexName) final;
+
+    void updateTTLSetting(OperationContext* opCtx,
+                          StringData idxName,
+                          long long newExpireSeconds) final;
+
+    void updateFlags(OperationContext* opCtx, int newValue) final;
+
+    void updateValidator(OperationContext* opCtx,
+                         const BSONObj& validator,
+                         StringData validationLevel,
+                         StringData validationAction) final;
+
+    void updateCappedSize(OperationContext*, long long int) final;
+
+    void addUUID(OperationContext* opCtx, CollectionUUID uuid, Collection* coll) final;
+
+    void removeUUID(OperationContext* opCtx) final;
+
+    bool isEqualToMetadataUUID(OperationContext* opCtx, OptionalCollectionUUID uuid) final;
+
+    RecordStore* getRecordStore() {
+        return _recordStore.get();
+    }
+    const RecordStore* getRecordStore() const {
+        return _recordStore.get();
+    }
+
+protected:
+    MetaData _getMetaData(OperationContext* opCtx) const final;
+
+private:
+    class AddIndexChange;
+    class RemoveIndexChange;
+
+    KVEngine* _engine;    // not owned
+    KVCatalog* _catalog;  // not owned
+    std::string _ident;
+    std::unique_ptr<RecordStore> _recordStore;  // owned
+};
 }

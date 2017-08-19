@@ -32,6 +32,7 @@
 
 #include "mongo/db/catalog/drop_collection.h"
 
+#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -40,70 +41,78 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-namespace {
-    std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                         Database* db,
-                                         const NamespaceString& collectionName) {
-        IndexCatalog::IndexKillCriteria criteria;
-        criteria.ns = collectionName;
-        return IndexBuilder::killMatchingIndexBuilds(db->getCollection(collectionName),
-                                                     criteria);
+
+Status dropCollection(OperationContext* opCtx,
+                      const NamespaceString& collectionName,
+                      BSONObjBuilder& result,
+                      const repl::OpTime& dropOpTime,
+                      DropCollectionSystemCollectionMode systemCollectionMode) {
+    if (!serverGlobalParams.quiet.load()) {
+        log() << "CMD: drop " << collectionName;
     }
 
-} // namespace
-    Status dropCollection(OperationContext* txn,
-                          const NamespaceString& collectionName,
-                          BSONObjBuilder& result) {
-        if (!serverGlobalParams.quiet) {
-            log() << "CMD: drop " << collectionName;
+    const std::string dbname = collectionName.db().toString();
+
+    return writeConflictRetry(opCtx, "drop", collectionName.ns(), [&] {
+        AutoGetDb autoDb(opCtx, dbname, MODE_X);
+        Database* const db = autoDb.getDb();
+        Collection* coll = db ? db->getCollection(opCtx, collectionName) : nullptr;
+        auto view =
+            db && !coll ? db->getViewCatalog()->lookup(opCtx, collectionName.ns()) : nullptr;
+
+        if (!db || (!coll && !view)) {
+            return Status(ErrorCodes::NamespaceNotFound, "ns not found");
         }
 
-        std::string dbname = collectionName.db().toString();
+        const bool shardVersionCheck = true;
+        OldClientContext context(opCtx, collectionName.ns(), shardVersionCheck);
 
-        MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-            ScopedTransaction transaction(txn, MODE_IX);
+        bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
+            !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, collectionName);
 
-            AutoGetDb autoDb(txn, dbname, MODE_X);
-            Database* const db = autoDb.getDb();
-            Collection* coll = db ? db->getCollection(collectionName) : nullptr;
+        if (userInitiatedWritesAndNotPrimary) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while dropping collection "
+                                        << collectionName.ns());
+        }
 
-            // If db/collection does not exist, short circuit and return.
-            if ( !db || !coll ) {
-                return Status(ErrorCodes::NamespaceNotFound, "ns not found");
-            }
-            OldClientContext context(txn, collectionName);
+        WriteUnitOfWork wunit(opCtx);
+        result.append("ns", collectionName.ns());
 
-            bool userInitiatedWritesAndNotPrimary = txn->writesAreReplicated() &&
-                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname);
+        if (coll) {
+            invariant(!view);
+            int numIndexes = coll->getIndexCatalog()->numIndexesTotal(opCtx);
 
-            if (userInitiatedWritesAndNotPrimary) {
-                return Status(ErrorCodes::NotMaster,
-                              str::stream() << "Not primary while dropping collection "
-                                            << collectionName.ns());
-            }
+            BackgroundOperation::assertNoBgOpInProgForNs(collectionName.ns());
 
-            int numIndexes = coll->getIndexCatalog()->numIndexesTotal(txn);
+            Status s = systemCollectionMode ==
+                    DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops
+                ? db->dropCollection(opCtx, collectionName.ns(), dropOpTime)
+                : db->dropCollectionEvenIfSystem(opCtx, collectionName, dropOpTime);
 
-            stopIndexBuilds(txn, db, collectionName);
-
-            result.append("ns", collectionName);
-            result.append("nIndexesWas", numIndexes);
-            WriteUnitOfWork wunit(txn);
-            Status s = db->dropCollection(txn, collectionName.ns());
-
-            if ( !s.isOK() ) {
+            if (!s.isOK()) {
                 return s;
             }
 
-            wunit.commit();
-        } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "drop", collectionName.ns());
+            result.append("nIndexesWas", numIndexes);
+        } else {
+            invariant(view);
+            Status status = db->dropView(opCtx, collectionName.ns());
+            if (!status.isOK()) {
+                return status;
+            }
+        }
+        wunit.commit();
+
         return Status::OK();
-    }
-} // namespace mongo
+    });
+}
+
+}  // namespace mongo

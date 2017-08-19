@@ -28,193 +28,252 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
 
-#include <boost/shared_ptr.hpp>
-
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/query/find_constants.h"
-#include "mongo/db/storage_options.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using boost::shared_ptr;
-    using std::string;
+using boost::intrusive_ptr;
+using std::shared_ptr;
+using std::string;
 
-    DocumentSourceCursor::~DocumentSourceCursor() {
+const char* DocumentSourceCursor::getSourceName() const {
+    return "$cursor";
+}
+
+DocumentSource::GetNextResult DocumentSourceCursor::getNext() {
+    pExpCtx->checkForInterrupt();
+
+    if (_currentBatch.empty()) {
+        loadBatch();
+
+        if (_currentBatch.empty())
+            return GetNextResult::makeEOF();
+    }
+
+    Document out = std::move(_currentBatch.front());
+    _currentBatch.pop_front();
+    return std::move(out);
+}
+
+void DocumentSourceCursor::loadBatch() {
+    if (!_exec) {
+        // No more documents.
         dispose();
+        return;
     }
 
-    const char *DocumentSourceCursor::getSourceName() const {
-        return "$cursor";
-    }
-
-    boost::optional<Document> DocumentSourceCursor::getNext() {
-        pExpCtx->checkForInterrupt();
-
-        if (_currentBatch.empty()) {
-            loadBatch();
-
-            if (_currentBatch.empty()) // exhausted the cursor
-                return boost::none;
-        }
-
-        Document out = _currentBatch.front();
-        _currentBatch.pop_front();
-        return out;
-    }
-
-    void DocumentSourceCursor::dispose() {
-        // Can't call in to PlanExecutor or ClientCursor registries from this function since it
-        // will be called when an agg cursor is killed which would cause a deadlock.
-        _exec.reset();
-        _currentBatch.clear();
-    }
-
-    void DocumentSourceCursor::loadBatch() {
-        if (!_exec) {
-            dispose();
-            return;
-        }
-
-        // We have already validated the sharding version when we constructed the PlanExecutor
-        // so we shouldn't check it again.
-        const NamespaceString nss(_ns);
-        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
-
-        _exec->restoreState(pExpCtx->opCtx);
+    PlanExecutor::ExecState state;
+    BSONObj resultObj;
+    {
+        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _exec->nss());
+        _exec->restoreState();
 
         int memUsageBytes = 0;
-        BSONObj obj;
-        PlanExecutor::ExecState state;
-        while ((state = _exec->getNext(&obj, NULL)) == PlanExecutor::ADVANCED) {
-            if (_dependencies) {
-                _currentBatch.push_back(_dependencies->extractFields(obj));
-            }
-            else {
-                _currentBatch.push_back(Document::fromBsonWithMetaData(obj));
-            }
+        {
+            ON_BLOCK_EXIT([this] { recordPlanSummaryStats(); });
 
-            if (_limit) {
-                if (++_docsAddedToBatches == _limit->getLimit()) {
-                    break;
+            while ((state = _exec->getNext(&resultObj, nullptr)) == PlanExecutor::ADVANCED) {
+                if (_shouldProduceEmptyDocs) {
+                    _currentBatch.push_back(Document());
+                } else if (_dependencies) {
+                    _currentBatch.push_back(_dependencies->extractFields(resultObj));
+                } else {
+                    _currentBatch.push_back(Document::fromBsonWithMetaData(resultObj));
                 }
-                verify(_docsAddedToBatches < _limit->getLimit());
+
+                if (_limit) {
+                    if (++_docsAddedToBatches == _limit->getLimit()) {
+                        break;
+                    }
+                    verify(_docsAddedToBatches < _limit->getLimit());
+                }
+
+                memUsageBytes += _currentBatch.back().getApproximateSize();
+
+                // As long as we're waiting for inserts, we shouldn't do any batching at this level
+                // we need the whole pipeline to see each document to see if we should stop waiting.
+                if (shouldWaitForInserts(pExpCtx->opCtx) ||
+                    memUsageBytes > internalDocumentSourceCursorBatchSizeBytes.load()) {
+                    // End this batch and prepare PlanExecutor for yielding.
+                    _exec->saveState();
+                    return;
+                }
             }
-
-            memUsageBytes += _currentBatch.back().getApproximateSize();
-
-            if (memUsageBytes > MaxBytesToReturnToClientAtOnce) {
-                // End this batch and prepare PlanExecutor for yielding.
+            // Special case for tailable cursor -- EOF doesn't preclude more results, so keep
+            // the PlanExecutor alive.
+            if (state == PlanExecutor::IS_EOF && pExpCtx->isTailable()) {
                 _exec->saveState();
                 return;
             }
         }
-
-        // If we got here, there won't be any more documents, so destroy the executor. Can't use
-        // dispose since we want to keep the _currentBatch.
-        _exec.reset();
-
-        uassert(16028, "collection or index disappeared when cursor yielded",
-                state != PlanExecutor::DEAD);
-
-        uassert(17285, "cursor encountered an error: " + WorkingSetCommon::toStatusString(obj),
-                state != PlanExecutor::FAILURE);
-
-        massert(17286, str::stream() << "Unexpected return from PlanExecutor::getNext: " << state,
-                state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);
     }
 
-    void DocumentSourceCursor::setSource(DocumentSource *pSource) {
-        /* this doesn't take a source */
-        verify(false);
-    }
+    // If we got here, there won't be any more documents, so destroy our PlanExecutor. Note we can't
+    // use dispose() since we want to keep the current batch.
+    cleanupExecutor();
 
-    long long DocumentSourceCursor::getLimit() const {
-        return _limit ? _limit->getLimit() : -1;
-    }
-
-    bool DocumentSourceCursor::coalesce(const intrusive_ptr<DocumentSource>& nextSource) {
-        // Note: Currently we assume the $limit is logically after any $sort or
-        // $match. If we ever pull in $match or $sort using this method, we
-        // will need to keep track of the order of the sub-stages.
-
-        if (!_limit) {
-            _limit = dynamic_cast<DocumentSourceLimit*>(nextSource.get());
-            return _limit.get(); // false if next is not a $limit
+    switch (state) {
+        case PlanExecutor::ADVANCED:
+        case PlanExecutor::IS_EOF:
+            return;  // We've reached our limit or exhausted the cursor.
+        case PlanExecutor::DEAD: {
+            uasserted(ErrorCodes::QueryPlanKilled,
+                      str::stream() << "collection or index disappeared when cursor yielded: "
+                                    << WorkingSetCommon::toStatusString(resultObj));
         }
-        else {
-            return _limit->coalesce(nextSource);
+        case PlanExecutor::FAILURE: {
+            uasserted(17285,
+                      str::stream() << "cursor encountered an error: "
+                                    << WorkingSetCommon::toStatusString(resultObj));
         }
-
-        return false;
+        default:
+            MONGO_UNREACHABLE;
     }
+}
 
-    Value DocumentSourceCursor::serialize(bool explain) const {
-        // we never parse a documentSourceCursor, so we only serialize for explain
-        if (!explain)
-            return Value();
+Pipeline::SourceContainer::iterator DocumentSourceCursor::doOptimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    invariant(*itr == this);
 
-        // Get planner-level explain info from the underlying PlanExecutor.
-        BSONObjBuilder explainBuilder;
-        {
-            const NamespaceString nss(_ns);
-            AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
+    auto nextLimit = dynamic_cast<DocumentSourceLimit*>((*std::next(itr)).get());
 
-            massert(17392, "No _exec. Were we disposed before explained?", _exec);
-
-            _exec->restoreState(pExpCtx->opCtx);
-            Explain::explainStages(_exec.get(), ExplainCommon::QUERY_PLANNER, &explainBuilder);
-            _exec->saveState();
+    if (nextLimit) {
+        if (_limit) {
+            // We already have an internal limit, set it to the more restrictive of the two.
+            _limit->setLimit(std::min(_limit->getLimit(), nextLimit->getLimit()));
+        } else {
+            _limit = nextLimit;
         }
+        container->erase(std::next(itr));
+        return itr;
+    }
+    return std::next(itr);
+}
 
-        MutableDocument out;
-        out["query"] = Value(_query);
+void DocumentSourceCursor::recordPlanSummaryStats() {
+    invariant(_exec);
+    // Aggregation handles in-memory sort outside of the query sub-system. Given that we need to
+    // preserve the existing value of hasSortStage rather than overwrite with the underlying
+    // PlanExecutor's value.
+    auto hasSortStage = _planSummaryStats.hasSortStage;
 
-        if (!_sort.isEmpty())
-            out["sort"] = Value(_sort);
+    Explain::getSummaryStats(*_exec, &_planSummaryStats);
 
-        if (_limit)
-            out["limit"] = Value(_limit->getLimit());
+    _planSummaryStats.hasSortStage = hasSortStage;
+}
 
-        if (!_projection.isEmpty())
-            out["fields"] = Value(_projection);
+Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+    // We never parse a DocumentSourceCursor, so we only serialize for explain.
+    if (!explain)
+        return Value();
 
-        // Add explain results from the query system into the agg explain output.
-        BSONObj explainObj = explainBuilder.obj();
-        invariant(explainObj.hasField("queryPlanner"));
-        out["queryPlanner"] = Value(explainObj["queryPlanner"]);
-
-        return Value(DOC(getSourceName() << out.freezeToValue()));
+    // Get planner-level explain info from the underlying PlanExecutor.
+    invariant(_exec);
+    BSONObjBuilder explainBuilder;
+    {
+        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _exec->nss());
+        _exec->restoreState();
+        Explain::explainStages(_exec.get(), autoColl.getCollection(), *explain, &explainBuilder);
+        _exec->saveState();
     }
 
-    DocumentSourceCursor::DocumentSourceCursor(const string& ns,
-                                               const boost::shared_ptr<PlanExecutor>& exec,
-                                               const intrusive_ptr<ExpressionContext> &pCtx)
-        : DocumentSource(pCtx)
-        , _docsAddedToBatches(0)
-        , _ns(ns)
-        , _exec(exec)
-    {}
+    MutableDocument out;
+    out["query"] = Value(_query);
 
-    intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
-            const string& ns,
-            const boost::shared_ptr<PlanExecutor>& exec,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        return new DocumentSourceCursor(ns, exec, pExpCtx);
+    if (!_sort.isEmpty())
+        out["sort"] = Value(_sort);
+
+    if (_limit)
+        out["limit"] = Value(_limit->getLimit());
+
+    if (!_projection.isEmpty())
+        out["fields"] = Value(_projection);
+
+    // Add explain results from the query system into the agg explain output.
+    BSONObj explainObj = explainBuilder.obj();
+    invariant(explainObj.hasField("queryPlanner"));
+    out["queryPlanner"] = Value(explainObj["queryPlanner"]);
+    if (*explain >= ExplainOptions::Verbosity::kExecStats) {
+        invariant(explainObj.hasField("executionStats"));
+        out["executionStats"] = Value(explainObj["executionStats"]);
     }
 
-    void DocumentSourceCursor::setProjection(
-            const BSONObj& projection,
-            const boost::optional<ParsedDeps>& deps) {
-        _projection = projection;
-        _dependencies = deps;
+    return Value(DOC(getSourceName() << out.freezeToValue()));
+}
+
+void DocumentSourceCursor::detachFromOperationContext() {
+    if (_exec) {
+        _exec->detachFromOperationContext();
     }
+}
+
+void DocumentSourceCursor::reattachToOperationContext(OperationContext* opCtx) {
+    if (_exec) {
+        _exec->reattachToOperationContext(opCtx);
+    }
+}
+
+void DocumentSourceCursor::doDispose() {
+    _currentBatch.clear();
+    if (!_exec) {
+        // We've already properly disposed of our PlanExecutor.
+        return;
+    }
+    cleanupExecutor();
+}
+
+void DocumentSourceCursor::cleanupExecutor() {
+    invariant(_exec);
+    auto* opCtx = pExpCtx->opCtx;
+    // We need to be careful to not use AutoGetCollection here, since we only need the lock to
+    // protect potential access to the Collection's CursorManager, and AutoGetCollection may throw
+    // if this namespace has since turned into a view. Using Database::getCollection() will simply
+    // return nullptr if the collection has since turned into a view. In this case, '_exec' will
+    // already have been marked as killed when the collection was dropped, and we won't need to
+    // access the CursorManager to properly dispose of it.
+    AutoGetDb dbLock(opCtx, _exec->nss().db(), MODE_IS);
+    Lock::CollectionLock collLock(opCtx->lockState(), _exec->nss().ns(), MODE_IS);
+    auto collection = dbLock.getDb() ? dbLock.getDb()->getCollection(opCtx, _exec->nss()) : nullptr;
+    auto cursorManager = collection ? collection->getCursorManager() : nullptr;
+    _exec->dispose(opCtx, cursorManager);
+    _exec.reset();
+}
+
+DocumentSourceCursor::~DocumentSourceCursor() {
+    invariant(!_exec);  // '_exec' should have been cleaned up via dispose() before destruction.
+}
+
+DocumentSourceCursor::DocumentSourceCursor(
+    Collection* collection,
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const intrusive_ptr<ExpressionContext>& pCtx)
+    : DocumentSource(pCtx),
+      _docsAddedToBatches(0),
+      _exec(std::move(exec)),
+      _outputSorts(_exec->getOutputSorts()) {
+
+    _planSummary = Explain::getPlanSummary(_exec.get());
+    recordPlanSummaryStats();
+
+    if (collection) {
+        collection->infoCache()->notifyOfQuery(pExpCtx->opCtx, _planSummaryStats.indexesUsed);
+    }
+}
+
+intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
+    Collection* collection,
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const intrusive_ptr<ExpressionContext>& pExpCtx) {
+    intrusive_ptr<DocumentSourceCursor> source(
+        new DocumentSourceCursor(collection, std::move(exec), pExpCtx));
+    return source;
+}
 }

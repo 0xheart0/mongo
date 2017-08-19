@@ -28,172 +28,146 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/dbdirectclient.h"
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/transport/service_entry_point.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    using std::auto_ptr;
-    using std::endl;
-    using std::string;
+using std::unique_ptr;
+using std::string;
 
-    // Called from scripting/engine.cpp and scripting/v8_db.cpp.
-    DBClientBase* createDirectClient(OperationContext* txn) {
-        return new DBDirectClient(txn);
+namespace {
+
+class DirectClientScope {
+    MONGO_DISALLOW_COPYING(DirectClientScope);
+
+public:
+    explicit DirectClientScope(OperationContext* opCtx)
+        : _opCtx(opCtx), _prev(_opCtx->getClient()->isInDirectClient()) {
+        _opCtx->getClient()->setInDirectClient(true);
     }
 
-    namespace {
-
-        class DirectClientScope {
-            MONGO_DISALLOW_COPYING(DirectClientScope);
-        public:
-            explicit DirectClientScope(OperationContext* txn)
-                : _txn(txn), _prev(_txn->getClient()->isInDirectClient()) {
-                _txn->getClient()->setInDirectClient(true);
-            }
-
-            ~DirectClientScope() {
-                _txn->getClient()->setInDirectClient(_prev);
-            }
-
-        private:
-            OperationContext* const _txn;
-            const bool _prev;
-        };
-
-    }  // namespace
-
-
-    DBDirectClient::DBDirectClient(OperationContext* txn)  : _txn(txn) { }
-
-    bool DBDirectClient::isFailed() const {
-        return false;
+    ~DirectClientScope() {
+        _opCtx->getClient()->setInDirectClient(_prev);
     }
 
-    bool DBDirectClient::isStillConnected() {
-        return true;
-    }
+private:
+    OperationContext* const _opCtx;
+    const bool _prev;
+};
 
-    std::string DBDirectClient::toString() const {
-        return "DBDirectClient";
-    }
+}  // namespace
 
-    std::string DBDirectClient::getServerAddress() const {
-        return "localhost"; // TODO: should this have the port?
-    }
 
-    void DBDirectClient::sayPiggyBack(Message& toSend) {
-        // don't need to piggy back when connected locally
-        return say(toSend);
-    }
+DBDirectClient::DBDirectClient(OperationContext* opCtx) : _opCtx(opCtx) {
+    _setServerRPCProtocols(rpc::supports::kAll);
+}
 
-    bool DBDirectClient::callRead(Message& toSend, Message& response) {
-        return call(toSend, response);
-    }
+bool DBDirectClient::isFailed() const {
+    return false;
+}
 
-    ConnectionString::ConnectionType DBDirectClient::type() const {
-        return ConnectionString::MASTER;
-    }
+bool DBDirectClient::isStillConnected() {
+    return true;
+}
 
-    double DBDirectClient::getSoTimeout() const {
-        return 0;
-    }
+std::string DBDirectClient::toString() const {
+    return "DBDirectClient";
+}
 
-    bool DBDirectClient::lazySupported() const {
-        return true;
-    }
+std::string DBDirectClient::getServerAddress() const {
+    return "localhost";  // TODO: should this have the port?
+}
 
-    void DBDirectClient::setOpCtx(OperationContext* txn) {
-        _txn = txn;
-    }
+// Returned version should match the incoming connections restrictions.
+int DBDirectClient::getMinWireVersion() {
+    return WireSpec::instance().incoming.minWireVersion;
+}
 
-    QueryOptions DBDirectClient::_lookupAvailableOptions() {
-        // Exhaust mode is not available in DBDirectClient.
-        return QueryOptions(DBClientBase::_lookupAvailableOptions() & ~QueryOption_Exhaust);
-    }
+// Returned version should match the incoming connections restrictions.
+int DBDirectClient::getMaxWireVersion() {
+    return WireSpec::instance().incoming.maxWireVersion;
+}
 
-    bool DBDirectClient::call(Message& toSend,
-                              Message& response,
-                              bool assertOk,
-                              string* actualServer) {
-        DirectClientScope directClientScope(_txn);
-        LastError::get(_txn->getClient()).startRequest();
+ConnectionString::ConnectionType DBDirectClient::type() const {
+    return ConnectionString::MASTER;
+}
 
-        DbResponse dbResponse;
-        assembleResponse(_txn, toSend, dbResponse, dummyHost);
-        verify(dbResponse.response);
+double DBDirectClient::getSoTimeout() const {
+    return 0;
+}
 
-        // can get rid of this if we make response handling smarter
-        dbResponse.response->concat();
-        response = *dbResponse.response;
+bool DBDirectClient::lazySupported() const {
+    return true;
+}
 
-        return true;
-    }
+void DBDirectClient::setOpCtx(OperationContext* opCtx) {
+    _opCtx = opCtx;
+}
 
-    void DBDirectClient::say(Message& toSend, bool isRetry, string* actualServer) {
-        DirectClientScope directClientScope(_txn);
-        LastError::get(_txn->getClient()).startRequest();
+QueryOptions DBDirectClient::_lookupAvailableOptions() {
+    // Exhaust mode is not available in DBDirectClient.
+    return QueryOptions(DBClientBase::_lookupAvailableOptions() & ~QueryOption_Exhaust);
+}
 
-        DbResponse dbResponse;
-        assembleResponse(_txn, toSend, dbResponse, dummyHost);
-    }
+namespace {
+DbResponse loopbackBuildResponse(OperationContext* const opCtx, Message& toSend) {
+    DirectClientScope directClientScope(opCtx);
+    LastError::get(opCtx->getClient()).startDirectClientRequest();
+    CurOp curOp(opCtx);
 
-    auto_ptr<DBClientCursor> DBDirectClient::query(const string& ns,
-                                                   Query query,
-                                                   int nToReturn,
-                                                   int nToSkip,
-                                                   const BSONObj* fieldsToReturn,
-                                                   int queryOptions,
-                                                   int batchSize) {
+    toSend.header().setId(nextMessageId());
+    toSend.header().setResponseToMsgId(0);
+    return opCtx->getServiceContext()->getServiceEntryPoint()->handleRequest(opCtx, toSend);
+}
+}  // namespace
 
-        return DBClientBase::query(ns,
-                                   query,
-                                   nToReturn,
-                                   nToSkip,
-                                   fieldsToReturn,
-                                   queryOptions,
-                                   batchSize);
-    }
+bool DBDirectClient::call(Message& toSend, Message& response, bool assertOk, string* actualServer) {
+    auto dbResponse = loopbackBuildResponse(_opCtx, toSend);
+    invariant(!dbResponse.response.empty());
+    response = std::move(dbResponse.response);
 
-    void DBDirectClient::killCursor(long long id) {
-        // The killCursor command on the DB client is only used by sharding,
-        // so no need to have it for MongoD.
-        verify(!"killCursor should not be used in MongoD");
-    }
+    return true;
+}
 
-    const HostAndPort DBDirectClient::dummyHost("0.0.0.0", 0);
+void DBDirectClient::say(Message& toSend, bool isRetry, string* actualServer) {
+    auto dbResponse = loopbackBuildResponse(_opCtx, toSend);
+    invariant(dbResponse.response.empty());
+}
 
-    unsigned long long DBDirectClient::count(const string& ns,
-                                             const BSONObj& query,
-                                             int options,
-                                             int limit,
-                                             int skip) {
-        BSONObj cmdObj = _countCmd(ns, query, options, limit, skip);
+unique_ptr<DBClientCursor> DBDirectClient::query(const string& ns,
+                                                 Query query,
+                                                 int nToReturn,
+                                                 int nToSkip,
+                                                 const BSONObj* fieldsToReturn,
+                                                 int queryOptions,
+                                                 int batchSize) {
+    return DBClientBase::query(
+        ns, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
+}
 
-        NamespaceString nsString(ns);
-        std::string dbname = nsString.db().toString();
+unsigned long long DBDirectClient::count(
+    const string& ns, const BSONObj& query, int options, int limit, int skip) {
+    BSONObj cmdObj = _countCmd(ns, query, options, limit, skip);
 
-        Command* countCmd = Command::findCommand("count");
-        invariant(countCmd);
+    NamespaceString nsString(ns);
 
-        std::string errmsg;
-        BSONObjBuilder result;
-        bool runRetval = countCmd->run(_txn, dbname, cmdObj, options, errmsg, result);
-        if (!runRetval) {
-            Command::appendCommandStatus(result, runRetval, errmsg);
-            Status commandStatus = Command::getStatusFromCommandResult(result.obj());
-            invariant(!commandStatus.isOK());
-            uassertStatusOK(commandStatus);
-        }
+    auto result = Command::runCommandDirectly(
+        _opCtx, OpMsgRequest::fromDBAndBody(nsString.db(), std::move(cmdObj)));
 
-        BSONObj resultObj = result.obj();
-        return static_cast<unsigned long long>(resultObj["n"].numberLong());
-    }
+    uassertStatusOK(getStatusFromCommandResult(result));
+    return static_cast<unsigned long long>(result["n"].numberLong());
+}
 
 }  // namespace mongo

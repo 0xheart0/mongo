@@ -37,128 +37,98 @@
 #include "mongo/logger/tee.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"  // TODO: remove apple dep for this in threadlocal.h
-#include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 namespace {
 
-    /// This flag indicates whether the system providing a per-thread cache of ostringstreams
-    /// for use by LogstreamBuilder instances is initialized and ready for use.  Until this
-    /// flag is true, LogstreamBuilder instances must not use the cache.
-    bool isThreadOstreamCacheInitialized = false;
+/// This flag indicates whether the system providing a per-thread cache of ostringstreams
+/// for use by LogstreamBuilder instances is initialized and ready for use.  Until this
+/// flag is true, LogstreamBuilder instances must not use the cache.
+bool isThreadOstreamCacheInitialized = false;
 
-    MONGO_INITIALIZER(LogstreamBuilder)(InitializerContext*) {
-        isThreadOstreamCacheInitialized = true;
-        return Status::OK();
+MONGO_INITIALIZER(LogstreamBuilder)(InitializerContext*) {
+    isThreadOstreamCacheInitialized = true;
+    return Status::OK();
+}
+
+thread_local std::unique_ptr<std::ostringstream> threadOstreamCache;
+
+// During unittests, where we don't use quickExit(), static finalization may destroy the
+// cache before its last use, so mark it as not initialized in that case.
+// This must be after the definition of threadOstreamCache so that it is destroyed first.
+struct ThreadOstreamCacheFinalizer {
+    ~ThreadOstreamCacheFinalizer() {
+        isThreadOstreamCacheInitialized = false;
     }
+} threadOstreamCacheFinalizer;
 
 }  // namespace
 
-    TSP_DECLARE(std::unique_ptr<std::ostringstream>, threadOstreamCache);
-    TSP_DEFINE(std::unique_ptr<std::ostringstream>, threadOstreamCache);
-
-namespace {
-    // During unittests, where we don't use quickExit(), static finalization may destroy the
-    // cache before its last use, so mark it as not initialized in that case.
-    // This must be after the TSP_DEFINE so that it is destroyed first.
-    struct ThreadOstreamCacheFinalizer {
-        ~ThreadOstreamCacheFinalizer() {
-            isThreadOstreamCacheInitialized = false;
-        }
-    } threadOstreamCacheFinalizer;
-} // namespace
-
 namespace logger {
 
-    LogstreamBuilder::LogstreamBuilder(MessageLogDomain* domain,
-                                       std::string contextName,
-                                       LogSeverity severity)
-        : LogstreamBuilder(domain,
-                           std::move(contextName),
-                           std::move(severity),
-                           LogComponent::kDefault) {}
+LogstreamBuilder::LogstreamBuilder(MessageLogDomain* domain,
+                                   StringData contextName,
+                                   LogSeverity severity)
+    : LogstreamBuilder(domain, contextName, std::move(severity), LogComponent::kDefault) {}
 
-    LogstreamBuilder::LogstreamBuilder(MessageLogDomain* domain,
-                                       std::string contextName,
-                                       LogSeverity severity,
-                                       LogComponent component)
-        : _domain(domain),
-          _contextName(std::move(contextName)),
-          _severity(std::move(severity)),
-          _component(std::move(component)),
-          _tee(nullptr) {
-    }
+LogstreamBuilder::LogstreamBuilder(MessageLogDomain* domain,
+                                   StringData contextName,
+                                   LogSeverity severity,
+                                   LogComponent component,
+                                   bool shouldCache)
+    : _domain(domain),
+      _contextName(contextName.toString()),
+      _severity(std::move(severity)),
+      _component(std::move(component)),
+      _tee(nullptr),
+      _shouldCache(shouldCache) {}
 
-    LogstreamBuilder::LogstreamBuilder(logger::MessageLogDomain* domain,
-                                       const std::string& contextName,
-                                       LabeledLevel labeledLevel)
-        : LogstreamBuilder(domain,
-                           std::move(contextName),
-                           static_cast<LogSeverity>(labeledLevel)) {
+LogstreamBuilder::LogstreamBuilder(logger::MessageLogDomain* domain,
+                                   StringData contextName,
+                                   LabeledLevel labeledLevel)
+    : LogstreamBuilder(domain, contextName, static_cast<LogSeverity>(labeledLevel)) {
+    setBaseMessage(labeledLevel.getLabel());
+}
 
-        setBaseMessage(labeledLevel.getLabel());
-    }
-
-    LogstreamBuilder::LogstreamBuilder(LogstreamBuilder&& other)
-        : _domain(std::move(other._domain)),
-          _contextName(std::move(other._contextName)),
-          _severity(std::move(other._severity)),
-          _component(std::move(other._component)),
-          _baseMessage(std::move(other._baseMessage)),
-          _os(std::move(other._os)),
-          _tee(std::move(other._tee)) {
-    }
-
-    LogstreamBuilder& LogstreamBuilder::operator=(LogstreamBuilder&& other) {
-        _domain = std::move(other._domain);
-        _contextName = std::move(other._contextName);
-        _severity = std::move(other._severity);
-        _component = std::move(other._component);
-        _baseMessage = std::move(other._baseMessage);
-        _os = std::move(other._os);
-        _tee = std::move(other._tee);
-        return *this;
-    }
-
-
-    LogstreamBuilder::~LogstreamBuilder() {
-        if (_os) {
-            if ( !_baseMessage.empty() ) _baseMessage.push_back(' ');
-            _baseMessage += _os->str();
-            MessageEventEphemeral message(curTimeMillis64(), _severity, _component, _contextName,
-                                          _baseMessage);
-            _domain->append(message);
-            if (_tee) {
-                _os->str("");
-                logger::MessageEventDetailsEncoder teeEncoder;
-                teeEncoder.encode(message, *_os);
-                _tee->write(_os->str());
-            }
+LogstreamBuilder::~LogstreamBuilder() {
+    if (_os) {
+        if (!_baseMessage.empty())
+            _baseMessage.push_back(' ');
+        _baseMessage += _os->str();
+        MessageEventEphemeral message(
+            Date_t::now(), _severity, _component, _contextName, _baseMessage);
+        message.setIsTruncatable(_isTruncatable);
+        _domain->append(message).transitional_ignore();
+        if (_tee) {
             _os->str("");
-            if (isThreadOstreamCacheInitialized && !threadOstreamCache.getMake()->get()) {
-                *threadOstreamCache.get() = std::move(_os);
-            }
+            logger::MessageEventDetailsEncoder teeEncoder;
+            teeEncoder.encode(message, *_os);
+            _tee->write(_os->str());
+        }
+        _os->str("");
+        if (_shouldCache && isThreadOstreamCacheInitialized && !threadOstreamCache) {
+            threadOstreamCache = std::move(_os);
         }
     }
+}
 
-    void LogstreamBuilder::operator<<(Tee* tee) {
-        makeStream();  // Adding a Tee counts for purposes of deciding to make a log message.
-        // TODO: dassert(!_tee);
-        _tee = tee;
-    }
+void LogstreamBuilder::operator<<(Tee* tee) {
+    makeStream();  // Adding a Tee counts for purposes of deciding to make a log message.
+    // TODO: dassert(!_tee);
+    _tee = tee;
+}
 
-    void LogstreamBuilder::makeStream() {
-        if (!_os) {
-            if (isThreadOstreamCacheInitialized && threadOstreamCache.getMake()->get()) {
-                _os = std::move(*threadOstreamCache.get());
-            }
-            else {
-                _os = stdx::make_unique<std::ostringstream>();
-            }
+void LogstreamBuilder::makeStream() {
+    if (!_os) {
+        if (_shouldCache && isThreadOstreamCacheInitialized && threadOstreamCache) {
+            _os = std::move(threadOstreamCache);
+        } else {
+            _os = stdx::make_unique<std::ostringstream>();
         }
     }
+}
 
 }  // namespace logger
 }  // namespace mongo

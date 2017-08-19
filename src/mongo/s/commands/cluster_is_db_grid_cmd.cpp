@@ -29,43 +29,39 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/util/net/sock.h"
 
 namespace mongo {
 namespace {
 
-    class IsDbGridCmd : public Command {
-    public:
-        IsDbGridCmd() : Command("isdbgrid") { }
+class IsDbGridCmd : public BasicCommand {
+public:
+    IsDbGridCmd() : BasicCommand("isdbgrid") {}
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
 
-        virtual bool slaveOk() const {
-            return true;
-        }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
+    virtual bool slaveOk() const {
+        return true;
+    }
 
-            // No auth required
-        }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        // No auth required
+    }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
+    virtual bool run(OperationContext* opCtx,
+                     const std::string& dbname,
+                     const BSONObj& cmdObj,
+                     BSONObjBuilder& result) {
+        result.append("isdbgrid", 1);
+        result.append("hostname", getHostNameCached());
+        return true;
+    }
 
-            result.append("isdbgrid", 1);
-            result.append("hostname", getHostNameCached());
-            return true;
-        }
+} isdbGrid;
 
-    } isdbGrid;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

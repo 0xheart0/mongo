@@ -29,35 +29,58 @@
 #pragma once
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/operation_context.h"
 
 namespace mongo {
-    /**
-     * If true, Collection should do no validation of writes from this OperationContext.
-     *
-     * Note that Decorations are value-constructed so this defaults to false.
-     */
-    extern const OperationContext::Decoration<bool> documentValidationDisabled;
+/**
+ * If true, Collection should do no validation of writes from this OperationContext.
+ *
+ * Note that Decorations are value-constructed so this defaults to false.
+ */
+extern const OperationContext::Decoration<bool> documentValidationDisabled;
 
-    /**
-     * Disables document validation on a single OperationContext while in scope.
-     * Resets to original value when leaving scope so they are safe to nest.
-     */
-    class DisableDocumentValidation {
-        MONGO_DISALLOW_COPYING(DisableDocumentValidation);
-    public:
-        DisableDocumentValidation(OperationContext* txn)
-                : _txn(txn)
-                , _initialState(documentValidationDisabled(_txn)) {
-            documentValidationDisabled(_txn) = true;
-        }
+inline StringData bypassDocumentValidationCommandOption() {
+    return "bypassDocumentValidation";
+}
 
-        ~DisableDocumentValidation() {
-            documentValidationDisabled(_txn) = _initialState;
-        }
+inline bool shouldBypassDocumentValidationForCommand(const BSONObj& cmdObj) {
+    return cmdObj[bypassDocumentValidationCommandOption()].trueValue();
+}
 
-    private:
-        OperationContext* const _txn;
-        const bool _initialState;
-    };
+/**
+ * Disables document validation on a single OperationContext while in scope.
+ * Resets to original value when leaving scope so they are safe to nest.
+ */
+class DisableDocumentValidation {
+    MONGO_DISALLOW_COPYING(DisableDocumentValidation);
+
+public:
+    DisableDocumentValidation(OperationContext* opCtx)
+        : _opCtx(opCtx), _initialState(documentValidationDisabled(_opCtx)) {
+        documentValidationDisabled(_opCtx) = true;
+    }
+
+    ~DisableDocumentValidation() {
+        documentValidationDisabled(_opCtx) = _initialState;
+    }
+
+private:
+    OperationContext* const _opCtx;
+    const bool _initialState;
+};
+
+/**
+ * Disables document validation while in scope if the constructor is passed true.
+ */
+class DisableDocumentValidationIfTrue {
+public:
+    DisableDocumentValidationIfTrue(OperationContext* opCtx, bool shouldDisableValidation) {
+        if (shouldDisableValidation)
+            _documentValidationDisabler.emplace(opCtx);
+    }
+
+private:
+    boost::optional<DisableDocumentValidation> _documentValidationDisabler;
+};
 }

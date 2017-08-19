@@ -28,158 +28,324 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <boost/optional.hpp>
+#include <cstddef>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/multiapplier.h"
+#include "mongo/db/repl/oplog_buffer.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    class BSONObj;
-    class OID;
-    class OperationContext;
-    class Status;
-    struct HostAndPort;
-    template <typename T> class StatusWith;
+class BSONObj;
+class OID;
+class OldThreadPool;
+class OperationContext;
+class ServiceContext;
+class SnapshotName;
+class Status;
+struct HostAndPort;
+template <typename T>
+class StatusWith;
 
 namespace repl {
 
-    class LastVote;
+class LastVote;
+class ReplSettings;
+class ReplicationCoordinator;
+
+/**
+ * This class represents the interface the ReplicationCoordinator uses to interact with the
+ * rest of the system.  All functionality of the ReplicationCoordinatorImpl that would introduce
+ * dependencies on large sections of the server code and thus break the unit testability of
+ * ReplicationCoordinatorImpl should be moved here.
+ */
+class ReplicationCoordinatorExternalState {
+    MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalState);
+
+public:
+    ReplicationCoordinatorExternalState();
+    virtual ~ReplicationCoordinatorExternalState();
 
     /**
-     * This class represents the interface the ReplicationCoordinator uses to interact with the
-     * rest of the system.  All functionality of the ReplicationCoordinatorImpl that would introduce
-     * dependencies on large sections of the server code and thus break the unit testability of
-     * ReplicationCoordinatorImpl should be moved here.
+     * Starts the journal listener, and snapshot threads
+     *
+     * NOTE: Only starts threads if they are not already started,
      */
-    class ReplicationCoordinatorExternalState {
-        MONGO_DISALLOW_COPYING(ReplicationCoordinatorExternalState);
-    public:
+    virtual void startThreads(const ReplSettings& settings) = 0;
 
-        ReplicationCoordinatorExternalState();
-        virtual ~ReplicationCoordinatorExternalState();
+    /**
+     * Returns true if an incomplete initial sync is detected.
+     */
+    virtual bool isInitialSyncFlagSet(OperationContext* opCtx) = 0;
 
-        /**
-         * Starts the background sync, producer, and sync source feedback threads
-         *
-         * NOTE: Only starts threads if they are not already started,
-         */
-        virtual void startThreads() = 0;
+    /**
+     * Starts steady state sync for replica set member.
+     *
+     * NOTE: Use either this or the Master/Slave version, but not both.
+     */
+    virtual void startSteadyStateReplication(OperationContext* opCtx,
+                                             ReplicationCoordinator* replCoord) = 0;
 
-        /**
-         * Starts the Master/Slave threads and sets up logOp
-         */
-        virtual void startMasterSlave(OperationContext* txn) = 0;
+    /**
+     * Stops the data replication threads = bgsync, applier, reporter.
+     */
+    virtual void stopDataReplication(OperationContext* opCtx) = 0;
 
-        /**
-         * Performs any necessary external state specific shutdown tasks, such as cleaning up
-         * the threads it started.
-         */
-        virtual void shutdown() = 0;
+    /**
+     * Starts the Master/Slave threads and sets up logOp
+     */
+    virtual void startMasterSlave(OperationContext* opCtx) = 0;
 
-        /**
-         * Creates the oplog and writes the first entry.
-         */
-        virtual void initiateOplog(OperationContext* txn) = 0;
+    /**
+     * Performs any necessary external state specific shutdown tasks, such as cleaning up
+     * the threads it started.
+     */
+    virtual void shutdown(OperationContext* opCtx) = 0;
 
-        /**
-         * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
-         * SyncSourceFeedback thread that it needs to wake up and send a replSetUpdatePosition
-         * command upstream.
-         */
-        virtual void forwardSlaveProgress() = 0;
+    /**
+     * Returns task executor for scheduling tasks to be run asynchronously.
+     */
+    virtual executor::TaskExecutor* getTaskExecutor() const = 0;
 
-        /**
-         * Queries the singleton document in local.me.  If it exists and our hostname has not
-         * changed since we wrote, returns the RID stored in the object.  If the document does not
-         * exist or our hostname doesn't match what was recorded in local.me, generates a new OID
-         * to use as our RID, stores it in local.me, and returns it.
-         */
-        virtual OID ensureMe(OperationContext*) = 0;
+    /**
+     * Returns shared db worker thread pool for collection cloning.
+     */
+    virtual OldThreadPool* getDbWorkThreadPool() const = 0;
 
-        /**
-         * Returns true if "host" is one of the network identities of this node.
-         */
-        virtual bool isSelf(const HostAndPort& host) = 0;
+    /**
+     * Runs the repair database command on the "local" db, if the storage engine is MMapV1.
+     * Note: Used after initial sync to compact the database files.
+     */
+    virtual Status runRepairOnLocalDB(OperationContext* opCtx) = 0;
 
-        /**
-         * Gets the replica set config document from local storage, or returns an error.
-         */
-        virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* txn) = 0;
+    /**
+     * Creates the oplog, writes the first entry and stores the replica set config document.
+     */
+    virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config) = 0;
 
-        /**
-         * Stores the replica set config document in local storage, or returns an error.
-         */
-        virtual Status storeLocalConfigDocument(OperationContext* txn, const BSONObj& config) = 0;
+    /**
+     * Called when a node on way to becoming a primary is ready to leave drain mode. It is called
+     * outside of the global X lock and the replication coordinator mutex.
+     *
+     * Throws on errors.
+     */
+    virtual void onDrainComplete(OperationContext* opCtx) = 0;
 
-        /**
-         * Gets the replica set lastVote document from local storage, or returns an error.
-         */
-        virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* txn) = 0;
+    /**
+     * Called as part of the process of transitioning to primary and run with the global X lock and
+     * the replication coordinator mutex acquired, so no majoirty writes are allowed while in this
+     * state. See the call site in ReplicationCoordinatorImpl for details about when and how it is
+     * called.
+     *
+     * Among other things, this writes a message about our transition to primary to the oplog if
+     * isV1 and and returns the optime of that message. If !isV1, returns the optime of the last op
+     * in the oplog.
+     *
+     * Throws on errors.
+     */
+    virtual OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) = 0;
 
-        /**
-         * Stores the replica set lastVote document in local storage, or returns an error.
-         */
-        virtual Status storeLocalLastVoteDocument(OperationContext* txn,
-                                                  const LastVote& lastVote) = 0;
+    /**
+     * Simple wrapper around SyncSourceFeedback::forwardSlaveProgress.  Signals to the
+     * SyncSourceFeedback thread that it needs to wake up and send a replSetUpdatePosition
+     * command upstream.
+     */
+    virtual void forwardSlaveProgress() = 0;
 
-        /**
-         * Sets the global opTime to be 'newTime'.
-         */
-        virtual void setGlobalTimestamp(const Timestamp& newTime) = 0;
+    /**
+     * Queries the singleton document in local.me.  If it exists and our hostname has not
+     * changed since we wrote, returns the RID stored in the object.  If the document does not
+     * exist or our hostname doesn't match what was recorded in local.me, generates a new OID
+     * to use as our RID, stores it in local.me, and returns it.
+     */
+    virtual OID ensureMe(OperationContext*) = 0;
 
-        /**
-         * Gets the last optime of an operation performed on this host, from stable
-         * storage.
-         */
-        virtual StatusWith<Timestamp> loadLastOpTime(OperationContext* txn) = 0;
+    /**
+     * Returns true if "host" is one of the network identities of this node.
+     */
+    virtual bool isSelf(const HostAndPort& host, ServiceContext* service) = 0;
 
-        /**
-         * Returns the HostAndPort of the remote client connected to us that initiated the operation
-         * represented by "txn".
-         */
-        virtual HostAndPort getClientHostAndPort(const OperationContext* txn) = 0;
+    /**
+     * Gets the replica set config document from local storage, or returns an error.
+     */
+    virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) = 0;
 
-        /**
-         * Closes all connections except those marked with the keepOpen property, which should
-         * just be connections used for heartbeating.
-         * This is used during stepdown, and transition out of primary.
-         */
-        virtual void closeConnections() = 0;
+    /**
+     * Stores the replica set config document in local storage, or returns an error.
+     */
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
 
-        /**
-         * Kills all operations that have a Client that is associated with an incoming user
-         * connection.  Used during stepdown.
-         */
-        virtual void killAllUserOperations(OperationContext* txn) = 0;
+    /**
+     * Gets the replica set lastVote document from local storage, or returns an error.
+     */
+    virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx) = 0;
 
-        /**
-         * Clears all cached sharding metadata on this server.  This is called after stepDown to
-         * ensure that if the node becomes primary again in the future it will reload an up-to-date
-         * version of the sharding data.
-         */
-        virtual void clearShardingState() = 0;
+    /**
+     * Stores the replica set lastVote document in local storage, or returns an error.
+     */
+    virtual Status storeLocalLastVoteDocument(OperationContext* opCtx,
+                                              const LastVote& lastVote) = 0;
 
-        /**
-         * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
-         */
-        virtual void signalApplierToChooseNewSyncSource() = 0;
+    /**
+     * Sets the global opTime to be 'newTime'.
+     */
+    virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime) = 0;
 
-        /**
-         * Returns an OperationContext, owned by the caller, that may be used in methods of
-         * the same instance that require an OperationContext.
-         */
-        virtual OperationContext* createOperationContext(const std::string& threadName) = 0;
+    /**
+     * Gets the last optime of an operation performed on this host, from stable
+     * storage.
+     */
+    virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx) = 0;
 
-        /**
-         * Drops all temporary collections on all databases except "local".
-         *
-         * The implementation may assume that the caller has acquired the global exclusive lock
-         * for "txn".
-         */
-        virtual void dropAllTempCollections(OperationContext* txn) = 0;
-    };
+    /**
+     * Returns the HostAndPort of the remote client connected to us that initiated the operation
+     * represented by "opCtx".
+     */
+    virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx) = 0;
 
-} // namespace repl
-} // namespace mongo
+    /**
+     * Closes all connections in the given TransportLayer except those marked with the
+     * keepOpen property, which should just be connections used for heartbeating.
+     * This is used during stepdown, and transition out of primary.
+     */
+    virtual void closeConnections() = 0;
+
+    /**
+     * Kills all operations that have a Client that is associated with an incoming user
+     * connection.  Used during stepdown.
+     */
+    virtual void killAllUserOperations(OperationContext* opCtx) = 0;
+
+    /**
+     * Resets any active sharding metadata on this server and stops any sharding-related threads
+     * (such as the balancer). It is called after stepDown to ensure that if the node becomes
+     * primary again in the future it will recover its state from a clean slate.
+     */
+    virtual void shardingOnStepDownHook() = 0;
+
+    /**
+     * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
+     */
+    virtual void signalApplierToChooseNewSyncSource() = 0;
+
+    /**
+     * Notifies the bgsync to stop fetching data.
+     */
+    virtual void stopProducer() = 0;
+
+    /**
+     * Start bgsync's producer if it's stopped.
+     */
+    virtual void startProducerIfStopped() = 0;
+
+    /**
+     * Drops all snapshots and clears the "committed" snapshot.
+     */
+    virtual void dropAllSnapshots() = 0;
+
+    /**
+     * Updates the committed snapshot to the newCommitPoint, and deletes older snapshots.
+     *
+     * It is illegal to call with a newCommitPoint that does not name an existing snapshot.
+     */
+    virtual void updateCommittedSnapshot(SnapshotName newCommitPoint) = 0;
+
+    /**
+     * Creates a new snapshot.
+     */
+    virtual void createSnapshot(OperationContext* opCtx, SnapshotName name) = 0;
+
+    /**
+     * Signals the SnapshotThread, if running, to take a forced snapshot even if the global
+     * timestamp hasn't changed.
+     *
+     * Does not wait for the snapshot to be taken.
+     */
+    virtual void forceSnapshotCreation() = 0;
+
+    /**
+     * Returns whether or not the SnapshotThread is active.
+     */
+    virtual bool snapshotsEnabled() const = 0;
+
+    /**
+     * Notifies listeners of a change in the commit level.
+     */
+    virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime) = 0;
+
+    /**
+     * Returns multiplier to apply to election timeout to obtain upper bound
+     * on randomized offset.
+     */
+    virtual double getElectionTimeoutOffsetLimitFraction() const = 0;
+
+    /**
+     * Returns true if the current storage engine supports read committed.
+     */
+    virtual bool isReadCommittedSupportedByStorageEngine(OperationContext* opCtx) const = 0;
+
+    /**
+     * Applies the operations described in the oplog entries contained in "ops" using the
+     * "applyOperation" function.
+     */
+    virtual StatusWith<OpTime> multiApply(OperationContext* opCtx,
+                                          MultiApplier::Operations ops,
+                                          MultiApplier::ApplyOperationFn applyOperation) = 0;
+
+    /**
+     * Used by multiApply() to writes operations to database during steady state replication.
+     */
+    virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) = 0;
+
+    /**
+     * Used by multiApply() to writes operations to database during initial sync. `fetchCount` is a
+     * pointer to a counter that is incremented every time we fetch a missing document.
+     *
+     */
+    virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+                                         const HostAndPort& source,
+                                         AtomicUInt32* fetchCount) = 0;
+
+    /**
+     * This function creates an oplog buffer of the type specified at server startup.
+     */
+    virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
+        OperationContext* opCtx) const = 0;
+
+    /**
+     * Creates an oplog buffer suitable for steady state replication.
+     */
+    virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
+        OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns maximum number of times that the oplog fetcher will consecutively restart the oplog
+     * tailing query on non-cancellation errors.
+     */
+    virtual std::size_t getOplogFetcherMaxFetcherRestarts() const = 0;
+
+    /*
+     * Creates noop writer instance. Setting the _noopWriter member is not protected by a guard,
+     * hence it must be called before multi-threaded operations start.
+     */
+    virtual void setupNoopWriter(Seconds waitTime) = 0;
+
+    /*
+     * Starts periodic noop writes to oplog.
+     */
+    virtual void startNoopWriter(OpTime) = 0;
+
+    /*
+     * Stops periodic noop writes to oplog.
+     */
+    virtual void stopNoopWriter() = 0;
+};
+
+}  // namespace repl
+}  // namespace mongo

@@ -36,80 +36,262 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 
 namespace mongo {
 
-    TEST( MatchExpressionParserTest, SimpleEQ1 ) {
-        BSONObj query = BSON( "x" << 2 );
-        StatusWithMatchExpression result = MatchExpressionParser::parse( query );
-        ASSERT_TRUE( result.isOK() );
+TEST(MatchExpressionParserTest, SimpleEQ1) {
+    BSONObj query = BSON("x" << 2);
+    const CollatorInterface* collator = nullptr;
+    StatusWithMatchExpression result =
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_TRUE(result.isOK());
 
-        ASSERT( result.getValue()->matchesBSON( BSON( "x" << 2 ) ) );
-        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 3 ) ) );
+    ASSERT(result.getValue()->matchesBSON(BSON("x" << 2)));
+    ASSERT(!result.getValue()->matchesBSON(BSON("x" << 3)));
+}
 
-        delete result.getValue();
-    }
+TEST(MatchExpressionParserTest, Multiple1) {
+    BSONObj query = BSON("x" << 5 << "y" << BSON("$gt" << 5 << "$lt" << 8));
+    const CollatorInterface* collator = nullptr;
+    StatusWithMatchExpression result =
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_TRUE(result.isOK());
 
-    TEST( MatchExpressionParserTest, Multiple1 ) {
-        BSONObj query = BSON( "x" << 5 << "y" << BSON( "$gt" << 5 << "$lt" << 8 ) );
-        StatusWithMatchExpression result = MatchExpressionParser::parse( query );
-        ASSERT_TRUE( result.isOK() );
+    ASSERT(result.getValue()->matchesBSON(BSON("x" << 5 << "y" << 7)));
+    ASSERT(result.getValue()->matchesBSON(BSON("x" << 5 << "y" << 6)));
+    ASSERT(!result.getValue()->matchesBSON(BSON("x" << 6 << "y" << 7)));
+    ASSERT(!result.getValue()->matchesBSON(BSON("x" << 5 << "y" << 9)));
+    ASSERT(!result.getValue()->matchesBSON(BSON("x" << 5 << "y" << 4)));
+}
 
-        ASSERT( result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 7 ) ) );
-        ASSERT( result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 6 ) ) );
-        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 6 << "y" << 7 ) ) );
-        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 9 ) ) );
-        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 4 ) ) );
+TEST(AtomicMatchExpressionTest, AtomicOperator1) {
+    BSONObj query = BSON("x" << 5 << "$atomic" << BSON("$gt" << 5 << "$lt" << 8));
+    const CollatorInterface* collator = nullptr;
+    StatusWithMatchExpression result =
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_TRUE(result.isOK());
 
-        delete result.getValue();
-    }
+    query = BSON("x" << 5 << "$isolated" << 1);
+    result = MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_TRUE(result.isOK());
 
-    TEST( AtomicMatchExpressionTest, Simple1 ) {
-        BSONObj query = BSON( "x" << 5 << "$atomic" << BSON( "$gt" << 5 << "$lt" << 8 ) );
-        StatusWithMatchExpression result = MatchExpressionParser::parse( query );
-        ASSERT_TRUE( result.isOK() );
-        delete result.getValue();
+    query = BSON("x" << 5 << "y" << BSON("$isolated" << 1));
+    result = MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_FALSE(result.isOK());
+}
 
-        query = BSON( "x" << 5 << "$isolated" << 1 );
-        result = MatchExpressionParser::parse( query );
-        ASSERT_TRUE( result.isOK() );
-        delete result.getValue();
+TEST(MatchExpressionParserTest, MinDistanceWithoutNearFailsToParse) {
+    BSONObj query = fromjson("{loc: {$minDistance: 10}}");
+    const CollatorInterface* collator = nullptr;
+    StatusWithMatchExpression result =
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_FALSE(result.isOK());
+}
 
-        query = BSON( "x" << 5 << "y" << BSON( "$isolated" << 1 ) );
-        result = MatchExpressionParser::parse( query );
-        ASSERT_FALSE( result.isOK() );
-    }
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsNegative) {
+    BSONObj query = BSON("" << -2LL);
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
+}
 
-    StatusWith<int> fib( int n ) {
-        if ( n < 0 ) return StatusWith<int>( ErrorCodes::BadValue, "paramter to fib has to be >= 0" );
-        if ( n <= 1 ) return StatusWith<int>( 1 );
-        StatusWith<int> a = fib( n - 1 );
-        StatusWith<int> b = fib( n - 2 );
-        if ( !a.isOK() ) return a;
-        if ( !b.isOK() ) return b;
-        return StatusWith<int>( a.getValue() + b.getValue() );
-    }
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongAcceptsNegative) {
+    BSONObj query = BSON("" << -2LL);
+    auto result = MatchExpressionParser::parseIntegerElementToLong(query.firstElement());
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(-2LL, result.getValue());
+}
 
-    TEST( StatusWithTest, Fib1 ) {
-        StatusWith<int> x = fib( -2 );
-        ASSERT( !x.isOK() );
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsTooLargeDouble) {
+    BSONObj query = BSON("" << MatchExpressionParser::kLongLongMaxPlusOneAsDouble);
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
+}
 
-        x = fib(0);
-        ASSERT( x.isOK() );
-        ASSERT( 1 == x.getValue() );
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsTooLargeDouble) {
+    BSONObj query = BSON("" << MatchExpressionParser::kLongLongMaxPlusOneAsDouble);
+    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
+}
 
-        x = fib(1);
-        ASSERT( x.isOK() );
-        ASSERT( 1 == x.getValue() );
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsTooLargeNegativeDouble) {
+    BSONObj query = BSON("" << std::numeric_limits<double>::min());
+    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
+}
 
-        x = fib(2);
-        ASSERT( x.isOK() );
-        ASSERT( 2 == x.getValue() );
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsString) {
+    BSONObj query = BSON(""
+                         << "1");
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
+}
 
-        x = fib(3);
-        ASSERT( x.isOK() );
-        ASSERT( 3 == x.getValue() );
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsString) {
+    BSONObj query = BSON(""
+                         << "1");
+    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
+}
 
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDouble) {
+    BSONObj query = BSON("" << 2.5);
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
+}
 
-    }
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsNonIntegralDouble) {
+    BSONObj query = BSON("" << 2.5);
+    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsNonIntegralDecimal) {
+    BSONObj query = BSON("" << Decimal128("2.5"));
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsNonIntegralDecimal) {
+    BSONObj query = BSON("" << Decimal128("2.5"));
+    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongRejectsLargestDecimal) {
+    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
+    ASSERT_NOT_OK(
+        MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement()));
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongRejectsLargestDecimal) {
+    BSONObj query = BSON("" << Decimal128(Decimal128::kLargestPositive));
+    ASSERT_NOT_OK(MatchExpressionParser::parseIntegerElementToLong(query.firstElement()));
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongAcceptsZero) {
+    BSONObj query = BSON("" << 0);
+    auto result = MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement());
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 0LL);
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongAcceptsZero) {
+    BSONObj query = BSON("" << 0);
+    auto result = MatchExpressionParser::parseIntegerElementToLong(query.firstElement());
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 0LL);
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToNonNegativeLongAcceptsThree) {
+    BSONObj query = BSON("" << 3.0);
+    auto result = MatchExpressionParser::parseIntegerElementToNonNegativeLong(query.firstElement());
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 3LL);
+}
+
+TEST(MatchExpressionParserTest, ParseIntegerElementToLongAcceptsThree) {
+    BSONObj query = BSON("" << 3.0);
+    auto result = MatchExpressionParser::parseIntegerElementToLong(query.firstElement());
+    ASSERT_OK(result.getStatus());
+    ASSERT_EQ(result.getValue(), 3LL);
+}
+
+StatusWith<int> fib(int n) {
+    if (n < 0)
+        return StatusWith<int>(ErrorCodes::BadValue, "paramter to fib has to be >= 0");
+    if (n <= 1)
+        return StatusWith<int>(1);
+    StatusWith<int> a = fib(n - 1);
+    StatusWith<int> b = fib(n - 2);
+    if (!a.isOK())
+        return a;
+    if (!b.isOK())
+        return b;
+    return StatusWith<int>(a.getValue() + b.getValue());
+}
+
+TEST(StatusWithTest, Fib1) {
+    StatusWith<int> x = fib(-2);
+    ASSERT(!x.isOK());
+
+    x = fib(0);
+    ASSERT(x.isOK());
+    ASSERT(1 == x.getValue());
+
+    x = fib(1);
+    ASSERT(x.isOK());
+    ASSERT(1 == x.getValue());
+
+    x = fib(2);
+    ASSERT(x.isOK());
+    ASSERT(2 == x.getValue());
+
+    x = fib(3);
+    ASSERT(x.isOK());
+    ASSERT(3 == x.getValue());
+}
+
+TEST(MatchExpressionParserTest, AlwaysFalseFailsToParseNonOneArguments) {
+    auto queryIntArgument = BSON("$alwaysFalse" << 0);
+    auto expr = MatchExpressionParser::parse(
+        queryIntArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+
+    auto queryStringArgument = BSON("$alwaysFalse"
+                                    << "");
+    expr = MatchExpressionParser::parse(
+        queryStringArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+
+    auto queryDoubleArgument = BSON("$alwaysFalse" << 1.1);
+    expr = MatchExpressionParser::parse(
+        queryDoubleArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+
+    auto queryFalseArgument = BSON("$alwaysFalse" << true);
+    expr = MatchExpressionParser::parse(
+        queryFalseArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+}
+
+TEST(MatchExpressionParserTest, AlwaysFalseParsesIntegerArgument) {
+    auto query = BSON("$alwaysFalse" << 1);
+    auto expr =
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_OK(expr.getStatus());
+
+    ASSERT_FALSE(expr.getValue()->matchesBSON(fromjson("{}")));
+    ASSERT_FALSE(expr.getValue()->matchesBSON(fromjson("{x: 1}")));
+    ASSERT_FALSE(expr.getValue()->matchesBSON(fromjson("{x: 'blah'}")));
+}
+
+TEST(MatchExpressionParserTest, AlwaysTrueFailsToParseNonOneArguments) {
+    auto queryIntArgument = BSON("$alwaysTrue" << 0);
+    auto expr = MatchExpressionParser::parse(
+        queryIntArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+
+    auto queryStringArgument = BSON("$alwaysTrue"
+                                    << "");
+    expr = MatchExpressionParser::parse(
+        queryStringArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+
+    auto queryDoubleArgument = BSON("$alwaysTrue" << 1.1);
+    expr = MatchExpressionParser::parse(
+        queryDoubleArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+
+    auto queryFalseArgument = BSON("$alwaysTrue" << true);
+    expr = MatchExpressionParser::parse(
+        queryFalseArgument, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_EQ(expr.getStatus(), ErrorCodes::FailedToParse);
+}
+
+TEST(MatchExpressionParserTest, AlwaysTrueParsesIntegerArgument) {
+    auto query = BSON("$alwaysTrue" << 1);
+    auto expr =
+        MatchExpressionParser::parse(query, ExtensionsCallbackDisallowExtensions(), nullptr);
+    ASSERT_OK(expr.getStatus());
+
+    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{}")));
+    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{x: 1}")));
+    ASSERT_TRUE(expr.getValue()->matchesBSON(fromjson("{x: 'blah'}")));
+}
 }

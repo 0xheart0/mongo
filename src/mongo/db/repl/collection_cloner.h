@@ -28,207 +28,290 @@
 
 #pragma once
 
-#include <boost/thread/mutex.hpp>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/client/fetcher.h"
+#include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/base_cloner.h"
-#include "mongo/db/repl/fetcher.h"
-#include "mongo/db/repl/replication_executor.h"
+#include "mongo/db/repl/callback_completion_guard.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/task_runner.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/s/query/async_results_merger.h"
+#include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/old_thread_pool.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/progress_meter.h"
 
 namespace mongo {
+
+class OldThreadPool;
+
 namespace repl {
 
-    class CollectionCloner : public BaseCloner {
-        MONGO_DISALLOW_COPYING(CollectionCloner);
-    public:
+class StorageInterface;
 
-        /**
-         * Storage interface for collection cloner.
-         *
-         * Supports the operations on the storage layer required by the cloner.
-         */
-        class StorageInterface;
+class CollectionCloner : public BaseCloner {
+    MONGO_DISALLOW_COPYING(CollectionCloner);
 
-        /**
-         * Type of function to schedule database work with the executor.
-         *
-         * Must be consistent with ReplicationExecutor::scheduleWorkWithGlobalExclusiveLock().
-         *
-         * Used for testing only.
-         */
-        using ScheduleDbWorkFn = stdx::function<StatusWith<ReplicationExecutor::CallbackHandle> (
-            const ReplicationExecutor::CallbackFn&)>;
+public:
+    /**
+     * Callback completion guard for CollectionCloner.
+     */
+    using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
+    using OnCompletionGuard = CallbackCompletionGuard<Status>;
 
-        /**
-         * Creates CollectionCloner task in inactive state. Use start() to activate cloner.
-         *
-         * The cloner calls 'work' when the collection cloning has completed or failed.
-         *
-         * 'work' will be called exactly once.
-         *
-         * Takes ownership of the passed StorageInterface object.
-         */
-        CollectionCloner(ReplicationExecutor* executor,
-                         const HostAndPort& source,
-                         const NamespaceString& sourceNss,
-                         const CollectionOptions& options,
-                         const CallbackFn& work,
-                         StorageInterface* storageInterface);
+    struct Stats {
+        static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;
+        static constexpr StringData kDocumentsCopiedFieldName = "documentsCopied"_sd;
 
-        virtual ~CollectionCloner() = default;
+        std::string ns;
+        Date_t start;
+        Date_t end;
+        size_t documentToCopy{0};
+        size_t documentsCopied{0};
+        size_t indexes{0};
+        size_t fetchBatches{0};
 
-        const NamespaceString& getSourceNamespace() const;
-
-        std::string getDiagnosticString() const override;
-
-        bool isActive() const override;
-
-        Status start() override;
-
-        void cancel() override;
-
-        //
-        // Testing only functions below.
-        //
-
-        void wait() override;
-
-        /**
-         * Waits for database worker to complete.
-         * Returns immediately if collection cloner is not active.
-         *
-         * For testing only.
-         */
-        void waitForDbWorker();
-
-        /**
-         * Overrides how executor schedules database work.
-         *
-         * For testing only.
-         */
-        void setScheduleDbWorkFn(const ScheduleDbWorkFn& scheduleDbWorkFn);
-
-    private:
-
-        /**
-         * Read index specs from listIndexes result.
-         */
-        void _listIndexesCallback(const StatusWith<Fetcher::BatchData>& fetchResult,
-                                  Fetcher::NextAction* nextAction);
-
-        /**
-         * Read collection documents from find result.
-         */
-        void _findCallback(const StatusWith<Fetcher::BatchData>& fetchResult,
-                           Fetcher::NextAction* nextAction);
-
-        /**
-         * Request storage interface to create collection.
-         *
-         * Called multiple times if there are more than one batch of responses from listIndexes
-         * cursor.
-         *
-         * 'nextAction' is an in/out arg indicating the next action planned and to be taken
-         *  by the fetcher.
-         */
-        void _beginCollectionCallback(const ReplicationExecutor::CallbackData& callbackData);
-
-        /**
-         * Called multiple times if there are more than one batch of documents from the fetcher.
-         * On the last batch, 'lastBatch' will be true.
-         *
-         * Each document returned will be inserted via the storage interfaceRequest storage
-         * interface.
-         */
-        void _insertDocumentsCallback(const ReplicationExecutor::CallbackData& callbackData,
-                                      bool lastBatch);
-
-        // Not owned by us.
-        ReplicationExecutor* _executor;
-
-        HostAndPort _source;
-        NamespaceString _sourceNss;
-        NamespaceString _destNss;
-        CollectionOptions _options;
-
-        // Invoked once when cloning completes or fails.
-        CallbackFn _work;
-
-        // Owned by us.
-        std::unique_ptr<StorageInterface> _storageInterface;
-
-        // Protects member data of this collection cloner.
-        mutable boost::mutex _mutex;
-
-        // _active is true when Collection Cloner is started.
-        bool _active;
-
-        // Fetcher instances for running listIndexes and find commands.
-        Fetcher _listIndexesFetcher;
-        Fetcher _findFetcher;
-
-        std::vector<BSONObj> _indexSpecs;
-
-        // Current batch of documents read from fetcher to insert into collection.
-        std::vector<BSONObj> _documents;
-
-        // Callback handle for database worker.
-        ReplicationExecutor::CallbackHandle _dbWorkCallbackHandle;
-
-        // Function for scheduling database work using the executor.
-        ScheduleDbWorkFn _scheduleDbWorkFn;
-
+        std::string toString() const;
+        BSONObj toBSON() const;
+        void append(BSONObjBuilder* builder) const;
     };
+    /**
+     * Type of function to schedule storage interface tasks with the executor.
+     *
+     * Used for testing only.
+     */
+    using ScheduleDbWorkFn = stdx::function<StatusWith<executor::TaskExecutor::CallbackHandle>(
+        const executor::TaskExecutor::CallbackFn&)>;
 
     /**
-     * Storage interface used by the collection cloner to build a collection.
+     * Creates CollectionCloner task in inactive state. Use start() to activate cloner.
      *
-     * Operation context is provided by the replication executor via the cloner.
+     * The cloner calls 'onCompletion' when the collection cloning has completed or failed.
      *
-     * The storage interface is expected to acquire locks on any resources it needs
-     * to perform any of its functions.
+     * 'onCompletion' will be called exactly once.
      *
-     * TODO: Consider having commit/abort/cancel functions.
+     * Takes ownership of the passed StorageInterface object.
      */
-    class CollectionCloner::StorageInterface {
-    public:
+    CollectionCloner(executor::TaskExecutor* executor,
+                     OldThreadPool* dbWorkThreadPool,
+                     const HostAndPort& source,
+                     const NamespaceString& sourceNss,
+                     const CollectionOptions& options,
+                     const CallbackFn& onCompletion,
+                     StorageInterface* storageInterface,
+                     const int batchSize,
+                     const int maxNumClonerCursors);
 
-        /**
-         * When the storage interface is destroyed, it will commit the index builder.
-         */
-        virtual ~StorageInterface() = default;
+    virtual ~CollectionCloner();
 
-        /**
-         * Creates a collection with the provided indexes.
-         *
-         * Assume that no database locks have been acquired prior to calling this
-         * function.
-         */
-        virtual Status beginCollection(OperationContext* txn,
-                                       const NamespaceString& nss,
-                                       const CollectionOptions& options,
-                                       const std::vector<BSONObj>& indexSpecs) = 0;
+    const NamespaceString& getSourceNamespace() const;
 
-        /**
-         * Inserts documents into a collection.
-         *
-         * Assume that no database locks have been acquired prior to calling this
-         * function.
-         */
-        virtual Status insertDocuments(OperationContext* txn,
-                                       const NamespaceString& nss,
-                                       const std::vector<BSONObj>& documents) = 0;
+    bool isActive() const override;
 
-    };
+    Status startup() noexcept override;
 
-} // namespace repl
-} // namespace mongo
+    void shutdown() override;
+
+    void join() override;
+
+    CollectionCloner::Stats getStats() const;
+
+    //
+    // Testing only functions below.
+    //
+
+    /**
+     * Waits for database worker to complete.
+     * Returns immediately if collection cloner is not active.
+     *
+     * For testing only.
+     */
+    void waitForDbWorker();
+
+    /**
+     * Overrides how executor schedules database work.
+     *
+     * For testing only.
+     */
+    void setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn);
+
+    /**
+     * Returns the documents currently stored in the '_documents' buffer that is intended
+     * to be inserted through the collection loader.
+     *
+     * For testing only.
+     */
+    std::vector<BSONObj> getDocumentsToInsert_forTest();
+
+private:
+    bool _isActive_inlock() const;
+
+    /**
+     * Returns whether the CollectionCloner is in shutdown.
+     */
+    bool _isShuttingDown() const;
+
+    /**
+     * Cancels all outstanding work.
+     * Used by shutdown() and CompletionGuard::setResultAndCancelRemainingWork().
+     */
+    void _cancelRemainingWork_inlock();
+
+    /**
+     * Read number of documents in collection from count result.
+     */
+    void _countCallback(const executor::TaskExecutor::RemoteCommandCallbackArgs& args);
+
+    /**
+     * Read index specs from listIndexes result.
+     */
+    void _listIndexesCallback(const StatusWith<Fetcher::QueryResponse>& fetchResult,
+                              Fetcher::NextAction* nextAction,
+                              BSONObjBuilder* getMoreBob);
+
+    /**
+     * Request storage interface to create collection.
+     *
+     * Called multiple times if there are more than one batch of responses from listIndexes
+     * cursor.
+     *
+     * 'nextAction' is an in/out arg indicating the next action planned and to be taken
+     *  by the fetcher.
+     */
+    void _beginCollectionCallback(const executor::TaskExecutor::CallbackArgs& callbackData);
+
+    /**
+     * The possible command types that can be used to establish the initial cursors on the
+     * remote collection.
+     */
+    enum EstablishCursorsCommand { Find, ParallelCollScan };
+
+    /**
+     * Parses the cursor responses from the 'find' or 'parallelCollectionScan' command
+     * and passes them into the 'AsyncResultsMerger'.
+     */
+    void _establishCollectionCursorsCallback(const RemoteCommandCallbackArgs& rcbd,
+                                             EstablishCursorsCommand cursorCommand);
+
+    /**
+     * Parses the response from a 'parallelCollectionScan' command into a vector of cursor
+     * elements.
+     */
+    StatusWith<std::vector<BSONElement>> _parseParallelCollectionScanResponse(BSONObj resp);
+
+    /**
+     * Takes a cursors buffer and parses the 'parallelCollectionScan' response into cursor
+     * responses that are pushed onto the buffer.
+     */
+    Status _parseCursorResponse(BSONObj response,
+                                std::vector<CursorResponse>* cursors,
+                                EstablishCursorsCommand cursorCommand);
+
+    /**
+     * Calls to get the next event from the 'AsyncResultsMerger'. This schedules
+     * '_handleAsyncResultsCallback' to be run when the event is signaled successfully.
+     */
+    Status _scheduleNextARMResultsCallback(std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+
+    /**
+     * Runs for each time a new batch of documents can be retrieved from the 'AsyncResultsMerger'.
+     * Buffers the documents retrieved for insertion and schedules a '_insertDocumentsCallback'
+     * to insert the contents of the buffer.
+     */
+    void _handleARMResultsCallback(const executor::TaskExecutor::CallbackArgs& cbd,
+                                   std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+
+    /**
+     * Pull all ready results from the ARM into a buffer to be inserted.
+     */
+    Status _bufferNextBatchFromArm();
+
+    /**
+     * Called whenever there is a new batch of documents ready from the 'AsyncResultsMerger'.
+     * On the last batch, 'lastBatch' will be true.
+     *
+     * Each document returned will be inserted via the storage interfaceRequest storage
+     * interface.
+     */
+    void _insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& cbd,
+                                  bool lastBatch,
+                                  std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+
+    /**
+     * Reports completion status.
+     * Commits/aborts collection building.
+     * Sets cloner to inactive.
+     */
+    void _finishCallback(const Status& status);
+
+    //
+    // All member variables are labeled with one of the following codes indicating the
+    // synchronization rules for accessing them.
+    //
+    // (R)  Read-only in concurrent operation; no synchronization required.
+    // (M)  Reads and writes guarded by _mutex
+    // (S)  Self-synchronizing; access in any way from any context.
+    // (RT)  Read-only in concurrent operation; synchronized externally by tests
+    //
+    mutable stdx::mutex _mutex;
+    mutable stdx::condition_variable _condition;        // (M)
+    executor::TaskExecutor* _executor;                  // (R) Not owned by us.
+    OldThreadPool* _dbWorkThreadPool;                   // (R) Not owned by us.
+    HostAndPort _source;                                // (R)
+    NamespaceString _sourceNss;                         // (R)
+    NamespaceString _destNss;                           // (R)
+    CollectionOptions _options;                         // (R)
+    std::unique_ptr<CollectionBulkLoader> _collLoader;  // (M)
+    CallbackFn _onCompletion;             // (M) Invoked once when cloning completes or fails.
+    StorageInterface* _storageInterface;  // (R) Not owned by us.
+    RemoteCommandRetryScheduler _countScheduler;  // (S)
+    Fetcher _listIndexesFetcher;                  // (S)
+    std::vector<BSONObj> _indexSpecs;             // (M)
+    BSONObj _idIndexSpec;                         // (M)
+    std::vector<BSONObj>
+        _documentsToInsert;        // (M) Documents read from 'AsyncResultsMerger' to insert.
+    TaskRunner _dbWorkTaskRunner;  // (R)
+    ScheduleDbWorkFn
+        _scheduleDbWorkFn;         // (RT) Function for scheduling database work using the executor.
+    Stats _stats;                  // (M) stats for this instance.
+    ProgressMeter _progressMeter;  // (M) progress meter for this instance.
+    const int _collectionCloningBatchSize;  // (R) The size of the batches of documents returned in
+                                            // collection cloning.
+
+    // (R) The maximum number of cursors to use in the collection cloning process.
+    const int _maxNumClonerCursors;
+    // (M) Component responsible for fetching the documents from the collection cloner cursor(s).
+    std::unique_ptr<AsyncResultsMerger> _arm;
+    // (R) The cursor parameters used by the 'AsyncResultsMerger'.
+    std::unique_ptr<ClusterClientCursorParams> _clusterClientCursorParams;
+
+    // (M) The event handle for the 'kill' event of the 'AsyncResultsMerger'.
+    executor::TaskExecutor::EventHandle _killArmHandle;
+
+    // (M) Scheduler used to establish the initial cursor or set of cursors.
+    std::unique_ptr<RemoteCommandRetryScheduler> _establishCollectionCursorsScheduler;
+
+    // State transitions:
+    // PreStart --> Running --> ShuttingDown --> Complete
+    // It is possible to skip intermediate states. For example,
+    // Calling shutdown() when the cloner has not started will transition from PreStart directly
+    // to Complete.
+    enum class State { kPreStart, kRunning, kShuttingDown, kComplete };
+    State _state = State::kPreStart;  // (M)
+};
+
+}  // namespace repl
+}  // namespace mongo

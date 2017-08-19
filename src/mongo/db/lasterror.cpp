@@ -36,82 +36,89 @@
 
 namespace mongo {
 
-    LastError LastError::noError;
+LastError LastError::noError;
 
-    const Client::Decoration<LastError> LastError::get = Client::declareDecoration<LastError>();
+const Client::Decoration<LastError> LastError::get = Client::declareDecoration<LastError>();
 
-    void LastError::reset(bool valid) {
-        *this = LastError();
-        _valid = valid;
+void LastError::reset(bool valid) {
+    *this = LastError();
+    _valid = valid;
+}
+
+void LastError::setLastError(int code, std::string msg) {
+    if (_disabled) {
+        return;
+    }
+    reset(true);
+    _code = code;
+    _msg = std::move(msg);
+
+    if (ErrorCodes::isNotMasterError(ErrorCodes::fromInt(_code)))
+        _hadNotMasterError = true;
+}
+
+void LastError::recordUpdate(bool updateObjects, long long nObjects, BSONObj upsertedId) {
+    reset(true);
+    _nObjects = nObjects;
+    _updatedExisting = updateObjects ? True : False;
+
+    // Use the latest BSON validation version. We record updates containing decimal data even if
+    // decimal is disabled.
+    if (upsertedId.valid(BSONVersion::kLatest) && upsertedId.hasField(kUpsertedFieldName))
+        _upsertedId = upsertedId;
+}
+
+void LastError::recordDelete(long long nDeleted) {
+    reset(true);
+    _nObjects = nDeleted;
+}
+
+bool LastError::appendSelf(BSONObjBuilder& b, bool blankErr) const {
+    if (!_valid) {
+        if (blankErr)
+            b.appendNull("err");
+        b.append("n", 0);
+        return false;
     }
 
-    void LastError::setLastError(int code, std::string msg) {
-        if (_disabled) {
-            return;
+    if (_msg.empty()) {
+        if (blankErr) {
+            b.appendNull("err");
         }
-        reset(true);
-        _code = code;
-        _msg = std::move(msg);
+    } else {
+        b.append("err", _msg);
     }
 
-    void LastError::recordInsert(long long nObjects) {
-        reset(true);
-        _nObjects = nObjects;
+    if (_code) {
+        b.append("code", _code);
+        b.append("codeName", ErrorCodes::errorString(ErrorCodes::fromInt(_code)));
     }
-
-    void LastError::recordUpdate(bool updateObjects, long long nObjects, BSONObj upsertedId) {
-        reset(true);
-        _nObjects = nObjects;
-        _updatedExisting = updateObjects ? True : False;
-        if ( upsertedId.valid() && upsertedId.hasField(kUpsertedFieldName) )
-            _upsertedId = upsertedId;
+    if (_updatedExisting != NotUpdate)
+        b.appendBool("updatedExisting", _updatedExisting == True);
+    if (!_upsertedId.isEmpty()) {
+        b.append(_upsertedId[kUpsertedFieldName]);
     }
+    b.appendNumber("n", _nObjects);
 
-    void LastError::recordDelete(long long nDeleted) {
-        reset(true);
-        _nObjects = nDeleted;
-    }
-
-    bool LastError::appendSelf(BSONObjBuilder &b , bool blankErr) const {
-
-        if (!_valid) {
-            if (blankErr)
-                b.appendNull( "err" );
-            b.append( "n", 0 );
-            return false;
-        }
-
-        if (_msg.empty()) {
-            if (blankErr) {
-                b.appendNull( "err" );
-            }
-        }
-        else {
-            b.append("err", _msg);
-        }
-
-        if (_code)
-            b.append("code" , _code);
-        if (_updatedExisting != NotUpdate)
-            b.appendBool("updatedExisting", _updatedExisting == True);
-        if (!_upsertedId.isEmpty()) {
-            b.append(_upsertedId[kUpsertedFieldName]);
-        }
-        b.appendNumber("n", _nObjects);
-
-        return !_msg.empty();
-    }
+    return !_msg.empty();
+}
 
 
-    void LastError::disable() {
-        invariant(!_disabled);
-        _disabled = true;
-        _nPrev--; // caller is a command that shouldn't count as an operation
-    }
+void LastError::disable() {
+    invariant(!_disabled);
+    _disabled = true;
+    _nPrev--;  // caller is a command that shouldn't count as an operation
+}
 
-    void LastError::startRequest() {
-        _disabled = false;
-        ++_nPrev;
-    }
+void LastError::startTopLevelRequest() {
+    _disabled = false;
+    ++_nPrev;
+    _hadNotMasterError = false;
+}
 
-} // namespace mongo
+void LastError::startDirectClientRequest() {
+    _disabled = false;
+    ++_nPrev;
+}
+
+}  // namespace mongo

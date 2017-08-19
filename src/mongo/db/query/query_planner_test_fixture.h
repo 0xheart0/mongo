@@ -28,162 +28,191 @@
 
 #pragma once
 
+#include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
 
+#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/query_test_service_context.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-    class QueryPlannerTest : public mongo::unittest::Test {
-    protected:
-        void setUp();
+class QueryPlannerTest : public mongo::unittest::Test {
+protected:
+    void setUp();
 
-        void tearDown();
+    //
+    // Build up test.
+    //
 
-        //
-        // Build up test.
-        //
+    void addIndex(BSONObj keyPattern, bool multikey = false);
 
-        void addIndex(BSONObj keyPattern, bool multikey = false);
+    void addIndex(BSONObj keyPattern, bool multikey, bool sparse);
 
-        void addIndex(BSONObj keyPattern, bool multikey, bool sparse);
+    void addIndex(BSONObj keyPattern, bool multikey, bool sparse, bool unique);
 
-        void addIndex(BSONObj keyPattern, bool multikey, bool sparse, bool unique);
+    void addIndex(BSONObj keyPattern, BSONObj infoObj);
 
-        void addIndex(BSONObj keyPattern, BSONObj infoObj);
+    void addIndex(BSONObj keyPattern, MatchExpression* filterExpr);
 
-        //
-        // Execute planner.
-        //
+    void addIndex(BSONObj keyPattern, const MultikeyPaths& multikeyPaths);
 
-        void runQuery(BSONObj query);
+    void addIndex(BSONObj keyPattern, const CollatorInterface* collator);
 
-        void runQuerySortProj(const BSONObj& query, const BSONObj& sort, const BSONObj& proj);
+    void addIndex(BSONObj keyPattern,
+                  MatchExpression* filterExpr,
+                  const CollatorInterface* collator);
 
-        void runQuerySkipLimit(const BSONObj& query, long long skip, long long limit);
+    void addIndex(BSONObj keyPattern, const CollatorInterface* collator, StringData indexName);
 
-        void runQueryHint(const BSONObj& query, const BSONObj& hint);
+    //
+    // Execute planner.
+    //
 
-        void runQuerySortProjSkipLimit(const BSONObj& query,
+    void runQuery(BSONObj query);
+
+    void runQuerySortProj(const BSONObj& query, const BSONObj& sort, const BSONObj& proj);
+
+    void runQuerySkipNToReturn(const BSONObj& query, long long skip, long long ntoreturn);
+
+    void runQueryHint(const BSONObj& query, const BSONObj& hint);
+
+    void runQuerySortProjSkipNToReturn(const BSONObj& query,
                                        const BSONObj& sort,
                                        const BSONObj& proj,
                                        long long skip,
-                                       long long limit);
+                                       long long ntoreturn);
 
-        void runQuerySortHint(const BSONObj& query, const BSONObj& sort, const BSONObj& hint);
+    void runQuerySortHint(const BSONObj& query, const BSONObj& sort, const BSONObj& hint);
 
-        void runQueryHintMinMax(const BSONObj& query,
-                                const BSONObj& hint,
-                                const BSONObj& minObj,
-                                const BSONObj& maxObj);
+    void runQueryHintMinMax(const BSONObj& query,
+                            const BSONObj& hint,
+                            const BSONObj& minObj,
+                            const BSONObj& maxObj);
 
-        void runQuerySortProjSkipLimitHint(const BSONObj& query,
+    void runQuerySortProjSkipNToReturnHint(const BSONObj& query,
                                            const BSONObj& sort,
                                            const BSONObj& proj,
                                            long long skip,
-                                           long long limit,
+                                           long long ntoreturn,
                                            const BSONObj& hint);
 
-        void runQuerySnapshot(const BSONObj& query);
+    void runQuerySnapshot(const BSONObj& query);
 
-        void runQueryFull(const BSONObj& query,
-                          const BSONObj& sort,
-                          const BSONObj& proj,
-                          long long skip,
-                          long long limit,
-                          const BSONObj& hint,
-                          const BSONObj& minObj,
-                          const BSONObj& maxObj,
-                          bool snapshot);
+    void runQueryFull(const BSONObj& query,
+                      const BSONObj& sort,
+                      const BSONObj& proj,
+                      long long skip,
+                      long long ntoreturn,
+                      const BSONObj& hint,
+                      const BSONObj& minObj,
+                      const BSONObj& maxObj,
+                      bool snapshot);
 
-        //
-        // Same as runQuery* functions except we expect a failed status from the planning stage.
-        //
+    //
+    // Same as runQuery* functions except we expect a failed status from the planning stage.
+    //
 
-        void runInvalidQuery(const BSONObj& query);
+    void runInvalidQuery(const BSONObj& query);
 
-        void runInvalidQuerySortProj(const BSONObj& query,
-                                     const BSONObj& sort,
-                                     const BSONObj& proj);
+    void runInvalidQuerySortProj(const BSONObj& query, const BSONObj& sort, const BSONObj& proj);
 
-        void runInvalidQuerySortProjSkipLimit(const BSONObj& query,
+    void runInvalidQuerySortProjSkipNToReturn(const BSONObj& query,
                                               const BSONObj& sort,
                                               const BSONObj& proj,
                                               long long skip,
-                                              long long limit);
+                                              long long ntoreturn);
 
-        void runInvalidQueryHint(const BSONObj& query, const BSONObj& hint);
+    void runInvalidQueryHint(const BSONObj& query, const BSONObj& hint);
 
-        void runInvalidQueryHintMinMax(const BSONObj& query,
-                                       const BSONObj& hint,
-                                       const BSONObj& minObj,
-                                       const BSONObj& maxObj);
+    void runInvalidQueryHintMinMax(const BSONObj& query,
+                                   const BSONObj& hint,
+                                   const BSONObj& minObj,
+                                   const BSONObj& maxObj);
 
-        void runInvalidQuerySortProjSkipLimitHint(const BSONObj& query,
+    void runInvalidQuerySortProjSkipNToReturnHint(const BSONObj& query,
                                                   const BSONObj& sort,
                                                   const BSONObj& proj,
                                                   long long skip,
-                                                  long long limit,
+                                                  long long ntoreturn,
                                                   const BSONObj& hint);
 
-        void runInvalidQueryFull(const BSONObj& query,
-                                 const BSONObj& sort,
-                                 const BSONObj& proj,
-                                 long long skip,
-                                 long long limit,
-                                 const BSONObj& hint,
-                                 const BSONObj& minObj,
-                                 const BSONObj& maxObj,
-                                 bool snapshot);
+    void runInvalidQueryFull(const BSONObj& query,
+                             const BSONObj& sort,
+                             const BSONObj& proj,
+                             long long skip,
+                             long long ntoreturn,
+                             const BSONObj& hint,
+                             const BSONObj& minObj,
+                             const BSONObj& maxObj,
+                             bool snapshot);
 
-        //
-        // Introspect solutions.
-        //
+    /**
+     * The other runQuery* methods run the query as through it is an OP_QUERY style find. This
+     * version goes through find command parsing, and will be planned like a find command.
+     */
+    void runQueryAsCommand(const BSONObj& cmdObj);
 
-        size_t getNumSolutions() const;
+    void runInvalidQueryAsCommand(const BSONObj& cmdObj);
 
-        void dumpSolutions() const;
+    //
+    // Introspect solutions.
+    //
 
-        void dumpSolutions(mongoutils::str::stream& ost) const;
+    size_t getNumSolutions() const;
 
-        /**
-         * Checks number solutions. Generates assertion message
-         * containing solution dump if applicable.
-         */
-        void assertNumSolutions(size_t expectSolutions) const;
+    void dumpSolutions() const;
 
-        size_t numSolutionMatches(const std::string& solnJson) const;
+    void dumpSolutions(mongoutils::str::stream& ost) const;
 
-        /**
-         * Verifies that the solution tree represented in json by 'solnJson' is
-         * one of the solutions generated by QueryPlanner.
-         *
-         * The number of expected matches, 'numMatches', could be greater than
-         * 1 if solutions differ only by the pattern of index tags on a filter.
-         */
-        void assertSolutionExists(const std::string& solnJson, size_t numMatches = 1) const;
+    /**
+     * Checks number solutions. Generates assertion message
+     * containing solution dump if applicable.
+     */
+    void assertNumSolutions(size_t expectSolutions) const;
 
-        /**
-         * Given a vector of string-based solution tree representations 'solnStrs',
-         * verifies that the query planner generated exactly one of these solutions.
-         */
-        void assertHasOneSolutionOf(const std::vector<std::string>& solnStrs) const;
+    size_t numSolutionMatches(const std::string& solnJson) const;
 
-        //
-        // Data members.
-        //
+    /**
+     * Verifies that the solution tree represented in json by 'solnJson' is
+     * one of the solutions generated by QueryPlanner.
+     *
+     * The number of expected matches, 'numMatches', could be greater than
+     * 1 if solutions differ only by the pattern of index tags on a filter.
+     */
+    void assertSolutionExists(const std::string& solnJson, size_t numMatches = 1) const;
 
-        static const char* ns;
+    /**
+     * Given a vector of string-based solution tree representations 'solnStrs',
+     * verifies that the query planner generated exactly one of these solutions.
+     */
+    void assertHasOneSolutionOf(const std::vector<std::string>& solnStrs) const;
 
-        BSONObj queryObj;
-        CanonicalQuery* cq;
-        QueryPlannerParams params;
-        std::vector<QuerySolution*> solns;
-    };
+    /**
+     * Helper function to parse a MatchExpression.
+     */
+    static std::unique_ptr<MatchExpression> parseMatchExpression(
+        const BSONObj& obj, const CollatorInterface* collator = nullptr);
 
-} // namespace mongo
+    //
+    // Data members.
+    //
+
+    static const NamespaceString nss;
+
+    QueryTestServiceContext serviceContext;
+    ServiceContext::UniqueOperationContext opCtx;
+    BSONObj queryObj;
+    std::unique_ptr<CanonicalQuery> cq;
+    QueryPlannerParams params;
+    std::vector<std::unique_ptr<QuerySolution>> solns;
+};
+
+}  // namespace mongo

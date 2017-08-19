@@ -36,53 +36,51 @@
 namespace mongo {
 namespace {
 
-    class CmdReplSetGetStatus : public Command {
-    public:
-        CmdReplSetGetStatus() : Command("replSetGetStatus") { }
+class CmdReplSetGetStatus : public ErrmsgCommandDeprecated {
+public:
+    CmdReplSetGetStatus() : ErrmsgCommandDeprecated("replSetGetStatus") {}
 
-        virtual bool slaveOk() const {
-            return true;
+    virtual bool slaveOk() const {
+        return true;
+    }
+
+    virtual bool adminOnly() const {
+        return true;
+    }
+
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    virtual void help(std::stringstream& help) const {
+        help << "Not supported through mongos";
+    }
+
+    virtual Status checkAuthForCommand(Client* client,
+                                       const std::string& dbname,
+                                       const BSONObj& cmdObj) {
+        // Require no auth since this command isn't supported in mongos
+        return Status::OK();
+    }
+
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const std::string& dbname,
+                           const BSONObj& cmdObj,
+                           std::string& errmsg,
+                           BSONObjBuilder& result) {
+        if (cmdObj["forShell"].trueValue()) {
+            LastError::get(cc()).disable();
+            ClusterLastErrorInfo::get(cc())->disableForCommand();
         }
 
-        virtual bool adminOnly() const {
-            return true;
-        }
+        errmsg = "replSetGetStatus is not supported through mongos";
+        result.append("info", "mongos");
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+        return false;
+    }
 
-        virtual void help(std::stringstream& help) const {
-            help << "Not supported through mongos";
-        }
+} cmdReplSetGetStatus;
 
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-
-            // Require no auth since this command isn't supported in mongos
-            return Status::OK();
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
-
-            if (cmdObj["forShell"].trueValue()) {
-                LastError::get(cc()).disable();
-                ClusterLastErrorInfo::get(cc()).disableForCommand();
-            }
-
-            errmsg = "replSetGetStatus is not supported through mongos";
-            result.append("info", "mongos");
-
-            return false;
-        }
-
-    } cmdReplSetGetStatus;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

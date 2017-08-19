@@ -7,6 +7,7 @@ from __future__ import absolute_import
 import os
 import os.path
 import shutil
+import socket
 import time
 
 import pymongo
@@ -24,7 +25,7 @@ class MongoDFixture(interface.Fixture):
     against.
     """
 
-    AWAIT_READY_TIMEOUT_SECS = 30
+    AWAIT_READY_TIMEOUT_SECS = 300
 
     def __init__(self,
                  logger,
@@ -69,8 +70,7 @@ class MongoDFixture(interface.Fixture):
             pass
 
         if "port" not in self.mongod_options:
-            with core.network.UnusedPort() as port:
-                self.mongod_options["port"] = port.num
+            self.mongod_options["port"] = core.network.PortAllocator.next_fixture_port(self.job_num)
         self.port = self.mongod_options["port"]
 
         mongod = core.programs.mongod_program(self.logger,
@@ -89,15 +89,20 @@ class MongoDFixture(interface.Fixture):
     def await_ready(self):
         deadline = time.time() + MongoDFixture.AWAIT_READY_TIMEOUT_SECS
 
-        # Wait until server is accepting connections.
+        # Wait until the mongod is accepting connections. The retry logic is necessary to support
+        # versions of PyMongo <3.0 that immediately raise a ConnectionFailure if a connection cannot
+        # be established.
         while True:
             # Check whether the mongod exited for some reason.
-            if self.mongod.poll() is not None:
+            exit_code = self.mongod.poll()
+            if exit_code is not None:
                 raise errors.ServerFailure("Could not connect to mongod on port %d, process ended"
-                                           " unexpectedly." % (self.port))
+                                           " unexpectedly with code %d." % (self.port, exit_code))
 
             try:
-                utils.new_mongo_client(self.port).admin.command("ping")
+                # Use a shorter connection timeout to more closely satisfy the requested deadline.
+                client = utils.new_mongo_client(self.port, timeout_millis=500)
+                client.admin.command("ping")
                 break
             except pymongo.errors.ConnectionFailure:
                 remaining = deadline - time.time()
@@ -107,17 +112,19 @@ class MongoDFixture(interface.Fixture):
                         % (self.port, MongoDFixture.AWAIT_READY_TIMEOUT_SECS))
 
                 self.logger.info("Waiting to connect to mongod on port %d.", self.port)
-                time.sleep(1)  # Wait a little bit before trying again.
+                time.sleep(0.1)  # Wait a little bit before trying again.
 
         self.logger.info("Successfully contacted the mongod on port %d.", self.port)
 
-    def teardown(self):
+    def _do_teardown(self):
         running_at_start = self.is_running()
         success = True  # Still a success even if nothing is running.
 
-        if not running_at_start:
-            self.logger.info("mongod on port %d was expected to be running in teardown(), but"
-                             " wasn't." % (self.port))
+        if not running_at_start and self.mongod is not None:
+            self.logger.info(
+                "mongod on port %d was expected to be running in _do_teardown(), but wasn't. "
+                "Exited with code %d.",
+                self.port, self.mongod.poll())
 
         if self.mongod is not None:
             if running_at_start:
@@ -126,12 +133,22 @@ class MongoDFixture(interface.Fixture):
                                  self.mongod.pid)
                 self.mongod.stop()
 
-            success = self.mongod.wait() == 0
+            exit_code = self.mongod.wait()
+            success = exit_code == 0
 
             if running_at_start:
-                self.logger.info("Successfully terminated the mongod on port %d.", self.port)
+                self.logger.info("Successfully terminated the mongod on port %d, exited with code"
+                                 " %d.",
+                                 self.port,
+                                 exit_code)
 
         return success
 
     def is_running(self):
         return self.mongod is not None and self.mongod.poll() is None
+
+    def get_connection_string(self):
+        if self.mongod is None:
+            raise ValueError("Must call setup() before calling get_connection_string()")
+
+        return "%s:%d" % (socket.gethostname(), self.port)

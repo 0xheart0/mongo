@@ -29,25 +29,32 @@
 #pragma once
 
 #include "mongo/client/connpool.h"
+#include "mongo/rpc/metadata.h"
+#include "mongo/s/sharding_egress_metadata_hook.h"
 
 namespace mongo {
 
-    class DBClientBase;
+class DBClientBase;
 
-    /**
-     * Intercepts creation of sharded connections and transparently performs the internal
-     * authentication on them.
-     */
-    class ShardingConnectionHook : public DBConnectionHook {
-    public:
-        ShardingConnectionHook(bool shardedConnections);
+/**
+ * Intercepts creation of sharded connections and transparently performs the internal
+ * authentication on them.
+ */
+class ShardingConnectionHook : public DBConnectionHook {
+public:
+    ShardingConnectionHook(bool shardedConnections,
+                           std::unique_ptr<rpc::EgressMetadataHook> egressHook);
 
-        virtual void onCreate(DBClientBase* conn);
-        virtual void onDestroy(DBClientBase* conn);
-        virtual void onRelease(DBClientBase* conn);
+    void onCreate(DBClientBase* conn) override;
+    void onDestroy(DBClientBase* conn) override;
+    void onRelease(DBClientBase* conn) override;
 
-    private:
-        bool _shardedConnections;
-    };
+private:
+    bool _shardedConnections;
 
-} // namespace mongo
+    // Use the implementation of the metadata readers and writers in ShardingEgressMetadataHook,
+    // since that is the hook for Network Interface ASIO and this hook is to be deprecated.
+    std::unique_ptr<rpc::EgressMetadataHook> _egressHook;
+};
+
+}  // namespace mongo

@@ -35,25 +35,34 @@
 
 namespace mongo {
 
-    class IndexCatalogEntry;
-    class IndexDescriptor;
-    struct TwoDIndexingParams;
+class IndexCatalogEntry;
+class IndexDescriptor;
+struct TwoDIndexingParams;
 
-    class TwoDAccessMethod : public IndexAccessMethod {
-    public:
-        TwoDAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
+class TwoDAccessMethod : public IndexAccessMethod {
+public:
+    TwoDAccessMethod(IndexCatalogEntry* btreeState, SortedDataInterface* btree);
 
-    private:
+private:
+    const IndexDescriptor* getDescriptor() {
+        return _descriptor;
+    }
+    TwoDIndexingParams& getParams() {
+        return _params;
+    }
 
-        const IndexDescriptor* getDescriptor() { return _descriptor; }
-        TwoDIndexingParams& getParams() { return _params; }
+    // This really gets the 'locs' from the provided obj.
+    void getKeys(const BSONObj& obj, std::vector<BSONObj>& locs) const;
 
-        // This really gets the 'locs' from the provided obj.
-        void getKeys(const BSONObj& obj, std::vector<BSONObj>& locs) const;
+    /**
+     * Fills 'keys' with the keys that should be generated for 'obj' on this index.
+     *
+     * This function ignores the 'multikeyPaths' pointer because 2d indexes don't support tracking
+     * path-level multikey information.
+     */
+    void doGetKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const final;
 
-        virtual void getKeys(const BSONObj& obj, BSONObjSet* keys) const;
-
-        TwoDIndexingParams _params;
-    };
+    TwoDIndexingParams _params;
+};
 
 }  // namespace mongo

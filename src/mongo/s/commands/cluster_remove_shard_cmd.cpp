@@ -36,133 +36,75 @@
 #include "mongo/client/connpool.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    using std::string;
-    using std::vector;
+using std::string;
+using std::vector;
 
 namespace {
 
-    class RemoveShardCmd : public Command {
-    public:
-        RemoveShardCmd() : Command("removeShard", false, "removeshard") { }
+class RemoveShardCmd : public BasicCommand {
+public:
+    RemoveShardCmd() : BasicCommand("removeShard", "removeshard") {}
 
-        virtual bool slaveOk() const {
-            return true;
-        }
+    virtual bool slaveOk() const {
+        return false;
+    }
 
-        virtual bool adminOnly() const {
-            return true;
-        }
+    virtual bool adminOnly() const {
+        return true;
+    }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
-        virtual void help(std::stringstream& help) const {
-            help << "remove a shard from the system.";
-        }
+    virtual void help(std::stringstream& help) const {
+        help << "remove a shard from the system.";
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::removeShard);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
 
-            ActionSet actions;
-            actions.addAction(ActionType::removeShard);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
+    virtual bool run(OperationContext* opCtx,
+                     const std::string& dbname,
+                     const BSONObj& cmdObj,
+                     BSONObjBuilder& result) {
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
+        uassert(ErrorCodes::TypeMismatch,
+                str::stream() << "Field '" << cmdObj.firstElement().fieldName()
+                              << "' must be of type string",
+                cmdObj.firstElement().type() == BSONType::String);
+        const std::string target = cmdObj.firstElement().str();
 
-            const string target = cmdObj.firstElement().valuestrsafe();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+        auto cmdResponseStatus = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+            "admin",
+            Command::appendPassthroughFields(cmdObj, BSON("_configsvrRemoveShard" << target)),
+            Shard::RetryPolicy::kIdempotent));
+        uassertStatusOK(cmdResponseStatus.commandStatus);
 
-            Shard s = Shard::findIfExists(target);
-            if (!s.ok()) {
-                string msg(str::stream() <<
-                           "Could not drop shard '" << target <<
-                           "' because it does not exist");
-                log() << msg;
-                return appendCommandStatus(result,
-                                           Status(ErrorCodes::ShardNotFound, msg));
-            }
+        Command::filterCommandReplyForPassthrough(cmdResponseStatus.response, &result);
 
-            StatusWith<ShardDrainingStatus> removeShardResult =
-                grid.catalogManager()->removeShard(txn, s.getName());
-            if (!removeShardResult.isOK()) {
-                return appendCommandStatus(result, removeShardResult.getStatus());
-            }
+        return true;
+    }
 
-            vector<string> databases;
-            grid.catalogManager()->getDatabasesForShard(s.getName(), &databases);
+} removeShardCmd;
 
-            // Get BSONObj containing:
-            // 1) note about moving or dropping databases in a shard
-            // 2) list of databases (excluding 'local' database) that need to be moved
-            BSONObj dbInfo;
-            {
-                BSONObjBuilder dbInfoBuilder;
-                dbInfoBuilder.append("note",
-                                     "you need to drop or movePrimary these databases");
-                BSONArrayBuilder dbs(dbInfoBuilder.subarrayStart("dbsToMove"));
-                for (vector<string>::const_iterator it = databases.begin();
-                     it != databases.end();
-                     it++) {
-                    if (*it != "local") {
-                        dbs.append(*it);
-                    }
-                }
-                dbs.doneFast();
-                dbInfo = dbInfoBuilder.obj();
-            }
-
-            // TODO: Standardize/Seperate how we append to the result object
-            switch (removeShardResult.getValue()) {
-            case ShardDrainingStatus::STARTED:
-                result.append("msg", "draining started successfully");
-                result.append("state", "started");
-                result.append("shard", s.getName());
-                result.appendElements(dbInfo);
-                break;
-            case ShardDrainingStatus::ONGOING: {
-                vector<ChunkType> chunks;
-                Status status = grid.catalogManager()->getChunksForShard(s.getName(), &chunks);
-                if (!status.isOK()) {
-                    return appendCommandStatus(result, status);
-                }
-
-                result.append("msg", "draining ongoing");
-                result.append("state", "ongoing");
-                {
-                    BSONObjBuilder inner;
-                    inner.append("chunks", static_cast<long long>(chunks.size()));
-                    inner.append("dbs", static_cast<long long>(databases.size()));
-                    BSONObj b = inner.obj();
-                    result.append("remaining", b);
-                }
-                result.appendElements(dbInfo);
-                break;
-            }
-            case ShardDrainingStatus::COMPLETED:
-                result.append("msg", "removeshard completed successfully");
-                result.append("state", "completed");
-                result.append("shard", s.getName());
-            }
-
-            return true;
-        }
-
-    } removeShardCmd;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

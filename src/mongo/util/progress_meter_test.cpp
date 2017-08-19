@@ -28,16 +28,16 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/util/progress_meter.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/progress_meter.h"
 
 namespace {
 
-    using namespace mongo;
+using namespace mongo;
 
-    // Trivial unit test to validate build dependencies.
-    TEST(ProgressMeterTest, ToString) {
-        ASSERT_FALSE(ProgressMeter(1).toString().empty());
-    }
+// Trivial unit test to validate build dependencies.
+TEST(ProgressMeterTest, ToString) {
+    ASSERT_FALSE(ProgressMeter(1).toString().empty());
+}
 
-} // namespace
+}  // namespace

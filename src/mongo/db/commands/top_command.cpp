@@ -33,59 +33,61 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/commands.h"
 
 namespace {
 
-    using namespace mongo;
+using namespace mongo;
 
-    class TopCommand : public Command {
-    public:
-        TopCommand() : Command("top", true) {}
+class TopCommand : public BasicCommand {
+public:
+    TopCommand() : BasicCommand("top") {}
 
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help(std::stringstream& help) const {
-            help << "usage by collection, in micros ";
-        }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::top);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        virtual bool run(OperationContext* txn,
-                         const std::string& db,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
-            {
-                BSONObjBuilder b( result.subobjStart( "totals" ) );
-                b.append( "note", "all times in microseconds" );
-                Top::get(txn->getClient()->getServiceContext()).append(b);
-                b.done();
-            }
-            return true;
-        }
-
-    };
-
-    //
-    // Command instance.
-    // Registers command with the command system and make command
-    // available to the client.
-    //
-
-    MONGO_INITIALIZER(RegisterTopCommand)(InitializerContext* context) {
-
-        new TopCommand();
-
-        return Status::OK();
+    virtual bool slaveOk() const {
+        return true;
     }
-} // namespace
+    virtual bool adminOnly() const {
+        return true;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    virtual void help(std::stringstream& help) const {
+        help << "usage by collection, in micros ";
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        ActionSet actions;
+        actions.addAction(ActionType::top);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
+    virtual bool run(OperationContext* opCtx,
+                     const std::string& db,
+                     const BSONObj& cmdObj,
+                     BSONObjBuilder& result) {
+        {
+            BSONObjBuilder b(result.subobjStart("totals"));
+            b.append("note", "all times in microseconds");
+            Top::get(opCtx->getClient()->getServiceContext()).append(b);
+            b.done();
+        }
+        return true;
+    }
+};
+
+//
+// Command instance.
+// Registers command with the command system and make command
+// available to the client.
+//
+
+MONGO_INITIALIZER(RegisterTopCommand)(InitializerContext* context) {
+    new TopCommand();
+
+    return Status::OK();
+}
+}  // namespace

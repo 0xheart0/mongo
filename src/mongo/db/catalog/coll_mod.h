@@ -27,19 +27,33 @@
  */
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/catalog/collection_options.h"
 
 namespace mongo {
-    class BSONObj;
-    class BSONObjBuilder;
-    class NamespaceString;
-    class OperationContext;
+class BSONObj;
+class BSONObjBuilder;
+class Collection;
+class NamespaceString;
+class OperationContext;
 
-    /**
-     * Performs the collection modification described in "cmdObj" on the collection "ns".
-     */
-    Status collMod(OperationContext* txn,
-                   const NamespaceString& ns,
-                   const BSONObj& cmdObj,
-                   BSONObjBuilder* result);
-} // namespace mongo
+void updateUUIDSchemaVersion(OperationContext* opCtx, bool upgrade);
 
+/**
+ * Performs the collection modification described in "cmdObj" on the collection "ns".
+ */
+Status collMod(OperationContext* opCtx,
+               const NamespaceString& ns,
+               const BSONObj& cmdObj,
+               BSONObjBuilder* result);
+
+/*
+ * Adds uuid to the collection "ns" if uuid exists and removes any existing UUID from
+ * the collection "ns" if uuid is boost::none. This is called in circumstances where
+ * we may be upgrading or downgrading and we need to update the UUID.
+ */
+Status collModForUUIDUpgrade(OperationContext* opCtx,
+                             const NamespaceString& ns,
+                             const BSONObj& cmdObj,
+                             OptionalCollectionUUID uuid);
+}  // namespace mongo

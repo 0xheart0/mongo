@@ -32,102 +32,160 @@
 #include <string>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
-    class BSONObj;
-    class Status;
-    template<typename T> class StatusWith;
+class Status;
+template <typename T>
+class StatusWith;
 
+
+/**
+ * This class represents the layout and contents of documents contained in the config server's
+ * config.collections collection. All manipulation of documents coming from that collection
+ * should be done with this class.
+ *
+ * Expected config server config.collections collection format:
+ *   {
+ *      "_id" : "foo.bar",
+ *      "lastmodEpoch" : ObjectId("58b6fd76132358839e409e47"),
+ *      "lastmod" : ISODate("1970-02-19T17:02:47.296Z"),
+ *      "dropped" : false,
+ *      "key" : {
+ *          "_id" : 1
+ *      },
+ *      "defaultCollation" : {
+ *          "locale" : "fr_CA"
+ *      },
+ *      "unique" : false,
+ *      "uuid" : UUID,
+ *      "noBalance" : false
+ *   }
+ *
+ */
+class CollectionType {
+public:
+    // Name of the collections collection in the config server.
+    static const std::string ConfigNS;
+
+    static const BSONField<std::string> fullNs;
+    static const BSONField<OID> epoch;
+    static const BSONField<Date_t> updatedAt;
+    static const BSONField<BSONObj> keyPattern;
+    static const BSONField<BSONObj> defaultCollation;
+    static const BSONField<bool> unique;
+    static const BSONField<UUID> uuid;
 
     /**
-     * This class represents the layout and contents of documents contained in the
-     * config.collections collection. All manipulation of documents coming from that collection
-     * should be done with this class.
+     * Constructs a new DatabaseType object from BSON. Also does validation of the contents.
+     *
+     * Dropped collections accumulate in the collections list, through 3.6, so that
+     * mongos <= 3.4.x, when it retrieves the list from the config server, can delete its
+     * cache entries for dropped collections.  See SERVER-27475, SERVER-27474
      */
-    class CollectionType {
-    public:
-        // Name of the collections collection in the config server.
-        static const std::string ConfigNS;
+    static StatusWith<CollectionType> fromBSON(const BSONObj& source);
 
-        static const BSONField<std::string> fullNs;
-        static const BSONField<OID> epoch;
-        static const BSONField<Date_t> updatedAt;
-        static const BSONField<BSONObj> keyPattern;
-        static const BSONField<bool> unique;
-        static const BSONField<bool> noBalance;
-        static const BSONField<bool> dropped;
+    /**
+     * Returns OK if all fields have been set. Otherwise returns NoSuchKey and information
+     * about what is the first field which is missing.
+     */
+    Status validate() const;
 
+    /**
+     * Returns the BSON representation of the entry.
+     */
+    BSONObj toBSON() const;
 
-        CollectionType();
+    /**
+     * Returns a std::string representation of the current internal state.
+     */
+    std::string toString() const;
 
-        /**
-         * Constructs a new DatabaseType object from BSON. Also does validation of the contents.
-         */
-        static StatusWith<CollectionType> fromBSON(const BSONObj& source);
+    const NamespaceString& getNs() const {
+        return _fullNs.get();
+    }
+    void setNs(const NamespaceString& fullNs);
 
-        /**
-         * Returns OK if all fields have been set. Otherwise returns NoSuchKey and information
-         * about what is the first field which is missing.
-         */
-        Status validate() const;
+    OID getEpoch() const {
+        return _epoch.get();
+    }
+    void setEpoch(OID epoch);
 
-        /**
-         * Returns the BSON representation of the entry.
-         */
-        BSONObj toBSON() const;
+    Date_t getUpdatedAt() const {
+        return _updatedAt.get();
+    }
+    void setUpdatedAt(Date_t updatedAt);
 
-        /**
-         * Clears the internal state.
-         */
-        void clear();
+    bool getDropped() const {
+        return _dropped.get_value_or(false);
+    }
+    void setDropped(bool dropped) {
+        _dropped = dropped;
+    }
 
-        /**
-         * Returns a std::string representation of the current internal state.
-         */
-        std::string toString() const;
+    const KeyPattern& getKeyPattern() const {
+        return _keyPattern.get();
+    }
+    void setKeyPattern(const KeyPattern& keyPattern);
 
-        const std::string& getNs() const { return _fullNs.get(); }
-        void setNs(const std::string& fullNs);
+    const BSONObj& getDefaultCollation() const {
+        return _defaultCollation;
+    }
+    void setDefaultCollation(const BSONObj& collation) {
+        _defaultCollation = collation.getOwned();
+    }
 
-        OID getEpoch() const { return _epoch.get(); }
-        void setEpoch(OID epoch);
+    bool getUnique() const {
+        return _unique.get_value_or(false);
+    }
+    void setUnique(bool unique) {
+        _unique = unique;
+    }
 
-        Date_t getUpdatedAt() const { return _updatedAt.get(); }
-        void setUpdatedAt(Date_t updatedAt);
+    boost::optional<UUID> getUUID() const {
+        return _uuid;
+    }
 
-        bool getDropped() const { return _dropped.get_value_or(false); }
-        void setDropped(bool dropped) { _dropped = dropped; }
+    void setUUID(UUID uuid) {
+        _uuid = uuid;
+    }
 
-        const BSONObj& getKeyPattern() const { return _keyPattern.get(); }
-        void setKeyPattern(const BSONObj& keyPattern);
+    bool getAllowBalance() const {
+        return _allowBalance.get_value_or(true);
+    }
 
-        bool getUnique() const { return _unique.get_value_or(false); }
-        void setUnique(bool unique) { _unique = unique; }
+    bool hasSameOptions(CollectionType& other);
 
-        bool getAllowBalance() const { return _allowBalance.get_value_or(true); }
+private:
+    // Required full namespace (with the database prefix).
+    boost::optional<NamespaceString> _fullNs;
 
-    private:
-        // Required full namespace (with the database prefix).
-        boost::optional<std::string> _fullNs;
+    // Required to disambiguate collection namespace incarnations.
+    boost::optional<OID> _epoch;
 
-        // Required to disambiguate collection namespace incarnations.
-        boost::optional<OID> _epoch;
+    // Required last updated time.
+    boost::optional<Date_t> _updatedAt;
 
-        // Required last updated time.
-        boost::optional<Date_t> _updatedAt;
+    // Optional, whether the collection has been dropped. If missing, implies false.
+    boost::optional<bool> _dropped;
 
-        // Optional, whether the collection has been dropped. If missing, implies false.
-        boost::optional<bool> _dropped;
+    // Sharding key. Required, if collection is not dropped.
+    boost::optional<KeyPattern> _keyPattern;
 
-        // Sharding key. Required, if collection is not dropped.
-        boost::optional<BSONObj> _keyPattern;
+    // Optional collection default collation. If empty, implies simple collation.
+    BSONObj _defaultCollation;
 
-        // Optional uniqueness of the sharding key. If missing, implies false.
-        boost::optional<bool> _unique;
+    // Optional uniqueness of the sharding key. If missing, implies false.
+    boost::optional<bool> _unique;
 
-        // Optional whether balancing is allowed for this collection. If missing, implies true.
-        boost::optional<bool> _allowBalance;
-    };
+    // Optional in 3.6 binaries, because UUID does not exist in featureCompatibilityVersion=3.4.
+    boost::optional<UUID> _uuid;
 
-} // namespace mongo
+    // Optional whether balancing is allowed for this collection. If missing, implies true.
+    boost::optional<bool> _allowBalance;
+};
+
+}  // namespace mongo

@@ -30,221 +30,182 @@
 
 #include "mongo/crypto/mechanism_scram.h"
 
-#include <boost/scoped_ptr.hpp>
 #include <vector>
 
-#include "mongo/crypto/crypto.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/secure_compare_memory.h"
+#include "mongo/util/secure_zero_memory.h"
 
 namespace mongo {
 namespace scram {
 
-    using boost::scoped_ptr;
+using std::unique_ptr;
 
-    // Compute the SCRAM step Hi() as defined in RFC5802
-    static void HMACIteration(const unsigned char input[],
-                              size_t inputLen,
-                              const unsigned char salt[],
-                              size_t saltLen,
-                              unsigned int iterationCount,
-                              unsigned char output[]){
-        unsigned char intermediateDigest[hashSize];
-        unsigned char startKey[hashSize];
-        // Placeholder for HMAC return size, will always be scram::hashSize for HMAC SHA-1
-        unsigned int hashLen = 0;
+// Compute the SCRAM step Hi() as defined in RFC5802
+static SHA1Block HMACIteration(const unsigned char input[],
+                               size_t inputLen,
+                               const unsigned char salt[],
+                               size_t saltLen,
+                               unsigned int iterationCount) {
+    SHA1Block output;
+    SHA1Block intermediateDigest;
+    // Reserve a 20 byte block for the initial key. We use 16 byte salts, and must reserve an extra
+    // 4 bytes for a suffix mandated by RFC5802.
+    std::array<std::uint8_t, 20> startKey;
 
-        uassert(17450, "invalid salt length provided", saltLen + 4 == hashSize);
-        memcpy (startKey, salt, saltLen);
+    uassert(17450, "invalid salt length provided", saltLen + 4 == startKey.size());
+    std::copy(salt, salt + saltLen, startKey.begin());
 
-        startKey[saltLen] = 0;
-        startKey[saltLen+1] = 0;
-        startKey[saltLen+2] = 0;
-        startKey[saltLen+3] = 1;
+    startKey[saltLen] = 0;
+    startKey[saltLen + 1] = 0;
+    startKey[saltLen + 2] = 0;
+    startKey[saltLen + 3] = 1;
 
-        // U1 = HMAC(input, salt + 0001)
-        fassert(17494, crypto::hmacSha1(input,
-                                        inputLen,
-                                        startKey,
-                                        saltLen + 4,
-                                        output,
-                                        &hashLen));
+    // U1 = HMAC(input, salt + 0001)
+    output = SHA1Block::computeHmac(input, inputLen, startKey.data(), startKey.size());
+    intermediateDigest = output;
 
-        memcpy(intermediateDigest, output, hashSize);
-
-        // intermediateDigest contains Ui and output contains the accumulated XOR:ed result
-        for (size_t i = 2; i <= iterationCount; i++) {
-            unsigned char intermediateOutput[hashSize];
-            fassert(17495, crypto::hmacSha1(input,
-                                            inputLen,
-                                            intermediateDigest,
-                                            hashSize,
-                                            intermediateOutput,
-                                            &hashLen));
-            memcpy(intermediateDigest, intermediateOutput, hashSize);
-            for (size_t k = 0; k < hashSize; k++) {
-                output[k] ^= intermediateDigest[k];
-            }
-        }
+    // intermediateDigest contains Ui and output contains the accumulated XOR:ed result
+    for (size_t i = 2; i <= iterationCount; i++) {
+        intermediateDigest = SHA1Block::computeHmac(
+            input, inputLen, intermediateDigest.data(), intermediateDigest.size());
+        output.xorInline(intermediateDigest);
     }
 
-    // Iterate the hash function to generate SaltedPassword
-    void generateSaltedPassword(StringData hashedPassword,
-                                const unsigned char* salt,
-                                const int saltLen,
-                                const int iterationCount,
-                                unsigned char saltedPassword[hashSize]) {
-        // saltedPassword = Hi(hashedPassword, salt)
-        HMACIteration(reinterpret_cast<const unsigned char*>(hashedPassword.rawData()),
-                      hashedPassword.size(),
-                      salt,
-                      saltLen,
-                      iterationCount,
-                      saltedPassword);
-    }
+    return output;
+}
 
-    void generateSecrets(const std::string& hashedPassword,
-                         const unsigned char salt[],
-                         size_t saltLen,
-                         size_t iterationCount,
-                         unsigned char storedKey[hashSize],
-                         unsigned char serverKey[hashSize]) {
+// Iterate the hash function to generate SaltedPassword
+SHA1Block generateSaltedPassword(const SCRAMPresecrets& presecrets) {
+    // saltedPassword = Hi(hashedPassword, salt)
+    SHA1Block saltedPassword =
+        HMACIteration(reinterpret_cast<const unsigned char*>(presecrets.hashedPassword.c_str()),
+                      presecrets.hashedPassword.size(),
+                      presecrets.salt.data(),
+                      presecrets.salt.size(),
+                      presecrets.iterationCount);
 
-        unsigned char saltedPassword[hashSize];
-        unsigned char clientKey[hashSize];
-        unsigned int hashLen = 0;
+    return saltedPassword;
+}
 
-        generateSaltedPassword(hashedPassword,
-                               salt,
-                               saltLen,
-                               iterationCount,
-                               saltedPassword);
+SCRAMSecrets generateSecrets(const SCRAMPresecrets& presecrets) {
+    SHA1Block saltedPassword = generateSaltedPassword(presecrets);
+    return generateSecrets(saltedPassword);
+}
 
-        // clientKey = HMAC(saltedPassword, "Client Key")
-        fassert(17498, 
-                crypto::hmacSha1(saltedPassword,
-                                 hashSize,
-                                 reinterpret_cast<const unsigned char*>(clientKeyConst.data()),
-                                 clientKeyConst.size(),
-                                 clientKey,
-                                 &hashLen));
-
-        // storedKey = H(clientKey)
-        fassert(17499, crypto::sha1(clientKey, hashSize, storedKey));
-
-        // serverKey = HMAC(saltedPassword, "Server Key")
-        fassert(17500, 
-                crypto::hmacSha1(saltedPassword,
-                                 hashSize,
-                                 reinterpret_cast<const unsigned char*>(serverKeyConst.data()),
-                                 serverKeyConst.size(),
-                                 serverKey,
-                                 &hashLen));
-    }
-
-    BSONObj generateCredentials(const std::string& hashedPassword, int iterationCount) {
-
-        const int saltLenQWords = 2;
-
-        // Generate salt
-        uint64_t userSalt[saltLenQWords];
-
-        scoped_ptr<SecureRandom> sr(SecureRandom::create());
-
-        userSalt[0] = sr->nextInt64();
-        userSalt[1] = sr->nextInt64();
-        std::string encodedUserSalt =
-            base64::encode(reinterpret_cast<char*>(userSalt), sizeof(userSalt));
-
-        // Compute SCRAM secrets serverKey and storedKey
-        unsigned char storedKey[hashSize];
-        unsigned char serverKey[hashSize];
-
-        generateSecrets(hashedPassword,
-                        reinterpret_cast<unsigned char*>(userSalt),
-                        saltLenQWords*sizeof(uint64_t),
-                        iterationCount,
-                        storedKey,
-                        serverKey);
-
-        std::string encodedStoredKey =
-            base64::encode(reinterpret_cast<char*>(storedKey), hashSize);
-        std::string encodedServerKey =
-            base64::encode(reinterpret_cast<char*>(serverKey), hashSize);
-
-        return BSON(iterationCountFieldName << iterationCount <<
-                    saltFieldName << encodedUserSalt <<
-                    storedKeyFieldName << encodedStoredKey <<
-                    serverKeyFieldName << encodedServerKey);
-    }
-
-    std::string generateClientProof(const unsigned char saltedPassword[hashSize],
-                                    const std::string& authMessage) {
+SCRAMSecrets generateSecrets(const SHA1Block& saltedPassword) {
+    auto generateAndStoreSecrets = [&saltedPassword](
+        SHA1Block& clientKey, SHA1Block& storedKey, SHA1Block& serverKey) {
 
         // ClientKey := HMAC(saltedPassword, "Client Key")
-        unsigned char clientKey[hashSize];
-        unsigned int hashLen = 0;
-        fassert(18689,
-                crypto::hmacSha1(saltedPassword,
-                                 hashSize,
-                                 reinterpret_cast<const unsigned char*>(clientKeyConst.data()),
-                                 clientKeyConst.size(),
-                                 clientKey,
-                                 &hashLen));
+        clientKey =
+            SHA1Block::computeHmac(saltedPassword.data(),
+                                   saltedPassword.size(),
+                                   reinterpret_cast<const unsigned char*>(clientKeyConst.data()),
+                                   clientKeyConst.size());
 
         // StoredKey := H(clientKey)
-        unsigned char storedKey[hashSize];
-        fassert(18701, crypto::sha1(clientKey, hashSize, storedKey));
-
-        // ClientSignature := HMAC(StoredKey, AuthMessage)
-        unsigned char clientSignature[hashSize];
-        fassert(18702,
-                crypto::hmacSha1(storedKey,
-                                 hashSize,
-                                 reinterpret_cast<const unsigned char*>(authMessage.c_str()),
-                                 authMessage.size(),
-                                 clientSignature,
-                                 &hashLen));
-
-        // ClientProof   := ClientKey XOR ClientSignature
-        unsigned char clientProof[hashSize];
-        for (size_t i = 0; i<hashSize; i++) {
-            clientProof[i] = clientKey[i] ^ clientSignature[i];
-        }
-
-        return base64::encode(reinterpret_cast<char*>(clientProof), hashSize);
-
-    }
-
-    bool verifyServerSignature(const unsigned char saltedPassword[hashSize],
-                               const std::string& authMessage,
-                               const std::string& receivedServerSignature) {
+        storedKey = SHA1Block::computeHash(clientKey.data(), clientKey.size());
 
         // ServerKey       := HMAC(SaltedPassword, "Server Key")
-        unsigned int hashLen;
-        unsigned char serverKey[hashSize];
-        fassert(18703,
-                crypto::hmacSha1(saltedPassword,
-                                 hashSize,
-                                 reinterpret_cast<const unsigned char*>(serverKeyConst.data()),
-                                 serverKeyConst.size(),
-                                 serverKey,
-                                 &hashLen));
+        serverKey =
+            SHA1Block::computeHmac(saltedPassword.data(),
+                                   saltedPassword.size(),
+                                   reinterpret_cast<const unsigned char*>(serverKeyConst.data()),
+                                   serverKeyConst.size());
+    };
+    return SCRAMSecrets(std::move(generateAndStoreSecrets));
+}
 
-        // ServerSignature := HMAC(ServerKey, AuthMessage)
-        unsigned char serverSignature[hashSize];
-        fassert(18704,
-                crypto::hmacSha1(serverKey,
-                                 hashSize,
-                                 reinterpret_cast<const unsigned char*>(authMessage.c_str()),
-                                 authMessage.size(),
-                                 serverSignature,
-                                 &hashLen));
 
-        std::string encodedServerSignature =
-            base64::encode(reinterpret_cast<char*>(serverSignature), sizeof(serverSignature));
-        return (receivedServerSignature == encodedServerSignature);
+BSONObj generateCredentials(const std::string& hashedPassword, int iterationCount) {
+    const int saltLenQWords = 2;
+
+    // Generate salt
+    uint64_t userSalt[saltLenQWords];
+
+    unique_ptr<SecureRandom> sr(SecureRandom::create());
+
+    userSalt[0] = sr->nextInt64();
+    userSalt[1] = sr->nextInt64();
+    std::string encodedUserSalt =
+        base64::encode(reinterpret_cast<char*>(userSalt), sizeof(userSalt));
+
+    // Compute SCRAM secrets serverKey and storedKey
+    auto secrets = generateSecrets(
+        SCRAMPresecrets(hashedPassword,
+                        std::vector<std::uint8_t>(reinterpret_cast<std::uint8_t*>(userSalt),
+                                                  reinterpret_cast<std::uint8_t*>(userSalt) +
+                                                      saltLenQWords * sizeof(uint64_t)),
+                        iterationCount));
+
+    std::string encodedStoredKey = secrets->storedKey.toString();
+    std::string encodedServerKey = secrets->serverKey.toString();
+
+    return BSON(iterationCountFieldName << iterationCount << saltFieldName << encodedUserSalt
+                                        << storedKeyFieldName
+                                        << encodedStoredKey
+                                        << serverKeyFieldName
+                                        << encodedServerKey);
+}
+
+std::string generateClientProof(const SCRAMSecrets& clientCredentials,
+                                const std::string& authMessage) {
+    // ClientSignature := HMAC(StoredKey, AuthMessage)
+    SHA1Block clientSignature =
+        SHA1Block::computeHmac(clientCredentials->storedKey.data(),
+                               clientCredentials->storedKey.size(),
+                               reinterpret_cast<const unsigned char*>(authMessage.c_str()),
+                               authMessage.size());
+
+    clientSignature.xorInline(clientCredentials->clientKey);
+    return clientSignature.toString();
+}
+
+bool verifyServerSignature(const SCRAMSecrets& clientCredentials,
+                           const std::string& authMessage,
+                           const std::string& receivedServerSignature) {
+    // ServerSignature := HMAC(ServerKey, AuthMessage)
+    SHA1Block serverSignature =
+        SHA1Block::computeHmac(clientCredentials->serverKey.data(),
+                               clientCredentials->serverKey.size(),
+                               reinterpret_cast<const unsigned char*>(authMessage.c_str()),
+                               authMessage.size());
+
+    std::string encodedServerSignature = serverSignature.toString();
+
+    if (encodedServerSignature.size() != receivedServerSignature.size()) {
+        return false;
     }
 
-} // namespace scram
-} // namespace mongo
+    return consttimeMemEqual(
+        reinterpret_cast<const unsigned char*>(encodedServerSignature.c_str()),
+        reinterpret_cast<const unsigned char*>(receivedServerSignature.c_str()),
+        encodedServerSignature.size());
+}
+
+bool verifyClientProof(StringData clientProof, StringData storedKey, StringData authMessage) {
+    // ClientSignature := HMAC(StoredKey, AuthMessage)
+    SHA1Block clientSignature =
+        SHA1Block::computeHmac(reinterpret_cast<const unsigned char*>(storedKey.rawData()),
+                               storedKey.size(),
+                               reinterpret_cast<const unsigned char*>(authMessage.rawData()),
+                               authMessage.size());
+
+    auto clientProofSHA1Status = SHA1Block::fromBuffer(
+        reinterpret_cast<const uint8_t*>(clientProof.rawData()), clientProof.size());
+    uassertStatusOK(clientProofSHA1Status);
+    clientSignature.xorInline(clientProofSHA1Status.getValue());
+
+    // StoredKey := H(clientSignature)
+    SHA1Block computedStoredKey =
+        SHA1Block::computeHash(clientSignature.data(), clientSignature.size());
+
+    return consttimeMemEqual(reinterpret_cast<const unsigned char*>(storedKey.rawData()),
+                             computedStoredKey.data(),
+                             computedStoredKey.size());
+}
+
+}  // namespace scram
+}  // namespace mongo

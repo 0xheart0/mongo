@@ -3,7 +3,7 @@
 # Check spelling in comments and quoted strings from the source files.
 
 t=__wt.$$
-trap 'rm -f $t; exit 0' 0 1 2 3 13 15
+trap 'rm -f $t' 0 1 2 3 13 15
 
 # Insulate against locale-specific sort order
 LC_ALL=C
@@ -16,7 +16,11 @@ type aspell > /dev/null 2>&1 || {
 }
 
 # replace:
-#	Create a replacement list of spelling words.
+#	Create a replacement list of spelling words. This is here because the
+# words we ignore changes over time and it's worth periodically collapsing
+# the list. Don't it too often, the list is correct for many different aspell
+# catalogs and generating a shorter list on any single system will break other
+# systems.
 replace() {
 	aspell --mode=ccpp --lang=en list < ../$1 |
 	sort -u |
@@ -26,11 +30,14 @@ replace() {
 # check:
 #	Check the spelling of an individual file.
 check() {
-	aspell --mode=ccpp --lang=en list < ../$1 |
+	# Strip out git hashes, which are seven character hex strings.
+	# Strip out double quote char literals ('"'), they confuse aspell.
+	sed -e 's/ [0-9a-f]\{7\} / /g' -e "s/'\"'//g" ../$2 |
+	aspell --lang=en $1 list |
 	sort -u |
 	comm -23 /dev/stdin s_string.ok > $t
 	test -s $t && {
-		echo "==== $1"
+		echo "==== $2"
 		cat $t
 	}
 }
@@ -59,8 +66,15 @@ while :
 	esac
 done
 
+# Check source files.
 for f in $l; do
-	check $f
+	check "--mode=ccpp" $f
+done
+
+l="NEWS"
+# Check other files.
+for f in $l; do
+	check "" $f
 done
 
 exit 0

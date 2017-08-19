@@ -30,577 +30,660 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/shared_ptr.hpp>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/connpool.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/mr.h"
-#include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/catalog/catalog_manager.h"
-#include "mongo/s/client/shard_connection.h"
-#include "mongo/s/chunk.h"
-#include "mongo/s/chunk_manager.h"
-#include "mongo/s/commands/cluster_commands_common.h"
-#include "mongo/s/config.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard_connection.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/commands/cluster_write.h"
+#include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/strategy.h"
+#include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-    using boost::shared_ptr;
-    using std::map;
-    using std::set;
-    using std::string;
-    using std::vector;
-
 namespace {
 
-    AtomicUInt32 JOB_NUMBER;
+AtomicUInt32 JOB_NUMBER;
 
-    /**
-     * Generates a unique name for the temporary M/R output collection.
-     */
-    string getTmpName(const string& coll) {
-        StringBuilder sb;
-        sb << "tmp.mrs." << coll << "_" << time(0) << "_" << JOB_NUMBER.fetchAndAdd(1);
-        return sb.str();
+const Milliseconds kNoDistLockTimeout(-1);
+
+/**
+ * Generates a unique name for the temporary M/R output collection.
+ */
+std::string getTmpName(StringData coll) {
+    return str::stream() << "tmp.mrs." << coll << "_" << time(0) << "_"
+                         << JOB_NUMBER.fetchAndAdd(1);
+}
+
+/**
+ * Given an input map/reduce command, this call generates the matching command which should
+ * be sent to the shards as part of the first phase of map/reduce.
+ */
+BSONObj fixForShards(const BSONObj& orig,
+                     const std::string& output,
+                     std::string& badShardedField,
+                     int maxChunkSizeBytes) {
+    BSONObjBuilder b;
+    BSONObjIterator i(orig);
+    while (i.more()) {
+        BSONElement e = i.next();
+        const auto fn = e.fieldNameStringData();
+
+        if (fn == bypassDocumentValidationCommandOption() || fn == "map" || fn == "mapreduce" ||
+            fn == "mapReduce" || fn == "mapparams" || fn == "reduce" || fn == "query" ||
+            fn == "sort" || fn == "collation" || fn == "scope" || fn == "verbose" ||
+            fn == "$queryOptions" || fn == "readConcern" ||
+            fn == QueryRequest::cmdOptionMaxTimeMS) {
+            b.append(e);
+        } else if (fn == "out" || fn == "finalize" || fn == "writeConcern") {
+            // We don't want to copy these
+        } else if (!Command::isGenericArgument(fn)) {
+            badShardedField = fn.toString();
+            return BSONObj();
+        }
     }
 
-    /**
-     * Given an input map/reduce command, this call generates the matching command which should
-     * be sent to the shards as part of the first phase of map/reduce.
-     */
-    BSONObj fixForShards(const BSONObj& orig,
-                         const string& output,
-                         string& badShardedField,
-                         int maxChunkSizeBytes) {
+    b.append("out", output);
+    b.append("shardedFirstPass", true);
 
-        BSONObjBuilder b;
-        BSONObjIterator i(orig);
-        while (i.more()) {
-            BSONElement e = i.next();
-            const string fn = e.fieldName();
-
-            if (fn == "map" ||
-                fn == "mapreduce" ||
-                fn == "mapReduce" ||
-                fn == "mapparams" ||
-                fn == "reduce" ||
-                fn == "query" ||
-                fn == "sort" ||
-                fn == "scope" ||
-                fn == "verbose" ||
-                fn == "$queryOptions" ||
-                fn == LiteParsedQuery::cmdOptionMaxTimeMS) {
-
-                b.append(e);
-            }
-            else if (fn == "out" || fn == "finalize") {
-                // We don't want to copy these
-            }
-            else {
-                badShardedField = fn;
-                return BSONObj();
-            }
-        }
-
-        b.append("out", output);
-        b.append("shardedFirstPass", true);
-
-        if (maxChunkSizeBytes > 0) {
-            // Will need to figure out chunks, ask shards for points
-            b.append("splitInfo", maxChunkSizeBytes);
-        }
-
-        return b.obj();
+    if (maxChunkSizeBytes > 0) {
+        // Will need to figure out chunks, ask shards for points
+        b.append("splitInfo", maxChunkSizeBytes);
     }
 
+    return b.obj();
+}
 
-    /**
-     * Outline for sharded map reduce for sharded output, $out replace:
-     *
-     * ============= mongos =============
-     * 1. Send map reduce command to all relevant shards with some extra info like the value for
-     *    the chunkSize and the name of the temporary output collection.
-     *
-     * ============= shard =============
-     * 2. Does normal map reduce.
-     *
-     * 3. Calls splitVector on itself against the output collection and puts the results into the
-     *    response object.
-     *
-     * ============= mongos =============
-     * 4. If the output collection is *not* sharded, uses the information from splitVector to
-     *    create a pre-split sharded collection.
-     *
-     * 5. Grabs the distributed lock for the final output collection.
-     *
-     * 6. Sends mapReduce.shardedfinish.
-     *
-     * ============= shard =============
-     * 7. Extracts the list of shards from the mapReduce.shardedfinish and performs a broadcast
-     *    query against all of them to obtain all documents that this shard owns.
-     *
-     * 8. Performs the reduce operation against every document from step #7 and outputs them to
-     *    another temporary collection. Also keeps track of the BSONObject size of every "reduced"
-     *    document for each chunk range.
-     *
-     * 9. Atomically drops the old output collection and renames the temporary collection to the
-     *    output collection.
-     *
-     * ============= mongos =============
-     * 10. Releases the distributed lock acquired at step #5.
-     *
-     * 11. Inspects the BSONObject size from step #8 and determines if it needs to split.
-     */
-    class MRCmd : public Command {
-    public:
-        MRCmd() : Command("mapReduce", false, "mapreduce") { }
+/**
+ * Outline for sharded map reduce for sharded output, $out replace:
+ *
+ * ============= mongos =============
+ * 1. Send map reduce command to all relevant shards with some extra info like the value for
+ *    the chunkSize and the name of the temporary output collection.
+ *
+ * ============= shard =============
+ * 2. Does normal map reduce.
+ *
+ * 3. Calls splitVector on itself against the output collection and puts the results into the
+ *    response object.
+ *
+ * ============= mongos =============
+ * 4. If the output collection is *not* sharded, uses the information from splitVector to
+ *    create a pre-split sharded collection.
+ *
+ * 5. Grabs the distributed lock for the final output collection.
+ *
+ * 6. Sends mapReduce.shardedfinish.
+ *
+ * ============= shard =============
+ * 7. Extracts the list of shards from the mapReduce.shardedfinish and performs a broadcast
+ *    query against all of them to obtain all documents that this shard owns.
+ *
+ * 8. Performs the reduce operation against every document from step #7 and outputs them to
+ *    another temporary collection. Also keeps track of the BSONObject size of every "reduced"
+ *    document for each chunk range.
+ *
+ * 9. Atomically drops the old output collection and renames the temporary collection to the
+ *    output collection.
+ *
+ * ============= mongos =============
+ * 10. Releases the distributed lock acquired at step #5.
+ *
+ * 11. Inspects the BSONObject size from step #8 and determines if it needs to split.
+ */
+class MRCmd : public ErrmsgCommandDeprecated {
+public:
+    MRCmd() : ErrmsgCommandDeprecated("mapReduce", "mapreduce") {}
 
-        virtual bool slaveOk() const {
-            return true;
-        }
+    bool slaveOk() const override {
+        return true;
+    }
 
-        virtual bool adminOnly() const {
-            return false;
-        }
+    bool adminOnly() const override {
+        return false;
+    }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return parseNsCollectionRequired(dbname, cmdObj).ns();
+    }
 
-        virtual void help(std::stringstream& help) const {
-            help << "Runs the sharded map/reduce command";
-        }
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return mr::mrSupportsWriteConcern(cmd);
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
+    void help(std::stringstream& help) const override {
+        help << "Runs the sharded map/reduce command";
+    }
 
-            mr::addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
-        }
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) override {
+        mr::addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
+    }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
+        Timer t;
 
-            Timer t;
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        const std::string shardResultCollection = getTmpName(nss.coll());
 
-            const string collection = cmdObj.firstElement().valuestrsafe();
-            const string fullns = dbname + "." + collection;
-            const string shardResultCollection = getTmpName(collection);
+        bool shardedOutput = false;
+        bool customOutDB = false;
+        NamespaceString outputCollNss;
+        bool inlineOutput = false;
 
-            BSONObj customOut;
-            string finalColShort;
-            string finalColLong;
-            bool customOutDB = false;
+        std::string outDB = dbname;
 
-            string outDB = dbname;
+        BSONElement outElmt = cmdObj.getField("out");
+        if (outElmt.type() == Object) {
+            // Check if there is a custom output
+            BSONObj customOut = outElmt.embeddedObject();
+            shardedOutput = customOut.getBoolField("sharded");
 
-            BSONElement outElmt = cmdObj.getField("out");
-            if (outElmt.type() == Object) {
-                // Check if there is a custom output
-                BSONObj out = outElmt.embeddedObject();
-                customOut = out;
-
+            if (customOut.hasField("inline")) {
+                inlineOutput = true;
+                uassert(ErrorCodes::InvalidOptions,
+                        "cannot specify inline and sharded output at the same time",
+                        !shardedOutput);
+                uassert(ErrorCodes::InvalidOptions,
+                        "cannot specify inline and output database at the same time",
+                        !customOut.hasField("db"));
+            } else {
                 // Mode must be 1st element
-                finalColShort = out.firstElement().str();
+                const std::string finalColShort = customOut.firstElement().str();
+
                 if (customOut.hasField("db")) {
                     customOutDB = true;
                     outDB = customOut.getField("db").str();
                 }
 
-                finalColLong = outDB + "." + finalColShort;
+                outputCollNss = NamespaceString(outDB, finalColShort);
+                uassert(ErrorCodes::InvalidNamespace,
+                        "Invalid output namespace",
+                        outputCollNss.isValid());
+            }
+        }
+
+        auto const catalogCache = Grid::get(opCtx)->catalogCache();
+
+        // Ensure the input database exists and set up the input collection
+        auto inputRoutingInfo = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
+
+        const bool shardedInput = inputRoutingInfo.cm() != nullptr;
+
+        // Create the output database implicitly if we have a custom output requested
+        if (customOutDB) {
+            uassertStatusOK(createShardDatabase(opCtx, outDB));
+        }
+
+        // Ensure that the output database doesn't reside on the config server
+        auto outputDbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, outDB));
+        uassert(ErrorCodes::CommandNotSupported,
+                str::stream() << "Can not execute mapReduce with output database " << outDB
+                              << " which lives on config servers",
+                inlineOutput || outputDbInfo.primaryId() != "config");
+
+        int64_t maxChunkSizeBytes = 0;
+
+        if (shardedOutput) {
+            // Will need to figure out chunks, ask shards for points
+            maxChunkSizeBytes = cmdObj["maxChunkSizeBytes"].numberLong();
+            if (maxChunkSizeBytes == 0) {
+                maxChunkSizeBytes =
+                    Grid::get(opCtx)->getBalancerConfiguration()->getMaxChunkSizeBytes();
             }
 
-            // Ensure the input database exists
-            auto status = grid.catalogCache()->getDatabase(dbname);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status.getStatus());
+            // maxChunkSizeBytes is sent as int BSON field
+            invariant(maxChunkSizeBytes < std::numeric_limits<int>::max());
+        } else if (outputCollNss.isValid()) {
+            auto outputRoutingInfo =
+                uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, outputCollNss));
+
+            uassert(15920,
+                    "Cannot output to a non-sharded collection because "
+                    "sharded collection exists already",
+                    !outputRoutingInfo.cm());
+
+            // TODO: Should we also prevent going from non-sharded to sharded? During the
+            //       transition client may see partial data.
+        }
+
+        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+
+        // modify command to run on shards with output to tmp collection
+        std::string badShardedField;
+        BSONObj shardedCommand =
+            fixForShards(cmdObj, shardResultCollection, badShardedField, maxChunkSizeBytes);
+
+        if (!shardedInput && !shardedOutput && !customOutDB) {
+            LOG(1) << "simple MR, just passthrough";
+
+            invariant(inputRoutingInfo.primary());
+
+            ShardConnection conn(inputRoutingInfo.primary()->getConnString(), "");
+
+            BSONObj res;
+            bool ok = conn->runCommand(dbname, filterCommandRequestForPassthrough(cmdObj), res);
+            conn.done();
+
+            if (auto wcErrorElem = res["writeConcernError"]) {
+                appendWriteConcernErrorToCmdResponse(
+                    inputRoutingInfo.primary()->getId(), wcErrorElem, result);
             }
 
-            shared_ptr<DBConfig> confIn = status.getValue();
+            result.appendElementsUnique(filterCommandReplyForPassthrough(res));
+            return ok;
+        }
 
-            shared_ptr<DBConfig> confOut;
-            if (customOutDB) {
-                // Create the output database implicitly, since we have a custom output requested
-                confOut = uassertStatusOK(grid.implicitCreateDb(outDB));
+        if (badShardedField.size()) {
+            errmsg = str::stream() << "unknown m/r field for sharding: " << badShardedField;
+            return false;
+        }
+
+        BSONObj q;
+        if (cmdObj["query"].type() == Object) {
+            q = cmdObj["query"].embeddedObjectUserCheck();
+        }
+
+        BSONObj collation;
+        if (cmdObj["collation"].type() == Object) {
+            collation = cmdObj["collation"].embeddedObjectUserCheck();
+        }
+
+        std::set<std::string> servers;
+        std::vector<Strategy::CommandResult> mrCommandResults;
+
+        BSONObjBuilder shardResultsB;
+        BSONObjBuilder shardCountsB;
+        std::map<std::string, int64_t> countsMap;
+
+        auto splitPts = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+
+        {
+            bool ok = true;
+
+            // TODO: take distributed lock to prevent split / migration?
+
+            try {
+                Strategy::commandOp(
+                    opCtx, dbname, shardedCommand, nss.ns(), q, collation, &mrCommandResults);
+            } catch (DBException& e) {
+                e.addContext(str::stream() << "could not run map command on all shards for ns "
+                                           << nss.ns()
+                                           << " and query "
+                                           << q);
+                throw;
             }
-            else {
-                confOut = confIn;
-            }
 
-            const bool shardedInput = confIn &&
-                                      confIn->isShardingEnabled() &&
-                                      confIn->isSharded(fullns);
-            const bool shardedOutput = customOut.getBoolField("sharded");
+            for (const auto& mrResult : mrCommandResults) {
+                // Need to gather list of all servers even if an error happened
+                const auto server = [&]() {
+                    const auto shard =
+                        uassertStatusOK(shardRegistry->getShard(opCtx, mrResult.shardTargetId));
+                    return shard->getConnString().toString();
+                }();
 
-            if (!shardedOutput) {
-                uassert(15920,
-                        "Cannot output to a non-sharded collection because "
-                        "sharded collection exists already",
-                        !confOut->isSharded(finalColLong));
+                servers.insert(server);
 
-                // TODO: Should we also prevent going from non-sharded to sharded? During the
-                //       transition client may see partial data.
-            }
-
-            int64_t maxChunkSizeBytes = 0;
-            if (shardedOutput) {
-                // Will need to figure out chunks, ask shards for points
-                maxChunkSizeBytes = cmdObj["maxChunkSizeBytes"].numberLong();
-                if (maxChunkSizeBytes == 0) {
-                    maxChunkSizeBytes = Chunk::MaxChunkSize;
+                if (!ok) {
+                    continue;
                 }
 
-                // maxChunkSizeBytes is sent as int BSON field
-                invariant(maxChunkSizeBytes < std::numeric_limits<int>::max());
+                BSONObj singleResult = mrResult.result;
+                ok = singleResult["ok"].trueValue();
+
+                if (!ok) {
+                    // At this point we will return
+                    errmsg = str::stream() << "MR parallel processing failed: "
+                                           << singleResult.toString();
+                    continue;
+                }
+
+                shardResultsB.append(server, singleResult);
+
+                BSONObj counts = singleResult["counts"].embeddedObjectUserCheck();
+                shardCountsB.append(server, counts);
+
+                // Add up the counts for each shard. Some of them will be fixed later like
+                // output and reduce.
+                BSONObjIterator j(counts);
+                while (j.more()) {
+                    BSONElement temp = j.next();
+                    countsMap[temp.fieldName()] += temp.numberLong();
+                }
+
+                if (singleResult.hasField("splitKeys")) {
+                    BSONElement splitKeys = singleResult.getField("splitKeys");
+                    for (const auto& splitPt : splitKeys.Array()) {
+                        splitPts.insert(splitPt.Obj().getOwned());
+                    }
+                }
             }
 
-            if (customOut.hasField("inline") && shardedOutput) {
-                errmsg = "cannot specify inline and sharded output at the same time";
+            if (!ok) {
+                cleanUp(servers, dbname, shardResultCollection);
+
+                // Add "code" to the top-level response, if the failure of the sharded command
+                // can be accounted to a single error.
+                int code = getUniqueCodeFromCommandResults(mrCommandResults);
+                if (code != 0) {
+                    result.append("code", code);
+                    result.append("codeName", ErrorCodes::errorString(ErrorCodes::fromInt(code)));
+                }
+
                 return false;
             }
+        }
 
-            // modify command to run on shards with output to tmp collection
-            string badShardedField;
-            BSONObj shardedCommand = fixForShards(cmdObj,
-                                                  shardResultCollection,
-                                                  badShardedField,
-                                                  maxChunkSizeBytes);
+        // Build the sharded finish command
+        BSONObjBuilder finalCmd;
+        finalCmd.append("mapreduce.shardedfinish", cmdObj);
+        finalCmd.append("inputDB", dbname);
+        finalCmd.append("shardedOutputCollection", shardResultCollection);
+        finalCmd.append("shards", shardResultsB.done());
+        finalCmd.append("writeConcern", opCtx->getWriteConcern().toBSON());
 
-            if (!shardedInput && !shardedOutput && !customOutDB) {
-                LOG(1) << "simple MR, just passthrough";
+        BSONObj shardCounts = shardCountsB.done();
+        finalCmd.append("shardCounts", shardCounts);
 
-                ShardConnection conn(confIn->getPrimary().getConnString(), "");
+        BSONObjBuilder timingBuilder;
+        timingBuilder.append("shardProcessing", t.millis());
 
-                BSONObj res;
-                bool ok = conn->runCommand(dbname, cmdObj, res);
-                conn.done();
+        BSONObjBuilder aggCountsB;
+        for (const auto& countEntry : countsMap) {
+            aggCountsB.append(countEntry.first, static_cast<long long>(countEntry.second));
+        }
 
-                result.appendElements(res);
-                return ok;
+        BSONObj aggCounts = aggCountsB.done();
+        finalCmd.append("counts", aggCounts);
+
+        if (auto elem = cmdObj[QueryRequest::cmdOptionMaxTimeMS])
+            finalCmd.append(elem);
+        if (auto elem = cmdObj[bypassDocumentValidationCommandOption()])
+            finalCmd.append(elem);
+
+        Timer t2;
+
+        long long reduceCount = 0;
+        long long outputCount = 0;
+        BSONObjBuilder postCountsB;
+
+        bool ok = true;
+        BSONObj singleResult;
+
+        if (!shardedOutput) {
+            LOG(1) << "MR with single shard output, NS=" << outputCollNss
+                   << " primary=" << outputDbInfo.primaryId();
+
+            const auto outputShard =
+                uassertStatusOK(shardRegistry->getShard(opCtx, outputDbInfo.primaryId()));
+
+            ShardConnection conn(outputShard->getConnString(), outputCollNss.ns());
+            ok = conn->runCommand(outDB, finalCmd.obj(), singleResult);
+
+            BSONObj counts = singleResult.getObjectField("counts");
+            postCountsB.append(conn->getServerAddress(), counts);
+            reduceCount = counts.getIntField("reduce");
+            outputCount = counts.getIntField("output");
+
+            conn.done();
+
+            if (auto wcErrorElem = singleResult["writeConcernError"]) {
+                appendWriteConcernErrorToCmdResponse(outputShard->getId(), wcErrorElem, result);
+            }
+        } else {
+            LOG(1) << "MR with sharded output, NS=" << outputCollNss.ns();
+
+            auto outputRoutingInfo =
+                uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, outputCollNss));
+
+            // Create the sharded collection if needed
+            if (!outputRoutingInfo.cm()) {
+                outputRoutingInfo = createShardedOutputCollection(opCtx, outputCollNss, splitPts);
             }
 
-            if (badShardedField.size()) {
-                errmsg = str::stream() << "unknown m/r field for sharding: " << badShardedField;
-                return false;
-            }
-
-            BSONObj q;
-            if (cmdObj["query"].type() == Object) {
-                q = cmdObj["query"].embeddedObjectUserCheck();
-            }
-
-            set<Shard> shards;
-            set<string> servers;
-            vector<Strategy::CommandResult> results;
-
-            BSONObjBuilder shardResultsB;
-            BSONObjBuilder shardCountsB;
-            map<string, int64_t> countsMap;
-            set< BSONObj > splitPts;
-
+            auto chunkSizes = SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<int>();
             {
-                bool ok = true;
+                // Take distributed lock to prevent split / migration.
+                auto scopedDistLock = Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
+                    opCtx, outputCollNss.ns(), "mr-post-process", kNoDistLockTimeout);
+                if (!scopedDistLock.isOK()) {
+                    return appendCommandStatus(result, scopedDistLock.getStatus());
+                }
 
-                // TODO: take distributed lock to prevent split / migration?
+                BSONObj finalCmdObj = finalCmd.obj();
+                mrCommandResults.clear();
 
                 try {
-                    STRATEGY->commandOp(dbname, shardedCommand, 0, fullns, q, &results);
-                }
-                catch (DBException& e){
-                    e.addContext(str::stream() << "could not run map command on all shards for ns "
-                                               << fullns << " and query " << q);
+                    const BSONObj query;
+                    Strategy::commandOp(opCtx,
+                                        outDB,
+                                        finalCmdObj,
+                                        outputCollNss.ns(),
+                                        query,
+                                        CollationSpec::kSimpleSpec,
+                                        &mrCommandResults);
+                    ok = true;
+                } catch (DBException& e) {
+                    e.addContext(str::stream() << "could not run final reduce on all shards for "
+                                               << nss.ns()
+                                               << ", output "
+                                               << outputCollNss.ns());
                     throw;
                 }
 
-                for (const auto& result : results) {
-                    // Need to gather list of all servers even if an error happened
-                    const string server = result.shardTarget.getConnString();
-                    servers.insert(server);
+                bool hasWCError = false;
 
-                    if (!ok) {
-                        continue;
+                for (const auto& mrResult : mrCommandResults) {
+                    const auto server = [&]() {
+                        const auto shard =
+                            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(
+                                opCtx, mrResult.shardTargetId));
+                        return shard->getConnString().toString();
+                    }();
+
+                    singleResult = mrResult.result;
+                    if (!hasWCError) {
+                        if (auto wcErrorElem = singleResult["writeConcernError"]) {
+                            appendWriteConcernErrorToCmdResponse(
+                                mrResult.shardTargetId, wcErrorElem, result);
+                            hasWCError = true;
+                        }
                     }
 
-                    BSONObj singleResult = result.result;
                     ok = singleResult["ok"].trueValue();
-
                     if (!ok) {
-                        // At this point we will return
-                        errmsg = str::stream() << "MR parallel processing failed: "
-                                               << singleResult.toString();
-                        continue;
+                        break;
                     }
 
-                    shardResultsB.append(server, singleResult);
+                    BSONObj counts = singleResult.getObjectField("counts");
+                    reduceCount += counts.getIntField("reduce");
+                    outputCount += counts.getIntField("output");
+                    postCountsB.append(server, counts);
 
-                    BSONObj counts = singleResult["counts"].embeddedObjectUserCheck();
-                    shardCountsB.append(server, counts);
+                    // get the size inserted for each chunk
+                    // split cannot be called here since we already have the distributed lock
+                    if (singleResult.hasField("chunkSizes")) {
+                        std::vector<BSONElement> sizes =
+                            singleResult.getField("chunkSizes").Array();
+                        for (unsigned int i = 0; i < sizes.size(); i += 2) {
+                            BSONObj key = sizes[i].Obj().getOwned();
+                            const long long size = sizes[i + 1].numberLong();
 
-                    // Add up the counts for each shard. Some of them will be fixed later like
-                    // output and reduce.
-                    BSONObjIterator j(counts);
-                    while (j.more()) {
-                        BSONElement temp = j.next();
-                        countsMap[temp.fieldName()] += temp.numberLong();
-                    }
-
-                    if (singleResult.hasField("splitKeys")) {
-                        BSONElement splitKeys = singleResult.getField("splitKeys");
-                        vector<BSONElement> pts = splitKeys.Array();
-                        for (vector<BSONElement>::iterator it = pts.begin(); it != pts.end(); ++it) {
-                            splitPts.insert(it->Obj().getOwned());
+                            invariant(size < std::numeric_limits<int>::max());
+                            chunkSizes[key] = static_cast<int>(size);
                         }
                     }
                 }
+            }
 
-                if (!ok) {
-                    _cleanUp(servers, dbname, shardResultCollection);
+            // Do the splitting round
+            catalogCache->onStaleConfigError(std::move(outputRoutingInfo));
+            outputRoutingInfo =
+                uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, outputCollNss));
+            uassert(34359,
+                    str::stream() << "Failed to write mapreduce output to " << outputCollNss.ns()
+                                  << "; expected that collection to be sharded, but it was not",
+                    outputRoutingInfo.cm());
 
-                    // Add "code" to the top-level response, if the failure of the sharded command
-                    // can be accounted to a single error.
-                    int code = getUniqueCodeFromCommandResults(results);
-                    if (code != 0) {
-                        result.append("code", code);
-                    }
+            const auto outputCM = outputRoutingInfo.cm();
 
-                    return false;
+            for (const auto& chunkSize : chunkSizes) {
+                BSONObj key = chunkSize.first;
+                const int size = chunkSize.second;
+                invariant(size < std::numeric_limits<int>::max());
+
+                // Key reported should be the chunk's minimum
+                auto c = outputCM->findIntersectingChunkWithSimpleCollation(key);
+                if (!c) {
+                    warning() << "Mongod reported " << size << " bytes inserted for key " << key
+                              << " but can't find chunk";
+                } else {
+                    updateChunkWriteStatsAndSplitIfNeeded(opCtx, outputCM.get(), c.get(), size);
                 }
             }
+        }
 
-            // Build the sharded finish command
-            BSONObjBuilder finalCmd;
-            finalCmd.append("mapreduce.shardedfinish", cmdObj);
-            finalCmd.append("inputDB", dbname);
-            finalCmd.append("shardedOutputCollection", shardResultCollection);
-            finalCmd.append("shards", shardResultsB.done());
+        cleanUp(servers, dbname, shardResultCollection);
 
-            BSONObj shardCounts = shardCountsB.done();
-            finalCmd.append("shardCounts", shardCounts);
+        if (!ok) {
+            errmsg = str::stream() << "MR post processing failed: " << singleResult.toString();
+            return false;
+        }
 
-            BSONObjBuilder timingBuilder;
-            timingBuilder.append("shardProcessing", t.millis());
+        // copy some elements from a single result
+        // annoying that we have to copy all results for inline, but no way around it
+        if (singleResult.hasField("result")) {
+            result.append(singleResult.getField("result"));
+        } else if (singleResult.hasField("results")) {
+            result.append(singleResult.getField("results"));
+        }
 
-            BSONObjBuilder aggCountsB;
-            for (const auto& countEntry : countsMap) {
-                aggCountsB.append(countEntry.first, static_cast<long long>(countEntry.second));
-            }
+        BSONObjBuilder countsB(32);
+        // input stat is determined by aggregate MR job
+        countsB.append("input", aggCounts.getField("input").numberLong());
+        countsB.append("emit", aggCounts.getField("emit").numberLong());
 
-            BSONObj aggCounts = aggCountsB.done();
-            finalCmd.append("counts", aggCounts);
+        // reduce count is sum of all reduces that happened
+        countsB.append("reduce", aggCounts.getField("reduce").numberLong() + reduceCount);
 
-            if (cmdObj.hasField(LiteParsedQuery::cmdOptionMaxTimeMS)) {
-                finalCmd.append(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
-            }
+        // ouput is determined by post processing on each shard
+        countsB.append("output", outputCount);
+        result.append("counts", countsB.done());
 
-            Timer t2;
+        timingBuilder.append("postProcessing", t2.millis());
 
-            long long reduceCount = 0;
-            long long outputCount = 0;
-            BSONObjBuilder postCountsB;
+        result.append("timeMillis", t.millis());
+        result.append("timing", timingBuilder.done());
+        result.append("shardCounts", shardCounts);
+        result.append("postProcessCounts", postCountsB.done());
 
-            bool ok = true;
-            BSONObj singleResult;
+        return true;
+    }
 
-            if (!shardedOutput) {
-                LOG(1) << "MR with single shard output, NS=" << finalColLong
-                       << " primary=" << confOut->getPrimary();
+private:
+    /**
+     * Creates and shards the collection for the output results.
+     */
+    static CachedCollectionRoutingInfo createShardedOutputCollection(OperationContext* opCtx,
+                                                                     const NamespaceString& nss,
+                                                                     const BSONObjSet& splitPts) {
+        auto const catalogCache = Grid::get(opCtx)->catalogCache();
 
-                ShardConnection conn(confOut->getPrimary().getConnString(), finalColLong);
-                ok = conn->runCommand(outDB, finalCmd.obj(), singleResult);
+        // Enable sharding on the output db
+        auto status =
+            Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                "admin",
+                BSON("_configsvrEnableSharding" << nss.db().toString()),
+                Shard::RetryPolicy::kIdempotent);
 
-                BSONObj counts = singleResult.getObjectField("counts");
-                postCountsB.append(conn->getServerAddress(), counts);
-                reduceCount = counts.getIntField("reduce");
-                outputCount = counts.getIntField("output");
+        // If the database has sharding already enabled, we can ignore the error
+        if (status.isOK()) {
+            // Invalidate the output database so it gets reloaded on the next fetch attempt
+            catalogCache->purgeDatabase(nss.db());
+        } else if (status != ErrorCodes::AlreadyInitialized) {
+            uassertStatusOK(status);
+        }
 
+        // Points will be properly sorted using the set
+        const std::vector<BSONObj> sortedSplitPts(splitPts.begin(), splitPts.end());
+
+        // Specifying the initial split points explicitly will cause _configsvrShardCollection to
+        // distribute the initial chunks evenly across shards.
+        // Note that it's not safe to pre-split onto non-primary shards through shardCollection:
+        // a conflict may result if multiple map-reduces are writing to the same output collection,
+        //
+        // TODO: pre-split mapReduce output in a safer way.
+
+        // Invalidate the routing table cache entry for this collection so that we reload the
+        // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
+        ON_BLOCK_EXIT([catalogCache, nss] { catalogCache->invalidateShardedCollection(nss); });
+
+        ConfigsvrShardCollectionRequest configShardCollRequest;
+        configShardCollRequest.set_configsvrShardCollection(nss);
+        configShardCollRequest.setKey(BSON("_id" << 1));
+        configShardCollRequest.setUnique(true);
+        // TODO (SERVER-29622): Setting the numInitialChunks to 0 will be unnecessary once the
+        // constructor automatically respects default values specified in the .idl.
+        configShardCollRequest.setNumInitialChunks(0);
+        configShardCollRequest.setInitialSplitPoints(sortedSplitPts);
+
+        auto cmdResponse = uassertStatusOK(
+            Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                "admin",
+                configShardCollRequest.toBSON(),
+                Shard::RetryPolicy::kIdempotent));
+        uassertStatusOK(cmdResponse.commandStatus);
+
+        // Make sure the cached metadata for the collection knows that we are now sharded
+        return uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
+    }
+
+    /**
+     * Drops the temporary results collections from each shard.
+     */
+    static void cleanUp(const std::set<std::string>& servers,
+                        const std::string& dbName,
+                        const std::string& shardResultCollection) {
+        try {
+            // drop collections with tmp results on each shard
+            for (const auto& server : servers) {
+                ScopedDbConnection conn(server);
+                conn->dropCollection(dbName + "." + shardResultCollection);
                 conn.done();
             }
-            else {
-                LOG(1) << "MR with sharded output, NS=" << finalColLong;
-
-                // Create the sharded collection if needed
-                if (!confOut->isSharded(finalColLong)) {
-                    // Enable sharding on db
-                    confOut->enableSharding();
-
-                    // Shard collection according to split points
-                    vector<BSONObj> sortedSplitPts;
-
-                    // Points will be properly sorted using the set
-                    for (const auto& splitPt : splitPts) {
-                        sortedSplitPts.push_back(splitPt);
-                    }
-
-                    // Pre-split the collection onto all the shards for this database. Note that
-                    // it's not completely safe to pre-split onto non-primary shards using the
-                    // shardcollection method (a conflict may result if multiple map-reduces are
-                    // writing to the same output collection, for instance).
-                    //
-                    // TODO: pre-split mapReduce output in a safer way.
-
-                    set<Shard> shardSet;
-                    confOut->getAllShards(shardSet);
-                    vector<Shard> outShards(shardSet.begin(), shardSet.end());
-
-                    BSONObj sortKey = BSON("_id" << 1);
-                    ShardKeyPattern sortKeyPattern(sortKey);
-                    Status status = grid.catalogManager()->shardCollection(finalColLong,
-                                                                           sortKeyPattern,
-                                                                           true,
-                                                                           &sortedSplitPts,
-                                                                           &outShards);
-                    if (!status.isOK()) {
-                        return appendCommandStatus(result, status);
-                    }
-                }
-
-                map<BSONObj, int> chunkSizes;
-                {
-                    // Take distributed lock to prevent split / migration.
-                    auto scopedDistLock = grid.catalogManager()->getDistLockManager()->lock(
-                                            finalColLong,
-                                            "mr-post-process",
-                                            stdx::chrono::milliseconds(-1), // retry indefinitely
-                                            stdx::chrono::milliseconds(100));
-
-                    if (!scopedDistLock.isOK()) {
-                        return appendCommandStatus(result, scopedDistLock.getStatus());
-                    }
-
-                    BSONObj finalCmdObj = finalCmd.obj();
-                    results.clear();
-
-                    try {
-                        STRATEGY->commandOp(outDB, finalCmdObj, 0, finalColLong, BSONObj(), &results);
-                        ok = true;
-                    }
-                    catch (DBException& e){
-                        e.addContext(str::stream() << "could not run final reduce on all shards for "
-                                                   << fullns << ", output " << finalColLong);
-                        throw;
-                    }
-
-                    for (vector<Strategy::CommandResult>::iterator i = results.begin();
-                        i != results.end(); ++i) {
-
-                        string server = i->shardTarget.getConnString();
-                        singleResult = i->result;
-                        ok = singleResult["ok"].trueValue();
-                        if (!ok) break;
-
-                        BSONObj counts = singleResult.getObjectField("counts");
-                        reduceCount += counts.getIntField("reduce");
-                        outputCount += counts.getIntField("output");
-                        postCountsB.append(server, counts);
-
-                        // get the size inserted for each chunk
-                        // split cannot be called here since we already have the distributed lock
-                        if (singleResult.hasField("chunkSizes")) {
-                            vector<BSONElement> sizes = singleResult.getField("chunkSizes").Array();
-                            for (unsigned int i = 0; i < sizes.size(); i += 2) {
-                                BSONObj key = sizes[i].Obj().getOwned();
-                                const long long size = sizes[i + 1].numberLong();
-
-                                invariant(size < std::numeric_limits<int>::max());
-                                chunkSizes[key] = static_cast<int>(size);
-                            }
-                        }
-                    }
-                }
-
-                // Do the splitting round
-                ChunkManagerPtr cm = confOut->getChunkManagerIfExists(finalColLong);
-                for (const auto& chunkSize : chunkSizes) {
-                    BSONObj key = chunkSize.first;
-                    const int size = chunkSize.second;
-                    invariant(size < std::numeric_limits<int>::max());
-
-                    // key reported should be the chunk's minimum
-                    ChunkPtr c = cm->findIntersectingChunk(key);
-                    if (!c) {
-                        warning() << "Mongod reported " << size << " bytes inserted for key "
-                                  << key << " but can't find chunk";
-                    }
-                    else {
-                        c->splitIfShould(size);
-                    }
-                }
-            }
-
-            _cleanUp(servers, dbname, shardResultCollection);
-
-            if (!ok) {
-                errmsg = str::stream() << "MR post processing failed: " << singleResult.toString();
-                return 0;
-            }
-
-            // copy some elements from a single result
-            // annoying that we have to copy all results for inline, but no way around it
-            if (singleResult.hasField("result")) {
-                result.append(singleResult.getField("result"));
-            }
-            else if (singleResult.hasField("results")) {
-                result.append(singleResult.getField("results"));
-            }
-
-            BSONObjBuilder countsB(32);
-            // input stat is determined by aggregate MR job
-            countsB.append("input", aggCounts.getField("input").numberLong());
-            countsB.append("emit", aggCounts.getField("emit").numberLong());
-
-            // reduce count is sum of all reduces that happened
-            countsB.append("reduce", aggCounts.getField("reduce").numberLong() + reduceCount);
-
-            // ouput is determined by post processing on each shard
-            countsB.append("output", outputCount);
-            result.append("counts", countsB.done());
-
-            timingBuilder.append("postProcessing", t2.millis());
-
-            result.append("timeMillis", t.millis());
-            result.append("timing", timingBuilder.done());
-            result.append("shardCounts", shardCounts);
-            result.append("postProcessCounts", postCountsB.done());
-
-            return true;
+        } catch (const DBException& e) {
+            warning() << "Cannot cleanup shard results" << redact(e);
+        } catch (const std::exception& e) {
+            severe() << "Cannot cleanup shard results" << causedBy(redact(e.what()));
         }
+    }
 
-    private:
+} clusterMapReduceCmd;
 
-        /**
-         * Drops the temporary results collections from each shard.
-         */
-        void _cleanUp(const set<string>& servers, string dbName, string shardResultCollection) {
-            try {
-                // drop collections with tmp results on each shard
-                for (const auto& server : servers) {
-                    ScopedDbConnection conn(server);
-                    conn->dropCollection(dbName + "." + shardResultCollection);
-                    conn.done();
-                }
-            }
-            catch (const DBException& e) {
-                warning() << "Cannot cleanup shard results" << e.toString();
-            }
-            catch (const std::exception& e) {
-                severe() << "Cannot cleanup shard results" << causedBy(e);
-            }
-        }
-
-    } clusterMapReduceCmd;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

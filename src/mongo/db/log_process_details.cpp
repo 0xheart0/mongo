@@ -37,35 +37,29 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 
-    using std::cout;
-    using std::endl;
+bool is32bit() {
+    return (sizeof(int*) == 4);
+}
 
-    bool is32bit() {
-        return ( sizeof(int*) == 4 );
-    }
+void logProcessDetails() {
+    auto&& vii = VersionInfoInterface::instance();
+    log() << mongodVersion(vii);
+    vii.logBuildInfo();
+    printCommandLineOpts();
+}
 
-    void logProcessDetails() {
-        log() << mongodVersion() << endl;
-        printGitVersion();
-        printOpenSSLVersion();
-        printAllocator();
-        printCommandLineOpts();
-    }
+void logProcessDetailsForLogRotate() {
+    log() << "pid=" << ProcessId::getCurrent() << " port=" << serverGlobalParams.port
+          << (is32bit() ? " 32" : " 64") << "-bit "
+          << "host=" << getHostNameCached();
 
-    void logProcessDetailsForLogRotate() {
-        log() << "pid=" <<  ProcessId::getCurrent()
-            << " port=" << serverGlobalParams.port
-            << ( is32bit() ? " 32" : " 64" ) << "-bit "
-            << "host=" << getHostNameCached();
+    logProcessDetails();
+}
 
-        logProcessDetails();
-    }
-
-} //mongo
+}  // mongo

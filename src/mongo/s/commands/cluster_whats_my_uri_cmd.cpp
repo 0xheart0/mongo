@@ -30,46 +30,42 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/util/net/sock.h"
 
 namespace mongo {
 namespace {
 
-    class WhatsMyUriCmd : public Command {
-    public:
-        WhatsMyUriCmd() : Command("whatsmyuri") { }
+class WhatsMyUriCmd : public BasicCommand {
+public:
+    WhatsMyUriCmd() : BasicCommand("whatsmyuri") {}
 
-        virtual bool slaveOk() const {
-            return true;
-        }
+    virtual bool slaveOk() const {
+        return true;
+    }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
 
-        virtual void help(std::stringstream &help) const {
-            help << "{whatsmyuri:1}";
-        }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
+    virtual void help(std::stringstream& help) const {
+        help << "{whatsmyuri:1}";
+    }
 
-            // No auth required
-        }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) {
+        // No auth required
+    }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
+    virtual bool run(OperationContext* opCtx,
+                     const std::string& dbname,
+                     const BSONObj& cmdObj,
+                     BSONObjBuilder& result) {
+        result << "you" << cc().getRemote().toString();
+        return true;
+    }
 
-            result << "you" << cc().getRemote().toString();
-            return true;
-        }
+} whatsMyUriCmd;
 
-    } whatsMyUriCmd;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

@@ -32,35 +32,33 @@
 
 namespace mongo {
 
-    class Collection;
+class Collection;
 
-    struct CollectionScanParams {
-        enum Direction {
-            FORWARD = 1,
-            BACKWARD = -1,
-        };
-
-        CollectionScanParams() : collection(NULL),
-                                 start(RecordId()),
-                                 direction(FORWARD),
-                                 tailable(false),
-                                 maxScan(0) { }
-
-        // What collection?
-        // not owned
-        const Collection* collection;
-
-        // isNull by default.  If you specify any value for this, you're responsible for the RecordId
-        // not being invalidated before the first call to work(...).
-        RecordId start;
-
-        Direction direction;
-
-        // Do we want the scan to be 'tailable'?  Only meaningful if the collection is capped.
-        bool tailable;
-
-        // If non-zero, how many documents will we look at?
-        size_t maxScan;
+struct CollectionScanParams {
+    enum Direction {
+        FORWARD = 1,
+        BACKWARD = -1,
     };
+
+    // What collection?
+    // not owned
+    const Collection* collection = nullptr;
+
+    // isNull by default.  If you specify any value for this, you're responsible for the RecordId
+    // not being invalidated before the first call to work(...).
+    RecordId start;
+
+    Direction direction = FORWARD;
+
+    // Do we want the scan to be 'tailable'?  Only meaningful if the collection is capped.
+    bool tailable = false;
+
+    // Once the first matching document is found, assume that all documents after it must match.
+    // This is useful for oplog queries where we know we will see records ordered by the ts field.
+    bool stopApplyingFilterAfterFirstMatch = false;
+
+    // If non-zero, how many documents will we look at?
+    size_t maxScan = 0;
+};
 
 }  // namespace mongo

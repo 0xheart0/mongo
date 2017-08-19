@@ -31,44 +31,80 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 
 #include "mongo/base/status.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    Status getStatusFromCommandResult(const BSONObj& result) {
-        BSONElement okElement = result["ok"];
-        BSONElement codeElement = result["code"];
-        BSONElement errmsgElement = result["errmsg"];
-        if (okElement.eoo()) {
-            return Status(ErrorCodes::CommandResultSchemaViolation,
-                          mongoutils::str::stream() << "No \"ok\" field in command result " <<
-                          result);
-        }
-        if (okElement.trueValue()) {
-            return Status::OK();
-        }
-        int code = codeElement.numberInt();
-        if (0 == code) {
-            code = ErrorCodes::UnknownError;
-        }
-        std::string errmsg;
-        if (errmsgElement.type() == String) {
-            errmsg = errmsgElement.String();
-        }
-        else if (!errmsgElement.eoo()) {
-            errmsg = errmsgElement.toString();
-        }
+namespace {
+const std::string kCmdResponseWriteConcernField = "writeConcernError";
+}  // namespace
 
-        // we can't use startsWith(errmsg, "no such")
-        // as we have errors such as "no such collection"
-        if (code == ErrorCodes::UnknownError &&
-            (str::startsWith(errmsg, "no such cmd") ||
-             str::startsWith(errmsg, "no such command"))) {
-            code = ErrorCodes::CommandNotFound;
-        }
+Status getStatusFromCommandResult(const BSONObj& result) {
+    BSONElement okElement = result["ok"];
+    BSONElement codeElement = result["code"];
+    BSONElement errmsgElement = result["errmsg"];
 
-        return Status(ErrorCodes::Error(code), errmsg);
+    // StaleConfigException doesn't pass "ok" in legacy servers
+    BSONElement dollarErrElement = result["$err"];
+
+    if (okElement.eoo() && dollarErrElement.eoo()) {
+        return Status(ErrorCodes::CommandResultSchemaViolation,
+                      mongoutils::str::stream() << "No \"ok\" field in command result " << result);
     }
+    if (okElement.trueValue()) {
+        return Status::OK();
+    }
+    int code = codeElement.numberInt();
+    if (0 == code) {
+        code = ErrorCodes::UnknownError;
+    }
+    std::string errmsg;
+    if (errmsgElement.type() == String) {
+        errmsg = errmsgElement.String();
+    } else if (!errmsgElement.eoo()) {
+        errmsg = errmsgElement.toString();
+    }
+
+    // we can't use startsWith(errmsg, "no such")
+    // as we have errors such as "no such collection"
+    if (code == ErrorCodes::UnknownError &&
+        (str::startsWith(errmsg, "no such cmd") || str::startsWith(errmsg, "no such command"))) {
+        code = ErrorCodes::CommandNotFound;
+    }
+
+    return Status(ErrorCodes::Error(code), errmsg);
+}
+
+Status getWriteConcernStatusFromCommandResult(const BSONObj& obj) {
+    BSONElement wcErrorElem;
+    Status status = bsonExtractTypedField(obj, kCmdResponseWriteConcernField, Object, &wcErrorElem);
+    if (!status.isOK()) {
+        if (status == ErrorCodes::NoSuchKey) {
+            return Status::OK();
+        } else {
+            return status;
+        }
+    }
+
+    BSONObj wcErrObj(wcErrorElem.Obj());
+
+    WriteConcernErrorDetail wcError;
+    std::string wcErrorParseMsg;
+    if (!wcError.parseBSON(wcErrObj, &wcErrorParseMsg)) {
+        return Status(ErrorCodes::UnsupportedFormat,
+                      str::stream() << "Failed to parse write concern section due to "
+                                    << wcErrorParseMsg);
+    }
+    std::string wcErrorInvalidMsg;
+    if (!wcError.isValid(&wcErrorInvalidMsg)) {
+        return Status(ErrorCodes::UnsupportedFormat,
+                      str::stream() << "Failed to parse write concern section due to "
+                                    << wcErrorInvalidMsg);
+    }
+    return wcError.toStatus();
+}
 
 }  // namespace mongo

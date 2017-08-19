@@ -26,103 +26,78 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
-#include <boost/shared_ptr.hpp>
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/catalog/catalog_cache.h"
-#include "mongo/s/chunk_manager.h"
-#include "mongo/s/config.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
-
-    using boost::shared_ptr;
-
 namespace {
 
-    class GetShardVersion : public Command {
-    public:
-        GetShardVersion() : Command("getShardVersion", false, "getshardversion") { }
+class GetShardVersion : public BasicCommand {
+public:
+    GetShardVersion() : BasicCommand("getShardVersion", "getshardversion") {}
 
-        virtual bool slaveOk() const {
-            return true;
+    bool slaveOk() const override {
+        return true;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    void help(std::stringstream& help) const override {
+        help << " example: { getShardVersion : 'alleyinsider.foo'  } ";
+    }
+
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) override {
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
+                ActionType::getShardVersion)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        virtual bool adminOnly() const {
-            return true;
+        return Status::OK();
+    }
+
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return parseNsFullyQualified(dbname, cmdObj);
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+
+        auto routingInfo = getShardedCollection(opCtx, nss);
+        const auto cm = routingInfo.cm();
+
+        for (const auto& chunk : cm->chunks()) {
+            log() << redact(chunk->toString());
         }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+        cm->getVersion().addToBSON(result, "version");
 
-        virtual void help(std::stringstream& help) const {
-            help << " example: { getShardVersion : 'alleyinsider.foo'  } ";
-        }
+        return true;
+    }
 
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
+} getShardVersionCmd;
 
-            if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                                                        ResourcePattern::forExactNamespace(
-                                                            NamespaceString(parseNs(dbname,
-                                                                                    cmdObj))),
-                                                        ActionType::getShardVersion)) {
-                return Status(ErrorCodes::Unauthorized, "Unauthorized");
-            }
-
-            return Status::OK();
-        }
-
-        virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-            return parseNsFullyQualified(dbname, cmdObj);
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result) {
-
-            const NamespaceString nss(parseNs(dbname, cmdObj));
-            if (nss.size() == 0) {
-                return appendCommandStatus(result, Status(ErrorCodes::InvalidNamespace,
-                                                          "no namespace specified"));
-            }
-
-            auto status = grid.catalogCache()->getDatabase(nss.db().toString());
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status.getStatus());
-            }
-
-            boost::shared_ptr<DBConfig> config = status.getValue();
-            if (!config->isSharded(nss.ns())) {
-                return appendCommandStatus(result, Status(ErrorCodes::NamespaceNotSharded,
-                                                   "ns [" + nss.ns() + " is not sharded."));
-            }
-
-            ChunkManagerPtr cm = config->getChunkManagerIfExists(nss.ns());
-            if (!cm) {
-                errmsg = "no chunk manager?";
-                return false;
-            }
-
-            cm->_printChunks();
-            cm->getVersion().addToBSON(result);
-
-            return true;
-        }
-
-    } getShardVersionCmd;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

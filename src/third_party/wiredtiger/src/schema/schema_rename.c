@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-2017 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -17,21 +17,24 @@ __rename_file(
     WT_SESSION_IMPL *session, const char *uri, const char *newuri)
 {
 	WT_DECL_RET;
-	int exist;
+	bool exist;
 	const char *filename, *newfile;
 	char *newvalue, *oldvalue;
 
 	newvalue = oldvalue = NULL;
 
 	filename = uri;
+	if (!WT_PREFIX_SKIP(filename, "file:"))
+		return (__wt_unexpected_object_type(session, uri, "file:"));
 	newfile = newuri;
-	if (!WT_PREFIX_SKIP(filename, "file:") ||
-	    !WT_PREFIX_SKIP(newfile, "file:"))
-		return (EINVAL);
+	if (!WT_PREFIX_SKIP(newfile, "file:"))
+		return (__wt_unexpected_object_type(session, newuri, "file:"));
 
+	WT_RET(__wt_schema_backup_check(session, filename));
+	WT_RET(__wt_schema_backup_check(session, newfile));
 	/* Close any btree handles in the file. */
-	WT_WITH_HANDLE_LIST_LOCK(session,
-	    ret = __wt_conn_dhandle_close_all(session, uri, 0));
+	WT_WITH_HANDLE_LIST_WRITE_LOCK(session,
+	    ret = __wt_conn_dhandle_close_all(session, uri, false));
 	WT_ERR(ret);
 
 	/*
@@ -55,7 +58,7 @@ __rename_file(
 	default:
 		WT_ERR(ret);
 	}
-	WT_ERR(__wt_exist(session, newfile, &exist));
+	WT_ERR(__wt_fs_exist(session, newfile, &exist));
 	if (exist)
 		WT_ERR_MSG(session, EEXIST, "%s", newfile);
 
@@ -64,7 +67,7 @@ __rename_file(
 	WT_ERR(__wt_metadata_insert(session, newuri, oldvalue));
 
 	/* Rename the underlying file. */
-	WT_ERR(__wt_rename(session, filename, newfile));
+	WT_ERR(__wt_fs_rename(session, filename, newfile, false));
 	if (WT_META_TRACKING(session))
 		WT_ERR(__wt_meta_track_fileop(session, uri, newuri));
 
@@ -87,9 +90,9 @@ __rename_tree(WT_SESSION_IMPL *session,
 	WT_DECL_ITEM(nv);
 	WT_DECL_ITEM(os);
 	WT_DECL_RET;
+	bool is_colgroup;
 	const char *newname, *olduri, *suffix;
 	char *value;
-	int is_colgroup;
 
 	olduri = table->name;
 	value = NULL;
@@ -151,8 +154,13 @@ __rename_tree(WT_SESSION_IMPL *session,
 	WT_ERR(__wt_scr_alloc(session, 0, &nv));
 	WT_ERR(__wt_buf_fmt(session, nv, "%.*s%s%s",
 	    (int)WT_PTRDIFF(cval.str, value), value,
-	    (const char *)ns->data,
-	    cval.str + cval.len));
+	    (const char *)ns->data, cval.str + cval.len));
+
+	/*
+	 * Do the rename before updating the metadata to avoid leaving the
+	 * metadata inconsistent if the rename fails.
+	 */
+	WT_ERR(__wt_schema_rename(session, os->data, ns->data, cfg));
 
 	/*
 	 * Remove the old metadata entry.
@@ -160,9 +168,6 @@ __rename_tree(WT_SESSION_IMPL *session,
 	 */
 	WT_ERR(__wt_metadata_remove(session, name));
 	WT_ERR(__wt_metadata_insert(session, nn->data, nv->data));
-
-	/* Rename the file. */
-	WT_ERR(__wt_schema_rename(session, os->data, ns->data, cfg));
 
 err:	__wt_scr_free(session, &nn);
 	__wt_scr_free(session, &ns);
@@ -208,7 +213,7 @@ __rename_table(WT_SESSION_IMPL *session,
 	(void)WT_PREFIX_SKIP(oldname, "table:");
 
 	WT_RET(__wt_schema_get_table(
-	    session, oldname, strlen(oldname), 0, &table));
+	    session, oldname, strlen(oldname), false, &table));
 
 	/* Rename the column groups. */
 	for (i = 0; i < WT_COLGROUPS(table); i++)
@@ -272,9 +277,9 @@ __wt_schema_rename(WT_SESSION_IMPL *session,
 		ret = __wt_bad_object_type(session, uri);
 
 	/* Bump the schema generation so that stale data is ignored. */
-	++S2C(session)->schema_gen;
+	(void)__wt_gen_next(session, WT_GEN_SCHEMA);
 
-	WT_TRET(__wt_meta_track_off(session, 1, ret != 0));
+	WT_TRET(__wt_meta_track_off(session, true, ret != 0));
 
 	/* If we didn't find a metadata entry, map that error to ENOENT. */
 	return (ret == WT_NOTFOUND ? ENOENT : ret);

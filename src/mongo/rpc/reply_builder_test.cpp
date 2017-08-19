@@ -28,60 +28,171 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/rpc/document_range.h"
-#include "mongo/rpc/reply.h"
-#include "mongo/rpc/reply_builder.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/json.h"
+#include "mongo/rpc/command_reply.h"
+#include "mongo/rpc/command_reply_builder.h"
+#include "mongo/rpc/legacy_reply.h"
+#include "mongo/rpc/legacy_reply_builder.h"
+#include "mongo/rpc/op_msg_rpc_impls.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
-    using namespace mongo;
+using namespace mongo;
 
-    TEST(ReplyBuilder, RoundTrip) {
+template <typename T>
+void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAndMetadata);
 
-        BSONObjBuilder metadataBob{};
-        metadataBob.append("foo", "bar");
-        auto metadata = metadataBob.done();
+TEST(LegacyReplyBuilder, RoundTrip) {
+    rpc::LegacyReplyBuilder r;
+    testRoundTrip<rpc::LegacyReply>(r, true);
+}
 
-        BSONObjBuilder commandReplyBob{};
-        commandReplyBob.append("bar", "baz");
-        auto commandReply = commandReplyBob.done();
+TEST(CommandReplyBuilder, RoundTrip) {
+    rpc::CommandReplyBuilder r;
+    testRoundTrip<rpc::CommandReply>(r, false);
+}
 
-        BSONObjBuilder outputDoc1Bob{};
-        outputDoc1Bob.append("z", "t");
-        auto outputDoc1 = outputDoc1Bob.done();
+TEST(OpMsgReplyBuilder, RoundTrip) {
+    rpc::OpMsgReplyBuilder r;
+    testRoundTrip<rpc::OpMsgReply>(r, true);
+}
 
-        BSONObjBuilder outputDoc2Bob{};
-        outputDoc2Bob.append("h", "j");
-        auto outputDoc2 = outputDoc2Bob.done();
-
-        BSONObjBuilder outputDoc3Bob{};
-        outputDoc3Bob.append("g", "p");
-        auto outputDoc3 = outputDoc3Bob.done();
-
-        BufBuilder outputDocs;
-        outputDoc1.appendSelfToBufBuilder(outputDocs);
-        outputDoc2.appendSelfToBufBuilder(outputDocs);
-        outputDoc3.appendSelfToBufBuilder(outputDocs);
-
-        rpc::DocumentRange outputDocRange{outputDocs.buf(), outputDocs.buf() + outputDocs.len()};
-
-        rpc::ReplyBuilder r;
-
-        auto msg = r.setMetadata(metadata)
-                    .setCommandReply(commandReply)
-                    .addOutputDocs(outputDocRange)
-                    .done();
-
-        rpc::Reply parsed(msg.get());
-
-        ASSERT_EQUALS(parsed.getMetadata(), metadata);
-        ASSERT_EQUALS(parsed.getCommandReply(), commandReply);
-        // need ostream overloads for ASSERT_EQUALS
-        ASSERT_TRUE(parsed.getOutputDocs() == outputDocRange);
+BSONObj buildMetadata() {
+    BSONObjBuilder metadataTop;
+    {
+        BSONObjBuilder metadataGle(metadataTop.subobjStart("$gleStats"));
+        metadataGle.append("lastOpTime", Timestamp());
+        metadataGle.append("electionId", OID("5592bee00d21e3aa796e185e"));
     }
+
+    // For now we don't need a real $clusterTime and just ensure that it just round trips whatever
+    // is there. If that ever changes, we will need to construct a real $clusterTime here.
+    metadataTop.append("$clusterTime", BSON("bogus" << true));
+    return metadataTop.obj();
+}
+
+BSONObj buildEmptyCommand() {
+    const char text[] = "{ ok: 1.0, cursor: { firstBatch: [] } }";
+    mongo::BSONObj obj = mongo::fromjson(text);
+    return obj;
+}
+
+BSONObj buildCommand() {
+    BSONObjBuilder commandReplyBob{};
+    commandReplyBob.append("ok", 1.0);
+    BSONObjBuilder cursorBuilder;
+    BSONArrayBuilder a(cursorBuilder.subarrayStart("firstBatch"));
+    a.append(BSON("Foo"
+                  << "Bar"));
+    a.done();
+
+    cursorBuilder.appendIntOrLL("id", 1);
+    cursorBuilder.append("ns", "test.$cmd.blah");
+    commandReplyBob.append("cursor", cursorBuilder.done());
+    return commandReplyBob.obj();
+}
+
+BSONObj buildErrReply(const Status status, const BSONObj& extraInfo = {}) {
+    BSONObjBuilder bob;
+    bob.appendElements(extraInfo);
+    bob.append("ok", 0.0);
+    bob.append("errmsg", status.reason());
+    bob.append("code", status.code());
+    bob.append("codeName", ErrorCodes::errorString(status.code()));
+    return bob.obj();
+}
+
+TEST(CommandReplyBuilder, CommandError) {
+    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
+    BSONObj metadata = buildMetadata();
+    rpc::CommandReplyBuilder replyBuilder;
+    replyBuilder.setCommandReply(status);
+    replyBuilder.setMetadata(metadata);
+    auto msg = replyBuilder.done();
+
+    rpc::CommandReply parsed(&msg);
+
+    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), metadata);
+    ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), buildErrReply(status));
+}
+
+TEST(LegacyReplyBuilder, CommandError) {
+    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
+    BSONObj metadata = buildMetadata();
+    BSONObjBuilder extra;
+    extra.append("a", "b");
+    extra.append("c", "d");
+    const BSONObj extraObj = extra.obj();
+    rpc::LegacyReplyBuilder replyBuilder;
+    replyBuilder.setCommandReply(status, extraObj);
+    replyBuilder.setMetadata(metadata);
+    auto msg = replyBuilder.done();
+
+    rpc::LegacyReply parsed(&msg);
+
+    const auto body = ([&] {
+        BSONObjBuilder unifiedBuilder(buildErrReply(status, extraObj));
+        unifiedBuilder.appendElements(metadata);
+        return unifiedBuilder.obj();
+    }());
+
+    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
+    ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
+}
+
+TEST(OpMsgReplyBuilder, CommandError) {
+    const Status status(ErrorCodes::InvalidLength, "Response payload too long");
+    BSONObj metadata = buildMetadata();
+    BSONObjBuilder extra;
+    extra.append("a", "b");
+    extra.append("c", "d");
+    const BSONObj extraObj = extra.obj();
+    rpc::OpMsgReplyBuilder replyBuilder;
+    replyBuilder.setCommandReply(status, extraObj);
+    replyBuilder.setMetadata(metadata);
+    auto msg = replyBuilder.done();
+
+    rpc::OpMsgReply parsed(&msg);
+
+    const auto body = ([&] {
+        BSONObjBuilder unifiedBuilder(buildErrReply(status, extraObj));
+        unifiedBuilder.appendElements(metadata);
+        return unifiedBuilder.obj();
+    }());
+
+    ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
+    ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
+}
+
+template <typename T>
+void testRoundTrip(rpc::ReplyBuilderInterface& replyBuilder, bool unifiedBodyAndMetadata) {
+    auto metadata = buildMetadata();
+    auto commandReply = buildEmptyCommand();
+
+    replyBuilder.setCommandReply(commandReply);
+    replyBuilder.setMetadata(metadata);
+
+    auto msg = replyBuilder.done();
+
+    T parsed(&msg);
+
+    if (unifiedBodyAndMetadata) {
+        const auto body = ([&] {
+            BSONObjBuilder unifiedBuilder(std::move(commandReply));
+            unifiedBuilder.appendElements(metadata);
+            return unifiedBuilder.obj();
+        }());
+
+        ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), body);
+        ASSERT_BSONOBJ_EQ(parsed.getMetadata(), body);
+    } else {
+        ASSERT_BSONOBJ_EQ(parsed.getCommandReply(), commandReply);
+        ASSERT_BSONOBJ_EQ(parsed.getMetadata(), metadata);
+    }
+}
 
 }  // namespace

@@ -29,365 +29,412 @@
 
 #include "mongo/db/ops/modifier_add_to_set.h"
 
+#include <cstdint>
+
 #include "mongo/base/string_data.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/ops/log_builder.h"
-#include "mongo/platform/cstdint.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/update/log_builder.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
-    using mongo::BSONObj;
-    using mongo::LogBuilder;
-    using mongo::ModifierAddToSet;
-    using mongo::ModifierInterface;
-    using mongo::Status;
-    using mongo::StringData;
-    using mongo::fromjson;
-    using mongo::mutablebson::Document;
-    using mongo::mutablebson::Element;
+using mongo::BSONObj;
+using mongo::CollatorInterfaceMock;
+using mongo::LogBuilder;
+using mongo::ModifierAddToSet;
+using mongo::ModifierInterface;
+using mongo::Status;
+using mongo::StringData;
+using mongo::fromjson;
+using mongo::mutablebson::Document;
+using mongo::mutablebson::Element;
 
-    /** Helper to build and manipulate a $addToSet mod. */
-    class Mod {
-    public:
-        Mod() : _mod() {}
+/** Helper to build and manipulate a $addToSet mod. */
+class Mod {
+public:
+    Mod() : _mod() {}
 
-        explicit Mod(BSONObj modObj)
-            : _modObj(modObj)
-            , _mod() {
-            ASSERT_OK(_mod.init(_modObj["$addToSet"].embeddedObject().firstElement(),
-                                ModifierInterface::Options::normal()));
-        }
-
-        Status prepare(Element root,
-                       StringData matchedField,
-                       ModifierInterface::ExecInfo* execInfo) {
-            return _mod.prepare(root, matchedField, execInfo);
-        }
-
-        Status apply() const {
-            return _mod.apply();
-        }
-
-        Status log(LogBuilder* logBuilder) const {
-            return _mod.log(logBuilder);
-        }
-
-        ModifierAddToSet& mod() {
-            return _mod;
-        }
-
-    private:
-        BSONObj _modObj;
-        ModifierAddToSet _mod;
-    };
-
-    TEST(Init, FailToInitWithInvalidValue) {
-        BSONObj modObj;
-        ModifierAddToSet mod;
-
-        modObj = fromjson("{ $addToSet : { a : { 'x.$.y' : 'bad' } } }");
-        ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                                ModifierInterface::Options::normal()));
-        modObj = fromjson("{ $addToSet : { a : { $each : [ { 'x.$.y' : 'bad' } ] } } }");
-        ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                                ModifierInterface::Options::normal()));
-
-        // An int is not valid after $each
-        modObj = fromjson("{ $addToSet : { a : { $each : 0 } } }");
-        ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                                ModifierInterface::Options::normal()));
-
-        // An object is not valid after $each
-        modObj = fromjson("{ $addToSet : { a : { $each : { a : 1 } } } }");
-        ASSERT_NOT_OK(mod.init(modObj["$addToSet"].embeddedObject().firstElement(),
-                                ModifierInterface::Options::normal()));
+    explicit Mod(BSONObj modObj,
+                 ModifierInterface::Options options = ModifierInterface::Options::normal())
+        : _modObj(modObj), _mod() {
+        ASSERT_OK(_mod.init(_modObj["$addToSet"].embeddedObject().firstElement(), options));
     }
 
-    TEST(Init, ParsesSimple) {
-        Mod(fromjson("{ $addToSet : { a : 1 } }"));
-        Mod(fromjson("{ $addToSet : { a : 'foo' } }"));
-        Mod(fromjson("{ $addToSet : { a : {} } }"));
-        Mod(fromjson("{ $addToSet : { a : { x : 1 } } }"));
-        Mod(fromjson("{ $addToSet : { a : [] } }"));
-        Mod(fromjson("{ $addToSet : { a : [1, 2] } } }"));
-        Mod(fromjson("{ $addToSet : { 'a.b' : 1 } }"));
-        Mod(fromjson("{ $addToSet : { 'a.b' : 'foo' } }"));
-        Mod(fromjson("{ $addToSet : { 'a.b' : {} } }"));
-        Mod(fromjson("{ $addToSet : { 'a.b' : { x : 1} } }"));
-        Mod(fromjson("{ $addToSet : { 'a.b' : [] } }"));
-        Mod(fromjson("{ $addToSet : { 'a.b' : [1, 2] } } }"));
+    Status prepare(Element root, StringData matchedField, ModifierInterface::ExecInfo* execInfo) {
+        return _mod.prepare(root, matchedField, execInfo);
     }
 
-    TEST(Init, ParsesEach) {
-        Mod(fromjson("{ $addToSet : { a : { $each : [] } } }"));
-        Mod(fromjson("{ $addToSet : { a : { $each : [ 1 ] } } }"));
-        Mod(fromjson("{ $addToSet : { a : { $each : [ 1, 2 ] } } }"));
-        Mod(fromjson("{ $addToSet : { a : { $each : [ 1, 2, 1 ] } } }"));
-        Mod(fromjson("{ $addToSet : { a : { $each : [ {} ] } } }"));
-        Mod(fromjson("{ $addToSet : { a : { $each : [ { x : 1 } ] } } }"));
-        Mod(fromjson("{ $addToSet : { a : { $each : [ { x : 1 }, { y : 2 } ] } } }"));
-        Mod(fromjson("{ $addToSet : { a : { $each : [ { x : 1 }, { y : 2 }, { x : 1 } ] } } }"));
+    Status apply() const {
+        return _mod.apply();
     }
 
-    TEST(SimpleMod, PrepareOKTargetNotFound) {
-        Document doc(fromjson("{}"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
-
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    Status log(LogBuilder* logBuilder) const {
+        return _mod.log(logBuilder);
     }
 
-    TEST(SimpleMod, PrepareOKTargetFound) {
-        Document doc(fromjson("{ a : [ 1 ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
-
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.noOp);
-
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1 ] } }"), logDoc);
+    ModifierAddToSet& mod() {
+        return _mod;
     }
 
-    TEST(SimpleMod, PrepareInvalidTargetNumber) {
-        Document doc(fromjson("{ a : 1 }"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
+private:
+    BSONObj _modObj;
+    ModifierAddToSet _mod;
+};
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_NOT_OK(mod.prepare(doc.root(), "", &execInfo));
-    }
+TEST(Init, ParsesSimple) {
+    Mod(fromjson("{ $addToSet : { a : 1 } }"));
+    Mod(fromjson("{ $addToSet : { a : 'foo' } }"));
+    Mod(fromjson("{ $addToSet : { a : {} } }"));
+    Mod(fromjson("{ $addToSet : { a : { x : 1 } } }"));
+    Mod(fromjson("{ $addToSet : { a : [] } }"));
+    Mod(fromjson("{ $addToSet : { a : [1, 2] } } }"));
+    Mod(fromjson("{ $addToSet : { 'a.b' : 1 } }"));
+    Mod(fromjson("{ $addToSet : { 'a.b' : 'foo' } }"));
+    Mod(fromjson("{ $addToSet : { 'a.b' : {} } }"));
+    Mod(fromjson("{ $addToSet : { 'a.b' : { x : 1} } }"));
+    Mod(fromjson("{ $addToSet : { 'a.b' : [] } }"));
+    Mod(fromjson("{ $addToSet : { 'a.b' : [1, 2] } } }"));
+}
 
-    TEST(SimpleMod, PrepareInvalidTarget) {
-        Document doc(fromjson("{ a : {} }"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
+TEST(Init, ParsesEach) {
+    Mod(fromjson("{ $addToSet : { a : { $each : [] } } }"));
+    Mod(fromjson("{ $addToSet : { a : { $each : [ 1 ] } } }"));
+    Mod(fromjson("{ $addToSet : { a : { $each : [ 1, 2 ] } } }"));
+    Mod(fromjson("{ $addToSet : { a : { $each : [ 1, 2, 1 ] } } }"));
+    Mod(fromjson("{ $addToSet : { a : { $each : [ {} ] } } }"));
+    Mod(fromjson("{ $addToSet : { a : { $each : [ { x : 1 } ] } } }"));
+    Mod(fromjson("{ $addToSet : { a : { $each : [ { x : 1 }, { y : 2 } ] } } }"));
+    Mod(fromjson("{ $addToSet : { a : { $each : [ { x : 1 }, { y : 2 }, { x : 1 } ] } } }"));
+}
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_NOT_OK(mod.prepare(doc.root(), "", &execInfo));
-    }
+TEST(SimpleMod, PrepareOKTargetNotFound) {
+    Document doc(fromjson("{}"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
 
-    TEST(SimpleMod, ApplyAndLogEmptyDocument) {
-        Document doc(fromjson("{}"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
+}
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+TEST(SimpleMod, PrepareOKTargetFound) {
+    Document doc(fromjson("{ a : [ 1 ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 1 ] }"), doc);
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_TRUE(execInfo.noOp);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1 ] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1 ] } }"), logDoc);
+}
 
-    TEST(SimpleMod, ApplyAndLogEmptyArray) {
-        Document doc(fromjson("{ a : [] }"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
+TEST(SimpleMod, PrepareInvalidTargetNumber) {
+    Document doc(fromjson("{ a : 1 }"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_NOT_OK(mod.prepare(doc.root(), "", &execInfo));
+}
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 1 ] }"), doc);
+TEST(SimpleMod, PrepareInvalidTarget) {
+    Document doc(fromjson("{ a : {} }"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1 ] } }"), logDoc);
-    }
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_NOT_OK(mod.prepare(doc.root(), "", &execInfo));
+}
 
-    TEST(SimpleEachMod, ApplyAndLogEmptyDocument) {
-        Document doc(fromjson("{}"));
-        Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
+TEST(SimpleMod, ApplyAndLogEmptyDocument) {
+    Document doc(fromjson("{}"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 1, 2, 3 ] }"), doc);
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 1 ] }"), doc);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1 ] } }"), logDoc);
+}
 
-    TEST(SimpleEachMod, ApplyAndLogEmptyArray) {
-        Document doc(fromjson("{ a : [] }"));
-        Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
+TEST(SimpleMod, ApplyAndLogEmptyArray) {
+    Document doc(fromjson("{ a : [] }"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 1, 2, 3 ] }"), doc);
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 1 ] }"), doc);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1 ] } }"), logDoc);
+}
 
-    TEST(SimpleMod, ApplyAndLogPopulatedArray) {
-        Document doc(fromjson("{ a : [ 'x' ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
+TEST(SimpleEachMod, ApplyAndLogEmptyDocument) {
+    Document doc(fromjson("{}"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 'x', 1 ] }"), doc);
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 1, 2, 3 ] }"), doc);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 'x', 1 ] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
+}
 
-    TEST(SimpleEachMod, ApplyAndLogPopulatedArray) {
-        Document doc(fromjson("{ a : [ 'x' ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
+TEST(SimpleEachMod, ApplyAndLogEmptyArray) {
+    Document doc(fromjson("{ a : [] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 'x', 1, 2, 3 ] }"), doc);
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 1, 2, 3 ] }"), doc);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 'x', 1, 2, 3 ] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
+}
 
-    TEST(NoOp, AddOneExistingIsNoOp) {
-        Document doc(fromjson("{ a : [ 1, 2, 3 ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.noOp);
+TEST(SimpleMod, ApplyAndLogPopulatedArray) {
+    Document doc(fromjson("{ a : [ 'x' ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
-    }
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-    TEST(NoOp, AddSeveralExistingIsNoOp) {
-        Document doc(fromjson("{ a : [ 1, 2, 3 ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2] } } }"));
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.noOp);
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 'x', 1 ] }"), doc);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 'x', 1 ] } }"), logDoc);
+}
 
-    TEST(NoOp, AddAllExistingIsNoOp) {
-        Document doc(fromjson("{ a : [ 1, 2, 3 ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.noOp);
+TEST(SimpleEachMod, ApplyAndLogPopulatedArray) {
+    Document doc(fromjson("{ a : [ 'x' ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
-    }
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-    TEST(Deduplication, ExistingDuplicatesArePreserved) {
-        Document doc(fromjson("{ a : [ 1, 1, 2, 1, 2, 2 ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : 3 } }"));
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 'x', 1, 2, 3 ] }"), doc);
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 'x', 1, 2, 3 ] } }"), logDoc);
+}
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 1, 1, 2, 1, 2, 2, 3] }"), doc);
+TEST(NoOp, AddOneExistingIsNoOp) {
+    Document doc(fromjson("{ a : [ 1, 2, 3 ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : 1 } }"));
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_TRUE(execInfo.noOp);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 1, 2, 1, 2, 2, 3] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
+}
 
-    TEST(Deduplication, NewDuplicatesAreElided) {
-        Document doc(fromjson("{ a : [ 1, 1, 2, 1, 2, 2 ] }"));
-        Mod mod(fromjson("{ $addToSet : { a : { $each : [ 4, 1, 3, 2, 3, 1, 3, 3, 2, 4] } } }"));
+TEST(NoOp, AddSeveralExistingIsNoOp) {
+    Document doc(fromjson("{ a : [ 1, 2, 3 ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2] } } }"));
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_TRUE(execInfo.noOp);
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.noOp);
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
+}
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ a : [ 1, 1, 2, 1, 2, 2, 4, 3] }"), doc);
+TEST(NoOp, AddAllExistingIsNoOp) {
+    Document doc(fromjson("{ a : [ 1, 2, 3 ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : [1, 2, 3] } } }"));
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_TRUE(execInfo.noOp);
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 1, 2, 1, 2, 2, 4, 3] } }"), logDoc);
-    }
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 2, 3 ] } }"), logDoc);
+}
 
-    TEST(Regressions, SERVER_12848) {
-        // Proof that the mod works ok (the real issue was in validate).
+TEST(Deduplication, ExistingDuplicatesArePreserved) {
+    Document doc(fromjson("{ a : [ 1, 1, 2, 1, 2, 2 ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : 3 } }"));
 
-        Document doc(fromjson("{ _id : 1, a : [ 1, [ ] ] }"));
-        Mod mod(fromjson("{ $addToSet : { 'a.1' : 1 } }"));
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-        ModifierInterface::ExecInfo execInfo;
-        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 1, 1, 2, 1, 2, 2, 3] }"), doc);
 
-        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.1");
-        ASSERT_FALSE(execInfo.noOp);
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 1, 2, 1, 2, 2, 3] } }"), logDoc);
+}
 
-        ASSERT_OK(mod.apply());
-        ASSERT_FALSE(doc.isInPlaceModeEnabled());
-        ASSERT_EQUALS(fromjson("{ _id : 1, a : [ 1, [ 1 ] ] }"), doc);
+TEST(Deduplication, NewDuplicatesAreElided) {
+    Document doc(fromjson("{ a : [ 1, 1, 2, 1, 2, 2 ] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : [ 4, 1, 3, 2, 3, 1, 3, 3, 2, 4] } } }"));
 
-        Document logDoc;
-        LogBuilder logBuilder(logDoc.root());
-        ASSERT_OK(mod.log(&logBuilder));
-        ASSERT_EQUALS(fromjson("{ $set : { 'a.1' : [ 1 ] } }"), logDoc);
-    }
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+    ASSERT_FALSE(execInfo.noOp);
 
-} // namespace
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ a : [ 1, 1, 2, 1, 2, 2, 4, 3] }"), doc);
+
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { a : [ 1, 1, 2, 1, 2, 2, 4, 3] } }"), logDoc);
+}
+
+TEST(Regressions, SERVER_12848) {
+    // Proof that the mod works ok (the real issue was in validate).
+
+    Document doc(fromjson("{ _id : 1, a : [ 1, [ ] ] }"));
+    Mod mod(fromjson("{ $addToSet : { 'a.1' : 1 } }"));
+
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+
+    ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.1");
+    ASSERT_FALSE(execInfo.noOp);
+
+    ASSERT_OK(mod.apply());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_EQUALS(fromjson("{ _id : 1, a : [ 1, [ 1 ] ] }"), doc);
+
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    ASSERT_OK(mod.log(&logBuilder));
+    ASSERT_EQUALS(fromjson("{ $set : { 'a.1' : [ 1 ] } }"), logDoc);
+}
+
+TEST(Deduplication, DeduplicationRespectsCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    Document doc(fromjson("{ a : ['bar'] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : ['FOO', 'foo'] } } }"));
+    mod.mod().setCollator(&collator);
+
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+
+    ASSERT_FALSE(execInfo.noOp);
+    ASSERT_OK(mod.apply());
+
+    ASSERT(doc.compareWithBSONObj(fromjson("{ a : ['bar', 'FOO'] }"), nullptr, false) == 0 ||
+           doc.compareWithBSONObj(fromjson("{ a: ['bar', 'foo'] }"), nullptr, false) == 0);
+}
+
+TEST(Deduplication, ExistingDuplicatesArePreservedWithRespectToCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    Document doc(fromjson("{ a : ['bar', 'BAR'] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : ['FOO', 'foo'] } } }"));
+    mod.mod().setCollator(&collator);
+
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+
+    ASSERT_FALSE(execInfo.noOp);
+    ASSERT_OK(mod.apply());
+
+    ASSERT_EQUALS(doc, fromjson("{ a : ['bar', 'BAR', 'FOO'] }"));
+}
+
+TEST(Collation, AddToSetRespectsCollationFromModifierOptions) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    Document doc(fromjson("{ a : ['not'] }"));
+    Mod mod(fromjson("{ $addToSet : { a : 'equal' } }"),
+            ModifierInterface::Options::normal(&collator));
+
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+
+    ASSERT_TRUE(execInfo.noOp);
+}
+
+TEST(Collation, AddToSetRespectsCollationFromSetCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
+    Document doc(fromjson("{ a : ['not'] }"));
+    Mod mod(fromjson("{ $addToSet : { a : 'equal' } }"));
+    mod.mod().setCollator(&collator);
+
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+
+    ASSERT_TRUE(execInfo.noOp);
+}
+
+TEST(Collation, AddToSetWithEachRespectsCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    Document doc(fromjson("{ a : ['abc'] }"));
+    Mod mod(fromjson("{ $addToSet : { a : { $each : ['ABC', 'bdc'] } } }"));
+    mod.mod().setCollator(&collator);
+
+    ModifierInterface::ExecInfo execInfo;
+    ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+
+    ASSERT_FALSE(execInfo.noOp);
+    ASSERT_OK(mod.apply());
+
+    ASSERT_EQUALS(doc, fromjson("{ a : ['abc', 'bdc'] }"));
+}
+}  // namespace

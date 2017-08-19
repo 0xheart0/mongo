@@ -33,25 +33,30 @@
 
 namespace mongo {
 
-    /**
-     * if doc is ok, then return is BSONObj()
-     * otherwise, BSONObj is what should be inserted instead
-     */
-    StatusWith<BSONObj> fixDocumentForInsert( const BSONObj& doc );
+class ServiceContext;
+
+/**
+ * Validates that 'doc' is legal for insertion, possibly with some modifications.
+ *
+ * This function returns:
+ *  - a non-OK status if 'doc' is not valid;
+ *  - an empty BSONObj if 'doc' can be inserted as-is; or
+ *  - a non-empty BSONObj representing what should be inserted instead of 'doc'.
+ */
+StatusWith<BSONObj> fixDocumentForInsert(ServiceContext* service, const BSONObj& doc);
 
 
-    /**
-     * Returns Status::OK() if this namespace is valid for user write operations.  If not, returns
-     * an error Status.
-     */
-    Status userAllowedWriteNS( StringData db, StringData coll );
-    Status userAllowedWriteNS( StringData ns );
-    Status userAllowedWriteNS( const NamespaceString& ns );
+/**
+ * Returns Status::OK() if this namespace is valid for user write operations.  If not, returns
+ * an error Status.
+ */
+Status userAllowedWriteNS(StringData db, StringData coll);
+Status userAllowedWriteNS(StringData ns);
+Status userAllowedWriteNS(const NamespaceString& ns);
 
-    /**
-     * Returns Status::OK() if the namespace described by (db, coll) is valid for user create
-     * operations.  If not, returns an error Status.
-     */
-    Status userAllowedCreateNS( StringData db, StringData coll );
-
+/**
+ * Returns Status::OK() if the namespace described by (db, coll) is valid for user create
+ * operations.  If not, returns an error Status.
+ */
+Status userAllowedCreateNS(StringData db, StringData coll);
 }

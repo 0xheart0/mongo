@@ -26,74 +26,45 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/cluster_last_error_info.h"
 
-#include <utility>
-
-#include "mongo/db/client.h"
-#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/stats/timer_stats.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
-    const ClientBasic::Decoration<ClusterLastErrorInfo> ClusterLastErrorInfo::get =
-        ClientBasic::declareDecoration<ClusterLastErrorInfo>();
+const Client::Decoration<std::shared_ptr<ClusterLastErrorInfo>> ClusterLastErrorInfo::get =
+    Client::declareDecoration<std::shared_ptr<ClusterLastErrorInfo>>();
 
-    void ClusterLastErrorInfo::addShardHost(const std::string& shardHost) {
-        _cur->shardHostsWritten.insert( shardHost );
+void ClusterLastErrorInfo::addShardHost(const std::string& shardHost) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _cur->shardHostsWritten.insert(shardHost);
+}
+
+void ClusterLastErrorInfo::addHostOpTime(ConnectionString connStr, HostOpTime stat) {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _cur->hostOpTimes[connStr] = stat;
+}
+
+void ClusterLastErrorInfo::addHostOpTimes(const HostOpTimeMap& hostOpTimes) {
+    for (HostOpTimeMap::const_iterator it = hostOpTimes.begin(); it != hostOpTimes.end(); ++it) {
+        addHostOpTime(it->first, it->second);
     }
+}
 
-    void ClusterLastErrorInfo::addHostOpTime(ConnectionString connStr, HostOpTime stat) {
-        _cur->hostOpTimes[connStr] = stat;
-    }
+void ClusterLastErrorInfo::newRequest() {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    std::swap(_cur, _prev);
+    _cur->clear();
+}
 
-    void ClusterLastErrorInfo::addHostOpTimes( const HostOpTimeMap& hostOpTimes ) {
-        for ( HostOpTimeMap::const_iterator it = hostOpTimes.begin();
-            it != hostOpTimes.end(); ++it ) {
-            addHostOpTime(it->first, it->second);
-        }
-    }
+void ClusterLastErrorInfo::disableForCommand() {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    RequestInfo* temp = _cur;
+    _cur = _prev;
+    _prev = temp;
+}
 
-    void ClusterLastErrorInfo::newRequest() {
-        std::swap(_cur, _prev);
-        _cur->clear();
-    }
-
-    void ClusterLastErrorInfo::disableForCommand() {
-        RequestInfo* temp = _cur;
-        _cur = _prev;
-        _prev = temp;
-    }
-
-    static TimerStats gleWtimeStats;
-    static ServerStatusMetricField<TimerStats> displayGleLatency("getLastError.wtime",
-                                                                 &gleWtimeStats);
-
-    void saveGLEStats(const BSONObj& result, const std::string& hostString) {
-        if (!haveClient()) {
-            return;
-        }
-        if (result[kGLEStatsFieldName].type() != Object) {
-            return;
-        }
-        std::string errmsg;
-        ConnectionString shardConn = ConnectionString::parse(hostString, errmsg);
-
-        BSONElement subobj = result[kGLEStatsFieldName];
-        Timestamp lastOpTime = subobj[kGLEStatsLastOpTimeFieldName].timestamp();
-        OID electionId = subobj[kGLEStatsElectionIdFieldName].OID();
-        auto& clientInfo = cc();
-        LOG(4) << "saveGLEStats lastOpTime:" << lastOpTime 
-               << " electionId:" << electionId;
-
-        ClusterLastErrorInfo::get(clientInfo).addHostOpTime(
-                shardConn, HostOpTime(lastOpTime, electionId));
-    }
-
-} // namespace mongo
+}  // namespace mongo

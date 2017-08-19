@@ -28,23 +28,105 @@
  *    it in the license file.
  */
 
+#pragma once
+
+#include <memory>
+#include <set>
+
+#include "mongo/base/string_data.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/util/string_map.h"
+
 namespace mongo {
 
-    class MatchExpression;
+class MatchExpression;
+struct DepsTracker;
 
-    namespace expression {
-        /**
-         * In filtered index case, a is the query, b is the filter.
-         * @return If 'b' cannot reduce the set of returned documents that would
-         *         be returned with 'a' as the only filter.
-         *         Everything that matches a also must match b.
-         *         The document set returned by applying a is a subset of the document
-         *         set returned by applying b.
-         * Examples:
-         *    a: { x : 5 } b: { x : { $lte : 5 } } = true
-         *    a: { x : { $lte : 5 } b: { x : 5 } = false
-         */
-        bool isClauseRedundant(const MatchExpression* a,
-                               const MatchExpression* b);
-    }
-}
+namespace expression {
+
+using NodeTraversalFunc = stdx::function<void(MatchExpression*, std::string)>;
+
+/**
+ * Returns true if the documents matched by 'lhs' are a subset of the documents matched by
+ * 'rhs', i.e. a document matched by 'lhs' must also be matched by 'rhs', and false otherwise.
+ *
+ * With respect to partial indexes, 'lhs' corresponds to the query specification and 'rhs'
+ * corresponds to the filter specification.
+ *
+ * e.g.
+ *
+ *  Suppose that
+ *
+ *      lhs = { x : 4 }
+ *      rhs = { x : { $lte : 5 } }
+ *
+ *      ==> true
+ *
+ *  Suppose that
+ *
+ *      lhs = { x : { $gte: 6 } }
+ *      rhs = { x : 7 }
+ *
+ *      ==> false
+ */
+bool isSubsetOf(const MatchExpression* lhs, const MatchExpression* rhs);
+
+/**
+ * Determine if it is possible to split 'expr' into two MatchExpressions, where one is not
+ * dependent on any path from 'pathSet', such that applying the two in sequence is equivalent
+ * to applying 'expr'.
+ *
+ * For example, {a: "foo", b: "bar"} is splittable by "b", while
+ * {$or: [{a: {$eq: "foo"}}, {b: {$eq: "bar"}}]} is not splittable by "b", due to the $or.
+ */
+bool isSplittableBy(const MatchExpression& expr, const std::set<std::string>& pathSet);
+
+/**
+ * Determine if 'expr' is reliant upon any path from 'pathSet'.
+ */
+bool isIndependentOf(const MatchExpression& expr, const std::set<std::string>& pathSet);
+
+/**
+ * Returns whether the path represented by 'first' is an prefix of the path represented by 'second'.
+ * Equality is not considered a prefix. For example:
+ *
+ * a.b is a prefix of a.b.c
+ * a.b is not a prefix of a.balloon
+ * a is a prefix of a.b
+ * a is not a prefix of a
+ * a.b is not a prefix of a
+ */
+bool isPathPrefixOf(StringData first, StringData second);
+
+/**
+ * Applies 'func' to each node of 'expr', where the first argument is a pointer to that actual node
+ * (not a copy), and the second argument is the path to that node. Callers should not depend on the
+ * order of the traversal of the nodes.
+ */
+void mapOver(MatchExpression* expr, NodeTraversalFunc func, std::string path = "");
+
+/**
+ * Attempt to split 'expr' into two MatchExpressions, where the first is not reliant upon any
+ * path from 'fields', such that applying the matches in sequence is equivalent to applying
+ * 'expr'. Takes ownership of 'expr'.
+ *
+ * If 'expr' cannot be split, returns {nullptr, expr}. If 'expr' is entirely independent of
+ * 'fields', returns {expr, nullptr}. If 'expr' is partially dependent on 'fields', and partially
+ * independent, returns {exprLeft, exprRight}, where each new MatchExpression contains a portion of
+ * 'expr'.
+ *
+ * Any paths which should be renamed are encoded in 'renames', which maps from path names in 'expr'
+ * to the new values of those paths. If the return value is {exprLeft, exprRight} or {exprLeft,
+ * nullptr}, exprLeft will reflect the path renames. For example, suppose the original match
+ * expression is {old: {$gt: 3}} and 'renames' contains the mapping "old" => "new". The returned
+ * exprLeft value will be {new: {$gt: 3}}, provided that "old" is not in 'fields'.
+ *
+ * Never returns {nullptr, nullptr}.
+ */
+std::pair<std::unique_ptr<MatchExpression>, std::unique_ptr<MatchExpression>>
+splitMatchExpressionBy(std::unique_ptr<MatchExpression> expr,
+                       const std::set<std::string>& fields,
+                       const StringMap<std::string>& renames);
+
+}  // namespace expression
+}  // namespace mongo

@@ -26,42 +26,33 @@
  *    it in the license file.
  */
 
+#pragma once
+
 #include "mongo/db/service_context.h"
 
 namespace mongo {
 
-    class ServiceContextNoop : public ServiceContext {
-    public:
-        StorageEngine* getGlobalStorageEngine();
+class ServiceContextNoop : public ServiceContext {
+public:
+    StorageEngine* getGlobalStorageEngine() override;
 
-        void setGlobalStorageEngine(const std::string& name);
+    void initializeGlobalStorageEngine() override;
 
-        void shutdownGlobalStorageEngineCleanly();
+    void shutdownGlobalStorageEngineCleanly() override;
 
-        void registerStorageEngine(const std::string& name,
-                                   const StorageEngine::Factory* factory);
+    void registerStorageEngine(const std::string& name,
+                               const StorageEngine::Factory* factory) override;
 
-        bool isRegisteredStorageEngine(const std::string& name);
+    bool isRegisteredStorageEngine(const std::string& name) override;
 
-        StorageFactoriesIterator* makeStorageFactoriesIterator();
+    StorageFactoriesIterator* makeStorageFactoriesIterator() override;
 
-        bool killOperation(unsigned int opId);
+    void setOpObserver(std::unique_ptr<OpObserver> opObserver) override;
 
-        void killAllUserOperations(const OperationContext* txn);
+    OpObserver* getOpObserver() override;
 
-        void setKillAllOperations();
-
-        void unsetKillAllOperations();
-
-        bool getKillAllOperations();
-
-        void registerKillOpListener(KillOpListenerInterface* listener);
-
-        OperationContext* newOpCtx();
-
-        void setOpObserver(std::unique_ptr<OpObserver> opObserver);
-
-        OpObserver* getOpObserver();
-    };
+private:
+    std::unique_ptr<OperationContext> _newOpCtx(Client* client, unsigned opId) override;
+};
 
 }  // namespace mongo

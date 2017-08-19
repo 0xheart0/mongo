@@ -1,244 +1,273 @@
 /**
- *    Copyright (C) 2008-2015 MongoDB Inc.
+ * Copyright (C) 2016 MongoDB Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ * This program is free software: you can redistribute it and/or  modify
+ * it under the terms of the GNU Affero General Public License, version 3,
+ * as published by the Free Software Foundation.
  *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects
+ * for all of the code used other than as permitted herein. If you modify
+ * file(s) with this exception, you may extend this exception to your
+ * version of the file(s), but you are not obligated to do so. If you do not
+ * wish to do so, delete this exception statement from your version. If you
+ * delete this exception statement from all source files in the program,
+ * then also delete it in the license file.
  */
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
+#include <boost/optional.hpp>
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
-    class BSONObj;
-    class ShardStatus;
+class BatchedCommandRequest;
+class BatchedCommandResponse;
+class OperationContext;
+class RemoteCommandTargeter;
 
-    /*
-     * A "shard" one partition of the overall database (and a replica set typically).
+/**
+ * Presents an interface for talking to shards, regardless of whether that shard is remote or is
+ * the current (local) shard.
+ */
+class Shard {
+public:
+    struct CommandResponse {
+        CommandResponse(boost::optional<HostAndPort> hostAndPort,
+                        BSONObj response,
+                        BSONObj metadata,
+                        Status commandStatus,
+                        Status writeConcernStatus)
+            : hostAndPort(std::move(hostAndPort)),
+              response(std::move(response)),
+              metadata(std::move(metadata)),
+              commandStatus(std::move(commandStatus)),
+              writeConcernStatus(std::move(writeConcernStatus)) {}
+
+        /**
+         * Takes the response from running a batch write command and writes the appropriate response
+         * into batchResponse, while also returning the Status of the operation.
+         */
+        static Status processBatchWriteResponse(StatusWith<CommandResponse> response,
+                                                BatchedCommandResponse* batchResponse);
+
+        boost::optional<HostAndPort> hostAndPort;
+        BSONObj response;
+        BSONObj metadata;
+        Status commandStatus;
+        Status writeConcernStatus;
+    };
+
+    struct QueryResponse {
+        std::vector<BSONObj> docs;
+        repl::OpTime opTime;
+    };
+
+    enum class RetryPolicy {
+        kIdempotent,
+        kNotIdempotent,
+        kNoRetry,
+    };
+
+    virtual ~Shard() = default;
+
+    const ShardId getId() const;
+
+    /**
+     * Returns true if this shard object represents the config server.
      */
+    bool isConfig() const;
 
-    class Shard {
-    public:
-        Shard();
+    /**
+     * Returns the current connection string for the shard.
+     */
+    virtual const ConnectionString getConnString() const = 0;
 
-        Shard(const std::string& name,
-              const std::string& addr,
-              long long maxSizeMB,
-              bool isDraining);
+    /**
+     * Returns the connection string that was used to create the Shard from the ShardFactory.  The
+     * current connection string may be different.
+     * NOTE: Chances are this isn't the method you want.  When in doubt, prefer to use
+     * getConnString() instead.
+     */
+    virtual const ConnectionString originalConnString() const = 0;
 
-        Shard(const std::string& name,
-              const ConnectionString& connStr,
-              long long maxSizeMB,
-              bool isDraining);
+    /**
+     * Returns the RemoteCommandTargeter for the hosts in this shard.
+     *
+     * This is only valid to call on ShardRemote instances.
+     */
+    virtual std::shared_ptr<RemoteCommandTargeter> getTargeter() const = 0;
 
-        Shard( const std::string& ident ) {
-            reset( ident );
-        }
+    /**
+     * Notifies the RemoteCommandTargeter owned by the shard of a particular mode of failure for
+     * the specified host.
+     *
+     * This is only valid to call on ShardRemote instances.
+     */
+    virtual void updateReplSetMonitor(const HostAndPort& remoteHost,
+                                      const Status& remoteCommandStatus) = 0;
 
-        /**
-         * Returns a Shard corresponding to 'ident', which can
-         * either be a shard name or a connection string.
-         * Assumes that a corresponding shard with name 'ident' already exists.
-         */
-        static Shard make( const std::string& ident ) {
-            Shard s;
-            s.reset( ident );
-            return s;
-        }
+    /**
+     * Returns a string description of this shard entry.
+     */
+    virtual std::string toString() const = 0;
 
-        /**
-         * Returns a Shard corresponding to 'shardName' if such a shard
-         * exists.
-         * If not, it returns Shard::EMPTY
-         */
-        static Shard findIfExists( const std::string& shardName );
+    /**
+     * Returns whether a server operation which failed with the given error code should be retried
+     * (i.e. is safe to retry and has the potential to succeed next time).  The 'options' argument
+     * describes whether the operation that generated the given code was idempotent, which affects
+     * which codes are safe to retry on.
+     */
+    virtual bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) = 0;
 
-        /**
-         * @param ident either name or address
-         */
-        void reset( const std::string& ident );
+    /**
+     * Runs the specified command returns the BSON command response plus parsed out Status of this
+     * response and write concern error (if present). Retries failed operations according to the
+     * given "retryPolicy".  Retries indefinitely until/unless a non-retriable error is encountered,
+     * the maxTimeMs on the OperationContext expires, or the operation is interrupted.
+     */
+    StatusWith<CommandResponse> runCommand(OperationContext* opCtx,
+                                           const ReadPreferenceSetting& readPref,
+                                           const std::string& dbName,
+                                           const BSONObj& cmdObj,
+                                           RetryPolicy retryPolicy);
 
-        const ConnectionString& getAddress() const { return _cs; }
-        const std::string& getName() const { return _name; }
-        const std::string& getConnString() const { return _addr; }
+    /**
+     * Same as the other variant of runCommand, but allows the operation timeout to be overriden.
+     * Runs for the lesser of the remaining time on the operation context or the specified maxTimeMS
+     * override.
+     */
+    StatusWith<CommandResponse> runCommand(OperationContext* opCtx,
+                                           const ReadPreferenceSetting& readPref,
+                                           const std::string& dbName,
+                                           const BSONObj& cmdObj,
+                                           Milliseconds maxTimeMSOverride,
+                                           RetryPolicy retryPolicy);
 
-        long long getMaxSizeMB() const {
-            return _maxSizeMB;
-        }
+    /**
+     * Same as runCommand, but will only retry failed operations up to 3 times, regardless of
+     * the retryPolicy or the remaining maxTimeMs.
+     * Wherever possible this method should be avoided in favor of runCommand.
+     */
+    StatusWith<CommandResponse> runCommandWithFixedRetryAttempts(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const std::string& dbName,
+        const BSONObj& cmdObj,
+        RetryPolicy retryPolicy);
 
-        bool isDraining() const {
-            return _isDraining;
-        }
+    /**
+     * Same as runCommand, but will only retry failed operations up to 3 times, regardless of
+     * the retryPolicy or the remaining maxTimeMs.
+     * Wherever possible this method should be avoided in favor of runCommand.
+     */
+    StatusWith<CommandResponse> runCommandWithFixedRetryAttempts(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const std::string& dbName,
+        const BSONObj& cmdObj,
+        Milliseconds maxTimeMSOverride,
+        RetryPolicy retryPolicy);
 
-        std::string toString() const {
-            return _name + ":" + _addr;
-        }
+    /**
+     * Runs a write command against a shard. This is separate from runCommand, because write
+     * commands return errors in a different format than regular commands do, so checking for
+     * retriable errors must be done differently.
+     */
+    BatchedCommandResponse runBatchWriteCommand(OperationContext* opCtx,
+                                                const Milliseconds maxTimeMS,
+                                                const BatchedCommandRequest& batchRequest,
+                                                RetryPolicy retryPolicy);
 
-        friend std::ostream& operator << (std::ostream& out, const Shard& s) {
-            return (out << s.toString());
-        }
+    /**
+    * Warning: This method exhausts the cursor and pulls all data into memory.
+    * Do not use other than for very small (i.e., admin or metadata) collections.
+    * Performs retries if the query fails in accordance with the kIdempotent RetryPolicy.
+    *
+    * ShardRemote instances expect "readConcernLevel" to always be kMajorityReadConcern, whereas
+    * ShardLocal instances expect either kLocalReadConcern or kMajorityReadConcern.
+    */
+    StatusWith<QueryResponse> exhaustiveFindOnConfig(OperationContext* opCtx,
+                                                     const ReadPreferenceSetting& readPref,
+                                                     const repl::ReadConcernLevel& readConcernLevel,
+                                                     const NamespaceString& nss,
+                                                     const BSONObj& query,
+                                                     const BSONObj& sort,
+                                                     const boost::optional<long long> limit);
+    /**
+     * Builds an index on a config server collection.
+     * Creates the collection if it doesn't yet exist.  Does not error if the index already exists,
+     * so long as the options are the same.
+     * NOTE: Currently only supported for LocalShard.
+     */
+    virtual Status createIndexOnConfig(OperationContext* opCtx,
+                                       const NamespaceString& ns,
+                                       const BSONObj& keys,
+                                       bool unique) = 0;
 
-        bool operator==( const Shard& s ) const {
-            if ( _name != s._name )
-                return false;
-            return _cs.sameLogicalEndpoint( s._cs );
-        }
+    // This timeout will be used by default in operations against the config server, unless
+    // explicitly overridden
+    static const Milliseconds kDefaultConfigCommandTimeout;
 
-        bool operator!=( const Shard& s ) const {
-            return ! ( *this == s );
-        }
+    /**
+     * Returns false if the error is a retriable error and/or causes a replset monitor update. These
+     * errors, if from a remote call, should not be further propagated back to another server
+     * because that server will interpret them as orignating on this server rather than the one this
+     * server called.
+     */
+    static bool shouldErrorBePropagated(ErrorCodes::Error code);
 
-        bool operator==( const std::string& s ) const {
-            return _name == s || _addr == s;
-        }
+protected:
+    Shard(const ShardId& id);
 
-        bool operator!=( const std::string& s ) const {
-            return _name != s && _addr != s;
-        }
+private:
+    /**
+     * Runs the specified command against the shard backed by this object with a timeout set to the
+     * minimum of maxTimeMSOverride or the timeout of the OperationContext.
+     *
+     * The return value exposes RemoteShard's host for calls to updateReplSetMonitor.
+     *
+     * NOTE: LocalShard implementation will not return a valid host and so should be ignored.
+     */
+    virtual StatusWith<CommandResponse> _runCommand(OperationContext* opCtx,
+                                                    const ReadPreferenceSetting& readPref,
+                                                    const std::string& dbname,
+                                                    Milliseconds maxTimeMSOverride,
+                                                    const BSONObj& cmdObj) = 0;
 
-        bool operator<(const Shard& o) const {
-            return _name < o._name;
-        }
+    virtual StatusWith<QueryResponse> _exhaustiveFindOnConfig(
+        OperationContext* opCtx,
+        const ReadPreferenceSetting& readPref,
+        const repl::ReadConcernLevel& readConcernLevel,
+        const NamespaceString& nss,
+        const BSONObj& query,
+        const BSONObj& sort,
+        boost::optional<long long> limit) = 0;
 
-        bool ok() const { return _addr.size() > 0; }
+    /**
+     * Identifier of the shard as obtained from the configuration data (i.e. shard0000).
+     */
+    const ShardId _id;
+};
 
-        // Set internal to true to run the command with internal authentication privileges.
-        BSONObj runCommand( const std::string& db , const std::string& simple ) const {
-            return runCommand( db , BSON( simple << 1 ) );
-        }
-        BSONObj runCommand( const std::string& db , const BSONObj& cmd ) const ;
-
-        /**
-         * Runs a command on this shard. This method signature matches that of
-         * the connection on which this method relies upon.
-         */
-        bool runCommand(const std::string& db,
-                        const BSONObj& cmd,
-                        BSONObj& res) const;
-
-        bool runCommand(const std::string& db,
-                        const std::string& simple,
-                        BSONObj& res) const {
-            return runCommand(db, BSON(simple << 1), res);
-        }
-
-        /**
-         * Returns the version string from the shard based from the serverStatus command result.
-         */
-        static std::string getShardMongoVersion(const std::string& shardHost);
-
-        /**
-         * Returns the total data size in bytes the shard is currently using.
-         */
-        static long long getShardDataSizeBytes(const std::string& shardHost);
-
-        /**
-         * Returns metadata and stats for this shard.
-         */
-        ShardStatus getStatus() const ;
-
-        /**
-         * mostly for replica set
-         * retursn true if node is the shard 
-         * of if the replica set contains node
-         */
-        bool containsNode( const std::string& node ) const;
-
-        static void getAllShards( std::vector<Shard>& all );
-        static void printShardInfo( std::ostream& out );
-        static Shard lookupRSName( const std::string& name);
-        
-        /**
-         * @parm current - shard where the chunk/database currently lives in
-         * @return the currently emptiest shard, if best then current, or EMPTY
-         */
-        static Shard pick( const Shard& current = EMPTY );
-
-        static void reloadShardInfo();
-
-        static void removeShard( const std::string& name );
-
-        static bool isAShardNode( const std::string& ident );
-
-        static Shard EMPTY;
-        
-        static void installShard(const std::string& name, const Shard& shard);
-
-    private:
-
-        void _setAddr( const std::string& addr );
-
-        std::string    _name;
-        std::string    _addr;
-        ConnectionString _cs;
-        long long _maxSizeMB;    // in MBytes, 0 is unlimited
-        bool      _isDraining; // shard is currently being removed
-    };
-
-    typedef boost::shared_ptr<Shard> ShardPtr;
-
-    class ShardStatus {
-    public:
-
-        ShardStatus(const Shard& shard, long long dataSizeBytes, const std::string& version);
-
-        friend std::ostream& operator << (std::ostream& out, const ShardStatus& s) {
-            out << s.toString();
-            return out;
-        }
-
-        std::string toString() const {
-            std::stringstream ss;
-            ss << "shard: " << _shard
-               << " dataSizeBytes: " << _dataSizeBytes
-               << " version: " << _mongoVersion;
-            return ss.str();
-        }
-
-        bool operator<( const ShardStatus& other ) const {
-            return _dataSizeBytes < other._dataSizeBytes;
-        }
-
-        Shard shard() const {
-            return _shard;
-        }
-
-        long long dataSizeBytes() const {
-            return _dataSizeBytes;
-        }
-
-        std::string mongoVersion() const {
-            return _mongoVersion;
-        }
-
-    private:
-        Shard _shard;
-        long long _dataSizeBytes;
-        std::string _mongoVersion;
-    };
-
-}
+}  // namespace mongo

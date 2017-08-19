@@ -33,67 +33,112 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace auth {
+namespace {
 
-    using std::string;
-    using std::vector;
+using write_ops::Delete;
+using write_ops::Insert;
+using write_ops::Update;
+using write_ops::UpdateOpEntry;
 
-    Status checkAuthForWriteCommand( AuthorizationSession* authzSession,
-                                     BatchedCommandRequest::BatchType cmdType,
-                                     const NamespaceString& cmdNSS,
-                                     const BSONObj& cmdObj ) {
-
-        vector<Privilege> privileges;
-
-        if ( cmdType == BatchedCommandRequest::BatchType_Insert ) {
-
-            if ( !cmdNSS.isSystemDotIndexes() ) {
-                privileges.push_back( Privilege( ResourcePattern::forExactNamespace( cmdNSS ),
-                                                 ActionType::insert ) );
-            }
-            else {
-                // Special-case indexes until we have a command
-                string nsToIndex, errMsg;
-                if ( !BatchedCommandRequest::getIndexedNS( cmdObj, &nsToIndex, &errMsg ) ) {
-                    return Status( ErrorCodes::FailedToParse, errMsg );
-                }
-
-                NamespaceString nssToIndex( nsToIndex );
-                privileges.push_back( Privilege( ResourcePattern::forExactNamespace( nssToIndex ),
-                                                 ActionType::createIndex ) );
-            }
-        }
-        else if ( cmdType == BatchedCommandRequest::BatchType_Update ) {
-
-            ActionSet actions;
-            actions.addAction( ActionType::update );
-
-            // Upsert also requires insert privs
-            if ( BatchedCommandRequest::containsUpserts( cmdObj ) ) {
-                actions.addAction( ActionType::insert );
-            }
-
-            privileges.push_back( Privilege( ResourcePattern::forExactNamespace( cmdNSS ),
-                                             actions ) );
-
-        }
-        else {
-            fassert( 17251, cmdType == BatchedCommandRequest::BatchType_Delete );
-            privileges.push_back( Privilege( ResourcePattern::forExactNamespace( cmdNSS ),
-                                             ActionType::remove ) );
-        }
-
-        if ( authzSession->isAuthorizedForPrivileges( privileges ) )
-            return Status::OK();
-
-        return Status( ErrorCodes::Unauthorized, "unauthorized" );
+/**
+ * Helper to determine whether or not there are any upserts in the batch
+ */
+bool containsUpserts(const std::vector<UpdateOpEntry>& updates) {
+    for (auto&& update : updates) {
+        if (update.getUpsert())
+            return true;
     }
 
+    return false;
 }
+
+/**
+ * Helper to extract the namespace being indexed from a raw BSON write command.
+ *
+ * TODO: Remove when we have parsing hooked before authorization.
+ */
+StatusWith<NamespaceString> getIndexedNss(const std::vector<BSONObj>& documentsToInsert) {
+    if (documentsToInsert.empty()) {
+        return {ErrorCodes::FailedToParse, "index write batch is empty"};
+    }
+
+    const std::string nsToIndex = documentsToInsert.front()["ns"].str();
+    if (nsToIndex.empty()) {
+        return {ErrorCodes::FailedToParse,
+                "index write batch contains an invalid index descriptor"};
+    }
+
+    if (documentsToInsert.size() != 1) {
+        return {ErrorCodes::FailedToParse,
+                "index write batches may only contain a single index descriptor"};
+    }
+
+    return {NamespaceString(std::move(nsToIndex))};
 }
+
+}  // namespace
+
+Status checkAuthForWriteCommand(AuthorizationSession* authzSession,
+                                BatchedCommandRequest::BatchType cmdType,
+                                const OpMsgRequest& request) {
+    std::vector<Privilege> privileges;
+    ActionSet actionsOnCommandNSS;
+
+    if (shouldBypassDocumentValidationForCommand(request.body)) {
+        actionsOnCommandNSS.addAction(ActionType::bypassDocumentValidation);
+    }
+
+    NamespaceString cmdNSS;
+    if (cmdType == BatchedCommandRequest::BatchType_Insert) {
+        auto op = Insert::parse(IDLParserErrorContext("insert"), request);
+        cmdNSS = op.getNamespace();
+        if (!op.getNamespace().isSystemDotIndexes()) {
+            actionsOnCommandNSS.addAction(ActionType::insert);
+        } else {
+            // Special-case indexes until we have a command
+            const auto swNssToIndex = getIndexedNss(op.getDocuments());
+            if (!swNssToIndex.isOK()) {
+                return swNssToIndex.getStatus();
+            }
+
+            const auto& nssToIndex = swNssToIndex.getValue();
+            privileges.push_back(
+                Privilege(ResourcePattern::forExactNamespace(nssToIndex), ActionType::createIndex));
+        }
+    } else if (cmdType == BatchedCommandRequest::BatchType_Update) {
+        auto op = Update::parse(IDLParserErrorContext("update"), request);
+        cmdNSS = op.getNamespace();
+        actionsOnCommandNSS.addAction(ActionType::update);
+
+        // Upsert also requires insert privs
+        if (containsUpserts(op.getUpdates())) {
+            actionsOnCommandNSS.addAction(ActionType::insert);
+        }
+    } else {
+        fassert(17251, cmdType == BatchedCommandRequest::BatchType_Delete);
+        auto op = Delete::parse(IDLParserErrorContext("delete"), request);
+        cmdNSS = op.getNamespace();
+        actionsOnCommandNSS.addAction(ActionType::remove);
+    }
+
+    if (!actionsOnCommandNSS.empty()) {
+        privileges.emplace_back(ResourcePattern::forExactNamespace(cmdNSS), actionsOnCommandNSS);
+    }
+
+    if (authzSession->isAuthorizedForPrivileges(privileges))
+        return Status::OK();
+
+    return Status(ErrorCodes::Unauthorized, "unauthorized");
+}
+
+}  // namespace auth
+}  // namespace mongo

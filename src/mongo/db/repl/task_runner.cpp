@@ -32,179 +32,223 @@
 
 #include "mongo/db/repl/task_runner.h"
 
-#include <boost/thread/locks.hpp>
 #include <memory>
 
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/concurrency/old_thread_pool.h"
+#include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/destructor_guard.h"
 #include "mongo/util/log.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 namespace repl {
 
 namespace {
+using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<stdx::mutex>;
 
-    /**
-     * Runs a single task runner task.
-     * Any exceptions thrown by the task will be logged and converted into a
-     * next action of kCancel.
-     */
-    TaskRunner::NextAction runSingleTask(const TaskRunner::Task& task,
-                                         OperationContext* txn,
-                                         const Status& status) {
-        try {
-            return task(txn, status);
-        }
-        catch (...) {
-            log() << "Unhandled exception in task runner: " << exceptionToStatus();
-        }
-        return TaskRunner::NextAction::kCancel;
+
+/**
+ * Runs a single task runner task.
+ * Any exceptions thrown by the task will be logged and converted into a
+ * next action of kCancel.
+ */
+TaskRunner::NextAction runSingleTask(const TaskRunner::Task& task,
+                                     OperationContext* opCtx,
+                                     const Status& status) {
+    try {
+        return task(opCtx, status);
+    } catch (...) {
+        log() << "Unhandled exception in task runner: " << redact(exceptionToStatus());
+    }
+    return TaskRunner::NextAction::kCancel;
+}
+
+}  // namespace
+
+// static
+TaskRunner::Task TaskRunner::makeCancelTask() {
+    return [](OperationContext* opCtx, const Status& status) { return NextAction::kCancel; };
+}
+
+TaskRunner::TaskRunner(OldThreadPool* threadPool)
+    : _threadPool(threadPool), _active(false), _cancelRequested(false) {
+    uassert(ErrorCodes::BadValue, "null thread pool", threadPool);
+}
+
+TaskRunner::~TaskRunner() {
+    DESTRUCTOR_GUARD(cancel(); join(););
+}
+
+std::string TaskRunner::getDiagnosticString() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    str::stream output;
+    output << "TaskRunner";
+    output << " scheduled tasks: " << _tasks.size();
+    output << " active: " << _active;
+    output << " cancel requested: " << _cancelRequested;
+    return output;
+}
+
+bool TaskRunner::isActive() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _active;
+}
+
+void TaskRunner::schedule(const Task& task) {
+    invariant(task);
+
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+    _tasks.push_back(task);
+    _condition.notify_all();
+
+    if (_active) {
+        return;
     }
 
-} // namespace
+    _threadPool->schedule(stdx::bind(&TaskRunner::_runTasks, this));
 
-    // static
-    TaskRunner::Task TaskRunner::makeCancelTask() {
-        return [](OperationContext* txn, const Status& status) {
-            return NextAction::kCancel;
-        };
-    }
+    _active = true;
+    _cancelRequested = false;
+}
 
-    TaskRunner::TaskRunner(threadpool::ThreadPool* threadPool,
-                           const CreateOperationContextFn& createOperationContext)
-        : _threadPool(threadPool),
-          _createOperationContext(createOperationContext),
-          _active(false),
-          _cancelRequested(false) {
+void TaskRunner::cancel() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _cancelRequested = true;
+    _condition.notify_all();
+}
 
-        uassert(ErrorCodes::BadValue, "null thread pool", threadPool);
-        uassert(ErrorCodes::BadValue, "null operation context factory", createOperationContext);
-    }
+void TaskRunner::join() {
+    UniqueLock lk(_mutex);
+    _condition.wait(lk, [this]() { return !_active; });
+}
 
-    TaskRunner::~TaskRunner() {
-        try {
-            boost::unique_lock<boost::mutex> lk(_mutex);
-            if (!_active) {
-                return;
-            }
-            _cancelRequested = true;
-            _condition.notify_all();
-            while (_active) {
-                _condition.wait(lk);
-            }
-        }
-        catch (...) {
-            error() << "unexpected exception destroying task runner: " << exceptionToStatus();
-        }
-    }
+void TaskRunner::_runTasks() {
+    Client* client = nullptr;
+    ServiceContext::UniqueOperationContext opCtx;
 
-    std::string TaskRunner::getDiagnosticString() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        str::stream output;
-        output << "TaskRunner";
-        output << " scheduled tasks: " << _tasks.size();
-        output << " active: " << _active;
-        output << " cancel requested: " << _cancelRequested;
-        return output;
-    }
-
-    bool TaskRunner::isActive() const {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        return _active;
-    }
-
-    void TaskRunner::schedule(const Task& task) {
-        invariant(task);
-
-        boost::lock_guard<boost::mutex> lk(_mutex);
-
-        _tasks.push_back(task);
-        _condition.notify_all();
-
-        if (_active) {
-            return;
-        }
-
-        _threadPool->schedule(stdx::bind(&TaskRunner::_runTasks, this));
-
-        _active = true;
-        _cancelRequested = false;
-    }
-
-    void TaskRunner::cancel() {
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        _cancelRequested = true;
-        _condition.notify_all();
-    }
-
-    void TaskRunner::_runTasks() {
-        std::unique_ptr<OperationContext> txn;
-
-        while (Task task = _waitForNextTask()) {
-            if (!txn) {
-                txn.reset(_createOperationContext());
-            }
-
-            NextAction nextAction = runSingleTask(task, txn.get(), Status::OK());
-
-            if (nextAction != NextAction::kKeepOperationContext) {
-                txn.reset();
-            }
-
-            if (nextAction == NextAction::kCancel) {
-                break;
-            }
-            // Release thread back to pool after disposing if no scheduled tasks in queue.
-            if (nextAction == NextAction::kDisposeOperationContext ||
-                nextAction == NextAction::kInvalid) {
-                boost::lock_guard<boost::mutex> lk(_mutex);
-                if (_tasks.empty()) {
-                    _finishRunTasks_inlock();
-                    return;
+    while (Task task = _waitForNextTask()) {
+        if (!opCtx) {
+            if (!client) {
+                // We initialize cc() because ServiceContextMongoD::_newOpCtx() expects cc()
+                // to be equal to the client used to create the operation context.
+                Client::initThreadIfNotAlready();
+                client = &cc();
+                if (AuthorizationManager::get(client->getServiceContext())->isAuthEnabled()) {
+                    AuthorizationSession::get(client)->grantInternalAuthorization();
                 }
             }
-        }
-        txn.reset();
-
-        std::list<Task> tasks;
-        {
-            boost::lock_guard<boost::mutex> lk(_mutex);
-            tasks.swap(_tasks);
+            opCtx = client->makeOperationContext();
         }
 
+        NextAction nextAction = runSingleTask(task, opCtx.get(), Status::OK());
+
+        if (nextAction != NextAction::kKeepOperationContext) {
+            opCtx.reset();
+        }
+
+        if (nextAction == NextAction::kCancel) {
+            break;
+        }
+        // Release thread back to pool after disposing if no scheduled tasks in queue.
+        if (nextAction == NextAction::kDisposeOperationContext ||
+            nextAction == NextAction::kInvalid) {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            if (_tasks.empty()) {
+                _finishRunTasks_inlock();
+                return;
+            }
+        }
+    }
+    opCtx.reset();
+
+    std::list<Task> tasks;
+    UniqueLock lk{_mutex};
+
+    auto cancelTasks = [&]() {
+        tasks.swap(_tasks);
+        lk.unlock();
         // Cancel remaining tasks with a CallbackCanceled status.
         for (auto task : tasks) {
-            runSingleTask(task, nullptr, Status(ErrorCodes::CallbackCanceled,
-                "this task has been canceled by a previously invoked task"));
+            runSingleTask(task,
+                          nullptr,
+                          Status(ErrorCodes::CallbackCanceled,
+                                 "this task has been canceled by a previously invoked task"));
         }
+        tasks.clear();
 
-        boost::lock_guard<boost::mutex> lk(_mutex);
-        _finishRunTasks_inlock();
+    };
+    cancelTasks();
+
+    lk.lock();
+    _finishRunTasks_inlock();
+    cancelTasks();
+}
+
+void TaskRunner::_finishRunTasks_inlock() {
+    _active = false;
+    _cancelRequested = false;
+    _condition.notify_all();
+}
+
+TaskRunner::Task TaskRunner::_waitForNextTask() {
+    UniqueLock lk(_mutex);
+
+    while (_tasks.empty() && !_cancelRequested) {
+        _condition.wait(lk);
     }
 
-    void TaskRunner::_finishRunTasks_inlock() {
-        _active = false;
-        _cancelRequested = false;
-        _condition.notify_all();
+    if (_cancelRequested) {
+        return Task();
     }
 
-    TaskRunner::Task TaskRunner::_waitForNextTask() {
-        boost::unique_lock<boost::mutex> lk(_mutex);
+    Task task = _tasks.front();
+    _tasks.pop_front();
+    return task;
+}
 
-        while (_tasks.empty() && !_cancelRequested) {
-            _condition.wait(lk);
+Status TaskRunner::runSynchronousTask(SynchronousTask func, TaskRunner::NextAction nextAction) {
+    // Setup cond_var for signaling when done.
+    bool done = false;
+    stdx::mutex mutex;
+    stdx::condition_variable waitTillDoneCond;
+
+    Status returnStatus{Status::OK()};
+    this->schedule([&](OperationContext* opCtx, const Status taskStatus) {
+        if (!taskStatus.isOK()) {
+            returnStatus = taskStatus;
+        } else {
+            // Run supplied function.
+            try {
+                returnStatus = func(opCtx);
+            } catch (...) {
+                returnStatus = exceptionToStatus();
+                error() << "Exception thrown in runSynchronousTask: " << redact(returnStatus);
+            }
         }
 
-        if (_cancelRequested) {
-            return Task();
+        // Signal done.
+        LockGuard lk2{mutex};
+        done = true;
+        waitTillDoneCond.notify_all();
+
+        // return nextAction based on status from supplied function.
+        if (returnStatus.isOK()) {
+            return nextAction;
         }
+        return TaskRunner::NextAction::kCancel;
+    });
 
-        Task task = _tasks.front();
-        _tasks.pop_front();
-        return task;
-    }
-
-} // namespace repl
-} // namespace mongo
+    UniqueLock lk{mutex};
+    waitTillDoneCond.wait(lk, [&done] { return done; });
+    return returnStatus;
+}
+}  // namespace repl
+}  // namespace mongo

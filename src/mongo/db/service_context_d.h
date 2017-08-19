@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/db/service_context.h"
@@ -36,82 +36,62 @@
 
 namespace mongo {
 
-    class Client;
-    class StorageEngineLockFile;
+class Client;
+class StorageEngineLockFile;
 
-    class ServiceContextMongoD : public ServiceContext {
-    public:
-        typedef std::map<std::string, const StorageEngine::Factory*> FactoryMap;
+class ServiceContextMongoD final : public ServiceContext {
+public:
+    typedef std::map<std::string, const StorageEngine::Factory*> FactoryMap;
 
-        ServiceContextMongoD();
+    ServiceContextMongoD();
 
-        ~ServiceContextMongoD();
+    ~ServiceContextMongoD();
 
-        StorageEngine* getGlobalStorageEngine();
+    StorageEngine* getGlobalStorageEngine() override;
 
-        void setGlobalStorageEngine(const std::string& name);
+    void createLockFile();
 
-        void shutdownGlobalStorageEngineCleanly();
+    void initializeGlobalStorageEngine() override;
 
-        void registerStorageEngine(const std::string& name,
-                                   const StorageEngine::Factory* factory);
+    void shutdownGlobalStorageEngineCleanly() override;
 
-        bool isRegisteredStorageEngine(const std::string& name);
+    void registerStorageEngine(const std::string& name,
+                               const StorageEngine::Factory* factory) override;
 
-        StorageFactoriesIterator* makeStorageFactoriesIterator();
+    bool isRegisteredStorageEngine(const std::string& name) override;
 
-        void setKillAllOperations();
+    StorageFactoriesIterator* makeStorageFactoriesIterator() override;
 
-        void unsetKillAllOperations();
+    void setOpObserver(std::unique_ptr<OpObserver> opObserver) override;
 
-        bool getKillAllOperations();
+    OpObserver* getOpObserver() override;
 
-        bool killOperation(unsigned int opId);
+private:
+    std::unique_ptr<OperationContext> _newOpCtx(Client* client, unsigned opId) override;
 
-        void killAllUserOperations(const OperationContext* txn);
+    std::unique_ptr<StorageEngineLockFile> _lockFile;
 
-        void registerKillOpListener(KillOpListenerInterface* listener);
+    // logically owned here, but never deleted by anyone.
+    StorageEngine* _storageEngine = nullptr;
 
-        OperationContext* newOpCtx();
+    // logically owned here.
+    std::unique_ptr<OpObserver> _opObserver;
 
-        void setOpObserver(std::unique_ptr<OpObserver> opObserver);
+    // All possible storage engines are registered here through MONGO_INIT.
+    FactoryMap _storageFactories;
+};
 
-        OpObserver* getOpObserver();
+class StorageFactoriesIteratorMongoD : public StorageFactoriesIterator {
+public:
+    typedef ServiceContextMongoD::FactoryMap::const_iterator FactoryMapIterator;
+    StorageFactoriesIteratorMongoD(const FactoryMapIterator& begin, const FactoryMapIterator& end);
 
-    private:
+    virtual bool more() const;
+    virtual const StorageEngine::Factory* next();
 
-        bool _killOperationsAssociatedWithClientAndOpId_inlock(Client* client, unsigned int opId);
-
-        bool _globalKill;
-
-        // protected by parent class's _mutex
-        std::vector<KillOpListenerInterface*> _killOpListeners;
-
-        boost::scoped_ptr<StorageEngineLockFile> _lockFile;
-
-        // logically owned here, but never deleted by anyone.
-        StorageEngine* _storageEngine;
-
-        // logically owned here.
-        std::unique_ptr<OpObserver> _opObserver;
-
-        // All possible storage engines are registered here through MONGO_INIT.
-        FactoryMap _storageFactories;
-    };
-
-    class StorageFactoriesIteratorMongoD : public StorageFactoriesIterator {
-    public:
-
-        typedef ServiceContextMongoD::FactoryMap::const_iterator FactoryMapIterator;
-        StorageFactoriesIteratorMongoD(const FactoryMapIterator& begin,
-                                       const FactoryMapIterator& end);
-
-        virtual bool more() const;
-        virtual const StorageEngine::Factory* next();
-
-    private:
-        FactoryMapIterator _curr;
-        FactoryMapIterator _end;
-    };
+private:
+    FactoryMapIterator _curr;
+    FactoryMapIterator _end;
+};
 
 }  // namespace mongo

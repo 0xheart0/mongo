@@ -34,130 +34,149 @@
 
 #include <memory.h>
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
+#include <vector>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot_name.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
-    class BSONObjBuilder;
-    class WiredTigerSession;
-    class WiredTigerSessionCache;
+class BSONObjBuilder;
 
-    class WiredTigerRecoveryUnit : public RecoveryUnit {
-    public:
-        WiredTigerRecoveryUnit(WiredTigerSessionCache* sc);
+class WiredTigerRecoveryUnit final : public RecoveryUnit {
+public:
+    WiredTigerRecoveryUnit(WiredTigerSessionCache* sc);
 
-        virtual ~WiredTigerRecoveryUnit();
+    virtual ~WiredTigerRecoveryUnit();
 
-        virtual void reportState( BSONObjBuilder* b ) const;
+    void beginUnitOfWork(OperationContext* opCtx) final;
+    void commitUnitOfWork() final;
+    void abortUnitOfWork() final;
 
-        virtual void beginUnitOfWork(OperationContext* opCtx);
+    virtual bool waitUntilDurable();
 
-        virtual void commitUnitOfWork();
+    virtual void registerChange(Change* change);
 
-        virtual void endUnitOfWork();
+    virtual void abandonSnapshot();
 
-        virtual bool awaitCommit();
-        virtual void goingToAwaitCommit();
+    virtual void* writingPtr(void* data, size_t len);
 
-        virtual void registerChange(Change *);
+    virtual void setRollbackWritesDisabled() {}
 
-        virtual void beingReleasedFromOperationContext();
-        virtual void beingSetOnOperationContext();
+    virtual SnapshotId getSnapshotId() const;
 
-        virtual void commitAndRestart();
+    Status setReadFromMajorityCommittedSnapshot() final;
+    bool isReadingFromMajorityCommittedSnapshot() const final {
+        return _readFromMajorityCommittedSnapshot;
+    }
 
-        // un-used API
-        virtual void* writingPtr(void* data, size_t len) { invariant(!"don't call writingPtr"); }
+    boost::optional<SnapshotName> getMajorityCommittedSnapshot() const final;
 
-        virtual void setRollbackWritesDisabled() {}
+    // ---- WT STUFF
 
-        virtual SnapshotId getSnapshotId() const;
-
-        // ---- WT STUFF
-
-        WiredTigerSession* getSession(OperationContext* opCtx);
-        WiredTigerSessionCache* getSessionCache() { return _sessionCache; }
-        bool inActiveTxn() const { return _active; }
-        void assertInActiveTxn() const;
-
-        bool everStartedWrite() const { return _everStartedWrite; }
-        int depth() const { return _depth; }
-
-        void setOplogReadTill( const RecordId& loc );
-        RecordId getOplogReadTill() const { return _oplogReadTill; }
-
-        void markNoTicketRequired();
-
-        static WiredTigerRecoveryUnit* get(OperationContext *txn);
-
-        static void appendGlobalStats(BSONObjBuilder& b);
-    private:
-
-        void _abort();
-        void _commit();
-
-        void _txnClose( bool commit );
-        void _txnOpen(OperationContext* opCtx);
-
-        WiredTigerSessionCache* _sessionCache; // not owned
-        WiredTigerSession* _session; // owned, but from pool
-        bool _defaultCommit;
-        int _depth;
-        bool _active;
-        uint64_t _myTransactionCount;
-        bool _everStartedWrite;
-        Timer _timer;
-        bool _currentlySquirreled;
-        bool _syncing;
-        RecordId _oplogReadTill;
-
-        typedef OwnedPointerVector<Change> Changes;
-        Changes _changes;
-
-        bool _noTicketNeeded;
-        void _getTicket(OperationContext* opCtx);
-        TicketHolderReleaser _ticket;
-    };
+    WiredTigerSession* getSession(OperationContext* opCtx);
 
     /**
-     * This is a smart pointer that wraps a WT_CURSOR and knows how to obtain and get from pool.
+     * Returns a session without starting a new WT txn on the session. Will not close any already
+     * running session.
      */
-    class WiredTigerCursor {
-    public:
-        WiredTigerCursor(const std::string& uri,
-                         uint64_t uriID,
-                         bool forRecordStore,
-                         OperationContext* txn);
 
-        ~WiredTigerCursor();
+    WiredTigerSession* getSessionNoTxn(OperationContext* opCtx);
+
+    WiredTigerSessionCache* getSessionCache() {
+        return _sessionCache;
+    }
+    bool inActiveTxn() const {
+        return _active;
+    }
+    void assertInActiveTxn() const;
+
+    void setOplogReadTill(const RecordId& id);
+    RecordId getOplogReadTill() const {
+        return _oplogReadTill;
+    }
+
+    static WiredTigerRecoveryUnit* get(OperationContext* opCtx) {
+        return checked_cast<WiredTigerRecoveryUnit*>(opCtx->recoveryUnit());
+    }
+
+    static void appendGlobalStats(BSONObjBuilder& b);
+
+    /**
+     * Prepares this RU to be the basis for a named snapshot.
+     *
+     * Begins a WT transaction, and invariants if we are already in one.
+     * Bans being in a WriteUnitOfWork until the next call to abandonSnapshot().
+     */
+    void prepareForCreateSnapshot(OperationContext* opCtx);
+
+private:
+    void _abort();
+    void _commit();
+
+    void _ensureSession();
+    void _txnClose(bool commit);
+    void _txnOpen(OperationContext* opCtx);
+
+    WiredTigerSessionCache* _sessionCache;  // not owned
+    UniqueWiredTigerSession _session;
+    bool _areWriteUnitOfWorksBanned = false;
+    bool _inUnitOfWork;
+    bool _active;
+    uint64_t _mySnapshotId;
+    RecordId _oplogReadTill;
+    bool _readFromMajorityCommittedSnapshot = false;
+    SnapshotName _majorityCommittedSnapshot = SnapshotName::min();
+    std::unique_ptr<Timer> _timer;
+
+    typedef std::vector<std::unique_ptr<Change>> Changes;
+    Changes _changes;
+};
+
+/**
+ * This is a smart pointer that wraps a WT_CURSOR and knows how to obtain and get from pool.
+ */
+class WiredTigerCursor {
+public:
+    WiredTigerCursor(const std::string& uri,
+                     uint64_t tableID,
+                     bool forRecordStore,
+                     OperationContext* opCtx);
+
+    ~WiredTigerCursor();
 
 
-        WT_CURSOR* get() const {
-            // TODO(SERVER-16816): assertInActiveTxn();
-            return _cursor;
-        }
+    WT_CURSOR* get() const {
+        // TODO(SERVER-16816): assertInActiveTxn();
+        return _cursor;
+    }
 
-        WT_CURSOR* operator->() const { return get(); }
+    WT_CURSOR* operator->() const {
+        return get();
+    }
 
-        WiredTigerSession* getSession() { return _session; }
-        WT_SESSION* getWTSession();
+    WiredTigerSession* getSession() {
+        return _session;
+    }
 
-        void reset();
+    void reset();
 
-        void assertInActiveTxn() const { _ru->assertInActiveTxn(); }
+    void assertInActiveTxn() const {
+        _ru->assertInActiveTxn();
+    }
 
-    private:
-        uint64_t _uriID;
-        WiredTigerRecoveryUnit* _ru; // not owned
-        WiredTigerSession* _session;
-        WT_CURSOR* _cursor; // owned, but pulled
-    };
-
+private:
+    uint64_t _tableID;
+    WiredTigerRecoveryUnit* _ru;  // not owned
+    WiredTigerSession* _session;
+    WT_CURSOR* _cursor;  // owned, but pulled
+};
 }

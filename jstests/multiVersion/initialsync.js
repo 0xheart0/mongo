@@ -2,31 +2,34 @@
 load("./jstests/multiVersion/libs/multi_rs.js");
 load("./jstests/replsets/rslib.js");
 
-var oldVersion = "2.6";
+var oldVersion = "last-stable";
 var newVersion = "latest";
 
 var name = "multiversioninitsync";
 
-var multitest = function(replSetVersion, newNodeVersion) {
-    var nodes = {n1: {binVersion: replSetVersion},
-                 n2: {binVersion: replSetVersion}};
+var multitest = function(replSetVersion, newNodeVersion, configSettings) {
+    var nodes = {n1: {binVersion: replSetVersion}, n2: {binVersion: replSetVersion}};
 
     print("Start up a two-node " + replSetVersion + " replica set.");
     var rst = new ReplSetTest({name: name, nodes: nodes});
     rst.startSet();
-    rst.initiate();
+    var conf = rst.getReplSetConfig();
+    conf.settings = configSettings;
+    rst.initiate(conf);
 
     // Wait for a primary node.
     var primary = rst.getPrimary();
 
+    // The featureCompatibilityVersion must be 3.4 to have a mixed-version replica set.
+    assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: "3.4"}));
+
     // Insert some data and wait for replication.
-    for (var i=0; i<25; i++) {
+    for (var i = 0; i < 25; i++) {
         primary.getDB("foo").foo.insert({_id: i});
     }
     rst.awaitReplication();
 
-    print("Bring up a new node with version " + newNodeVersion +
-          " and add to set.");
+    print("Bring up a new node with version " + newNodeVersion + " and add to set.");
     rst.add({binVersion: newNodeVersion});
     rst.reInitiate();
 
@@ -43,13 +46,14 @@ var multitest = function(replSetVersion, newNodeVersion) {
 // *****************************************
 // Test A:
 // "Latest" version secondary is synced from
-// a 2.6 ReplSet.
+// an old ReplSet.
 // *****************************************
 multitest(oldVersion, newVersion);
 
 // *****************************************
 // Test B:
-// 2.6 Secondary is synced from a "latest"
+// Old Secondary is synced from a "latest"
 // version ReplSet.
 // *****************************************
-multitest(newVersion, oldVersion);
+// Hard-code catchup timeout. The default timeout on 3.5 is -1, which is invalid on 3.4.
+multitest(newVersion, oldVersion, {catchUpTimeoutMillis: 2000});

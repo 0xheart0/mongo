@@ -27,131 +27,165 @@
 
 #pragma once
 
-#include <boost/config.hpp>
 #include <iosfwd>
 #include <string>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
+
+namespace mongoutils {
+namespace str {
+class stream;
+}  // namespace str
+}  // namespace mongoutils
 
 namespace mongo {
 
+/**
+ * Status represents an error state or the absence thereof.
+ *
+ * A Status uses the standardized error codes -- from file 'error_codes.h' -- to
+ * determine an error's cause. It further clarifies the error with a textual
+ * description.
+ *
+ * Example usage:
+ *
+ *    Status sumAB(int a, int b, int* c) {
+ *       if (overflowIfSum(a,b)) {
+ *           return Status(ErrorCodes::ERROR_OVERFLOW, "overflow in sumAB", 16494);
+ *       }
+ *
+ *       *c = a+b;
+ *       return Status::OK();
+ *   }
+ */
+class MONGO_WARN_UNUSED_RESULT_CLASS Status {
+public:
+    // Short-hand for returning an OK status.
+    static inline Status OK();
+
     /**
-     * Status represents an error state or the absence thereof.
+     * Builds an error status given the error code and a textual description of what
+     * caused the error.
      *
-     * A Status uses the standardized error codes -- from file 'error_codes.h' -- to
-     * determine an error's cause. It further clarifies the error with a textual
-     * description. Optionally, a Status may also have an error location number, which
-     * should be a unique, grep-able point in the code base (including assert numbers).
-     *
-     * Example usage:
-     *
-     *    Status sumAB(int a, int b, int* c) {
-     *       if (overflowIfSum(a,b)) {
-     *           return Status(ErrorCodes::ERROR_OVERFLOW, "overflow in sumAB", 16494);
-     *       }
-     *
-     *       *c = a+b;
-     *       return Status::OK();
-     *   }
-     *
-     * TODO: expand base/error_codes.h to capture common errors in current code
-     * TODO: generate base/error_codes.h out of a description file
-     * TODO: check 'location' duplicates against assert numbers
+     * For OK Statuses prefer using Status::OK(). If code is OK, the remaining arguments are
+     * ignored.
      */
-    class Status {
-    public:
-        // Short-hand for returning an OK status.
-        static inline Status OK();
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, std::string reason);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, const char* reason);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code, StringData reason);
+    MONGO_COMPILER_COLD_FUNCTION Status(ErrorCodes::Error code,
+                                        const mongoutils::str::stream& reason);
 
-        /**
-         * Builds an error status given the error code, a textual description of what
-         * caused the error, and a unique position in the where the error occurred
-         * (similar to an assert number)
-         */
-        Status(ErrorCodes::Error code, std::string reason, int location = 0);
+    inline Status(const Status& other);
+    inline Status& operator=(const Status& other);
 
-        inline Status(const Status& other);
-        inline Status& operator=(const Status& other);
+    inline Status(Status&& other) noexcept;
+    inline Status& operator=(Status&& other) noexcept;
 
-        inline Status(Status&& other) BOOST_NOEXCEPT;
-        inline Status& operator=(Status&& other) BOOST_NOEXCEPT;
+    inline ~Status();
 
-        inline ~Status();
+    /**
+     * Only compares codes. Ignores reason strings.
+     */
+    bool operator==(const Status& other) const {
+        return code() == other.code();
+    }
+    bool operator!=(const Status& other) const {
+        return !(*this == other);
+    }
 
-        /**
-         * Returns true if 'other's error code and location are equal/different to this
-         * instance's. Otherwise returns false.
-         */
-        bool compare(const Status& other) const;
-        bool operator==(const Status& other) const;
-        bool operator!=(const Status& other) const;
+    /**
+     * Compares this Status's code with an error code.
+     */
+    bool operator==(const ErrorCodes::Error other) const {
+        return code() == other;
+    }
+    bool operator!=(const ErrorCodes::Error other) const {
+        return !(*this == other);
+    }
 
-        /**
-         * Returns true if 'other's error code is equal/different to this instance's.
-         * Otherwise returns false.
-         */
-        bool compareCode(const ErrorCodes::Error other) const;
-        bool operator==(const ErrorCodes::Error other) const;
-        bool operator!=(const ErrorCodes::Error other) const;
+    //
+    // accessors
+    //
 
-        //
-        // accessors
-        //
+    inline bool isOK() const;
 
-        inline bool isOK() const;
+    inline ErrorCodes::Error code() const;
 
-        inline ErrorCodes::Error code() const;
+    inline std::string codeString() const;
 
-        inline std::string codeString() const;
 
-        inline std::string reason() const;
+    /**
+     * Returns the reason string or the empty string if isOK().
+     */
+    const std::string& reason() const {
+        if (_error)
+            return _error->reason;
 
-        inline int location() const;
+        static const std::string empty;
+        return empty;
+    }
 
-        std::string toString() const;
+    std::string toString() const;
 
-        //
-        // Below interface used for testing code only.
-        //
+    /**
+     * Call this method to indicate that it is your intention to ignore a returned status. Ignoring
+     * is only possible if the value being ignored is an xvalue -- it is not appropriate to create a
+     * status variable and then ignore it.
+     */
+    inline void ignore() && noexcept {}
+    inline void ignore() const& noexcept = delete;
 
-        inline AtomicUInt32::WordType refCount() const;
+    /**
+     * This method is a transitional tool, to facilitate transition to compile-time enforced status
+     * checking.
+     *
+     * NOTE: DO NOT ADD NEW CALLS TO THIS METHOD. This method serves the same purpose as
+     * `.ignore()`; however, it indicates a situation where the code that presently ignores a status
+     * code has not been audited for correctness. This method will be removed at some point. If you
+     * encounter a compiler error from ignoring the result of a status-returning function be sure to
+     * check the return value, or deliberately ignore the return value.
+     */
+    inline void transitional_ignore() && noexcept {};
+    inline void transitional_ignore() const& noexcept = delete;
 
-    private:
-        inline Status();
+    //
+    // Below interface used for testing code only.
+    //
 
-        struct ErrorInfo {
-            AtomicUInt32 refs;             // reference counter
-            const ErrorCodes::Error code;  // error code
-            const std::string reason;      // description of error cause
-            const int location;            // unique location of the triggering line in the code
+    inline AtomicUInt32::WordType refCount() const;
 
-            static ErrorInfo* create(ErrorCodes::Error code, std::string reason, int location);
+private:
+    inline Status();
 
-            ErrorInfo(ErrorCodes::Error code, std::string reason, int location);
-        };
+    struct ErrorInfo {
+        AtomicUInt32 refs;             // reference counter
+        const ErrorCodes::Error code;  // error code
+        const std::string reason;      // description of error cause
 
-        ErrorInfo* _error;
+        static ErrorInfo* create(ErrorCodes::Error code, std::string reason);
 
-        /**
-         * Increment/Decrement the reference counter inside an ErrorInfo
-         *
-         * @param error  ErrorInfo to be incremented
-         */
-        static inline void ref(ErrorInfo* error);
-        static inline void unref(ErrorInfo* error);
+        ErrorInfo(ErrorCodes::Error code, std::string reason);
     };
 
-    inline bool operator==(const ErrorCodes::Error lhs, const Status& rhs);
+    ErrorInfo* _error;
 
-    inline bool operator!=(const ErrorCodes::Error lhs, const Status& rhs);
+    /**
+     * Increment/Decrement the reference counter inside an ErrorInfo
+     *
+     * @param error  ErrorInfo to be incremented
+     */
+    static inline void ref(ErrorInfo* error);
+    static inline void unref(ErrorInfo* error);
+};
 
-    //
-    // Convenience method for unittest code. Please use accessors otherwise.
-    //
+inline bool operator==(const ErrorCodes::Error lhs, const Status& rhs);
 
-    std::ostream& operator<<(std::ostream& os, const Status& status);
-    std::ostream& operator<<(std::ostream& os, ErrorCodes::Error);
+inline bool operator!=(const ErrorCodes::Error lhs, const Status& rhs);
+
+std::ostream& operator<<(std::ostream& os, const Status& status);
 
 }  // namespace mongo
 

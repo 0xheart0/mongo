@@ -27,28 +27,29 @@
 
 #pragma once
 
-#include "mongo/logger/message_log_domain.h"
 #include "mongo/logger/log_manager.h"
+#include "mongo/logger/message_log_domain.h"
 #include "mongo/logger/rotatable_file_manager.h"
 
 namespace mongo {
 namespace logger {
 
-    /**
-     * Gets a global singleton instance of RotatableFileManager.
-     */
-    RotatableFileManager* globalRotatableFileManager();
+/**
+ * Gets a global singleton instance of RotatableFileManager.
+ */
+RotatableFileManager* globalRotatableFileManager();
 
-    /**
-     * Gets a global singleton instance of LogManager.
-     */
-    LogManager* globalLogManager();
+/**
+ * Gets a global singleton instance of LogManager.
+ */
+LogManager* globalLogManager();
 
-    /**
-     * Gets the global MessageLogDomain associated for the global log manager.
-     */
-    inline ComponentMessageLogDomain* globalLogDomain() { return globalLogManager()->getGlobalDomain(); }
+/**
+ * Gets the global MessageLogDomain associated for the global log manager.
+ */
+inline ComponentMessageLogDomain* globalLogDomain() {
+    return globalLogManager()->getGlobalDomain();
+}
 
 }  // namespace logger
 }  // namespace mongo
-

@@ -36,52 +36,54 @@
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
-    // Verify that calling touch() on an empty index returns an OK status.
-    TEST( SortedDataInterface, TouchEmpty ) {
-        const std::unique_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        const std::unique_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+// Verify that calling touch() on an empty index returns an OK status.
+TEST(SortedDataInterface, TouchEmpty) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
 
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        Status status = sorted->touch(opCtx.get());
+        ASSERT(status.isOK() || status.code() == ErrorCodes::CommandNotSupported);
+    }
+}
+
+// Verify that calling touch() on a nonempty index returns an OK status.
+TEST(SortedDataInterface, TouchNonEmpty) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            Status status = sorted->touch( opCtx.get() );
-            ASSERT( status.isOK() || status.code() == ErrorCodes::CommandNotSupported );
+            WriteUnitOfWork uow(opCtx.get());
+            ASSERT_OK(sorted->insert(opCtx.get(), key1, loc1, false));
+            ASSERT_OK(sorted->insert(opCtx.get(), key2, loc2, false));
+            ASSERT_OK(sorted->insert(opCtx.get(), key3, loc3, false));
+            uow.commit();
         }
     }
 
-    // Verify that calling touch() on a nonempty index returns an OK status.
-    TEST( SortedDataInterface, TouchNonEmpty ) {
-        const std::unique_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        const std::unique_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
-
-        {
-            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            {
-                WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, false ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key2, loc2, false ) );
-                ASSERT_OK( sorted->insert( opCtx.get(), key3, loc3, false ) );
-                uow.commit();
-            }
-        }
-
-        {
-            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
-
-        {
-            const std::unique_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            // XXX does not verify the index was brought into memory
-            //     (even if supported by storage engine)
-            Status status = sorted->touch( opCtx.get() );
-            ASSERT( status.isOK() || status.code() == ErrorCodes::CommandNotSupported );
-        }
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
     }
 
-} // namespace mongo
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        // XXX does not verify the index was brought into memory
+        //     (even if supported by storage engine)
+        Status status = sorted->touch(opCtx.get());
+        ASSERT(status.isOK() || status.code() == ErrorCodes::CommandNotSupported);
+    }
+}
+
+}  // namespace
+}  // namespace mongo

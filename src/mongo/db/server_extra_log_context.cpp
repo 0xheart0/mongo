@@ -34,48 +34,55 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_set.h"
-#include "mongo/db/client_basic.h"
+#include "mongo/db/client.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/logger/max_log_size.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
-    // Server parameter controlling whether or not user ids are included in log entries.
-    MONGO_EXPORT_STARTUP_SERVER_PARAMETER(logUserIds, bool, false);
+// Server parameter controlling whether or not user ids are included in log entries.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(logUserIds, bool, false);
+MONGO_EXPORT_SERVER_PARAMETER(maxLogSizeKB, int, 10);
 
-    /**
-     * Note: When appending new strings to the builder, make sure to pass false to the
-     * includeEndingNull parameter.
-     */
-    void appendServerExtraLogContext(BufBuilder& builder) {
-        ClientBasic* clientBasic = ClientBasic::getCurrent();
-        if (!clientBasic)
-            return;
-        if (!AuthorizationSession::exists(clientBasic))
-            return;
+/**
+ * Note: When appending new strings to the builder, make sure to pass false to the
+ * includeEndingNull parameter.
+ */
+void appendServerExtraLogContext(BufBuilder& builder) {
+    Client* client = Client::getCurrent();
+    if (!client)
+        return;
+    if (!AuthorizationSession::exists(client))
+        return;
 
-        UserNameIterator users =
-            AuthorizationSession::get(clientBasic)->getAuthenticatedUserNames();
+    UserNameIterator users = AuthorizationSession::get(client)->getAuthenticatedUserNames();
 
-        if (!users.more())
-            return;
+    if (!users.more())
+        return;
 
-        builder.appendStr("user:", false);
+    builder.appendStr("user:", false);
+    builder.appendStr(users.next().toString(), false);
+    while (users.more()) {
+        builder.appendChar(',');
         builder.appendStr(users.next().toString(), false);
-        while (users.more()) {
-            builder.appendChar(',');
-            builder.appendStr(users.next().toString(), false);
-        }
-        builder.appendChar(' ');
     }
+    builder.appendChar(' ');
+}
 
-    MONGO_INITIALIZER(SetServerLogContextFunction)(InitializerContext*) {
-        if (!logUserIds)
-            return Status::OK();
+int getMaxLogSizeKB() {
+    return maxLogSizeKB.load();
+}
 
-        return logger::registerExtraLogContextFn(appendServerExtraLogContext);
-    }
+MONGO_INITIALIZER(SetServerLogContextFunction)(InitializerContext*) {
+    logger::MaxLogSizeKB::setGetter(getMaxLogSizeKB);
+
+    if (!logUserIds)
+        return Status::OK();
+
+    return logger::registerExtraLogContextFn(appendServerExtraLogContext);
+}
 
 }  // namespace
 }  // namespace mongo

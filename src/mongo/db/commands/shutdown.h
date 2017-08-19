@@ -35,24 +35,31 @@
 
 namespace mongo {
 
-    class CmdShutdown : public Command {
-    public:
-        CmdShutdown() : Command("shutdown") { }
+class CmdShutdown : public BasicCommand {
+public:
+    CmdShutdown() : BasicCommand("shutdown") {}
 
-        virtual bool requiresAuth() { return true; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool localHostOnlyIfNoAuth(const BSONObj& cmdObj) { return true; }
-        virtual bool slaveOk() const {
-            return true;
-        }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out);
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+    bool requiresAuth() const override {
+        return true;
+    }
+    virtual bool adminOnly() const {
+        return true;
+    }
+    virtual bool localHostOnlyIfNoAuth() {
+        return true;
+    }
+    virtual bool slaveOk() const {
+        return true;
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out);
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
-    protected:
-        static void shutdownHelper();
-    };
+protected:
+    static void shutdownHelper();
+};
 
 }  // namespace mongo
-

@@ -31,33 +31,34 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/matcher/path.h"
-#include "mongo/db/exec/working_set.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
 
-    Matcher::Matcher(const BSONObj& pattern, 
-                     const MatchExpressionParser::WhereCallback& whereCallback)
-        : _pattern(pattern) {
+Matcher::Matcher(const BSONObj& pattern,
+                 const ExtensionsCallback& extensionsCallback,
+                 const CollatorInterface* collator)
+    : _pattern(pattern) {
+    StatusWithMatchExpression statusWithMatcher =
+        MatchExpressionParser::parse(pattern, extensionsCallback, collator);
+    uassert(16810,
+            mongoutils::str::stream() << "bad query: " << statusWithMatcher.getStatus().toString(),
+            statusWithMatcher.isOK());
 
-        StatusWithMatchExpression result = MatchExpressionParser::parse(pattern, whereCallback);
-        uassert( 16810,
-                 mongoutils::str::stream() << "bad query: " << result.getStatus().toString(),
-                 result.isOK() );
+    _expression = std::move(statusWithMatcher.getValue());
+}
 
-        _expression.reset( result.getValue() );
-    }
+bool Matcher::matches(const BSONObj& doc, MatchDetails* details) const {
+    if (!_expression)
+        return true;
 
-    bool Matcher::matches(const BSONObj& doc, MatchDetails* details ) const {
-        if ( !_expression )
-            return true;
-
-        return _expression->matchesBSON( doc, details );
-    }
+    return _expression->matchesBSON(doc, details);
+}
 
 }  // namespace mongo

@@ -28,156 +28,329 @@
 
 #pragma once
 
-#include <deque>
+#include <list>
+#include <vector>
 
 #include <boost/intrusive_ptr.hpp>
 
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/value.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
-    class BSONObj;
-    class BSONObjBuilder;
-    class Command;
-    struct DepsTracker;
-    class DocumentSource;
-    struct ExpressionContext;
-    class Privilege;
+class BSONObj;
+class BSONObjBuilder;
+class ExpressionContext;
+class DocumentSource;
+class CollatorInterface;
+class OperationContext;
 
-    /** mongodb "commands" (sent via db.$cmd.findOne(...))
-        subclass to make a command.  define a singleton object for it.
-        */
-    class Pipeline :
-        public IntrusiveCounterUnsigned {
+/**
+ * A Pipeline object represents a list of DocumentSources and is responsible for optimizing the
+ * pipeline.
+ */
+class Pipeline {
+public:
+    typedef std::list<boost::intrusive_ptr<DocumentSource>> SourceContainer;
+
+    /**
+     * This class will ensure a Pipeline is disposed before it is deleted.
+     */
+    class Deleter {
     public:
         /**
-         * Create a pipeline from the command.
-         *
-         * @param errmsg where to write errors, if there are any
-         * @param cmdObj the command object sent from the client
-         * @returns the pipeline, if created, otherwise a NULL reference
+         * Constructs an empty deleter. Useful for creating a
+         * unique_ptr<Pipeline, Pipeline::Deleter> without populating it.
          */
-        static boost::intrusive_ptr<Pipeline> parseCommand(
-            std::string& errmsg,
-            const BSONObj& cmdObj,
-            const boost::intrusive_ptr<ExpressionContext>& pCtx);
+        Deleter() {}
 
-        /// Helper to implement Command::addRequiredPrivileges
-        static void addRequiredPrivileges(Command* commandTemplate,
-                                          const std::string& dbname,
-                                          BSONObj cmdObj,
-                                          std::vector<Privilege>* out);
-
-        const boost::intrusive_ptr<ExpressionContext>& getContext() const { return pCtx; }
+        explicit Deleter(OperationContext* opCtx) : _opCtx(opCtx) {}
 
         /**
-          Split the current Pipeline into a Pipeline for each shard, and
-          a Pipeline that combines the results within mongos.
-
-          This permanently alters this pipeline for the merging operation.
-
-          @returns the Spec for the pipeline command that should be sent
-            to the shards
-        */
-        boost::intrusive_ptr<Pipeline> splitForSharded();
-
-        /** If the pipeline starts with a $match, return its BSON predicate.
-         *  Returns empty BSON if the first stage isn't $match.
+         * If an owner of a std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> wants to assume
+         * responsibility for calling PlanExecutor::dispose(), they can call dismissDisposal(). If
+         * dismissed, a Deleter will not call dispose() when deleting the PlanExecutor.
          */
-        BSONObj getInitialQuery() const;
+        void dismissDisposal() {
+            _dismissed = true;
+        }
 
         /**
-          Write the Pipeline as a BSONObj command.  This should be the
-          inverse of parseCommand().
-
-          This is only intended to be used by the shard command obtained
-          from splitForSharded().  Some pipeline operations in the merge
-          process do not have equivalent command forms, and using this on
-          the mongos Pipeline will cause assertions.
-
-          @param the builder to write the command to
-        */
-        Document serialize() const;
-
-        /** Stitch together the source pointers (by calling setSource) for each source in sources.
-         *  Must be called after optimize and addInitialSource but before trying to get results.
+         * Calls dispose() on 'pipeline', unless this Deleter has been dismissed.
          */
-        void stitch();
-
-        /**
-          Run the Pipeline on the given source.
-
-          @param result builder to write the result to
-        */
-        void run(BSONObjBuilder& result);
-
-        bool isExplain() const { return explain; }
-
-        /// The initial source is special since it varies between mongos and mongod.
-        void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
-
-        /// The source that represents the output. Returns a non-owning pointer.
-        DocumentSource* output() { invariant( !sources.empty() ); return sources.back().get(); }
-
-        /// Returns true if this pipeline only uses features that work in mongos.
-        bool canRunInMongos() const;
-
-        /**
-         * Write the pipeline's operators to a std::vector<Value>, with the
-         * explain flag true (for DocumentSource::serializeToArray()).
-         */
-        std::vector<Value> writeExplainOps() const;
-        
-        /**
-         * Returns the dependencies needed by this pipeline.
-         *
-         * initialQuery is used as a fallback for metadata dependency detection. The assumption is
-         * that any metadata produced by the query is needed unless we can prove it isn't.
-         */
-        DepsTracker getDependencies(const BSONObj& initialQuery) const;
-
-        /**
-          The aggregation command name.
-         */
-        static const char commandName[];
-
-        /*
-          PipelineD is a "sister" class that has additional functionality
-          for the Pipeline.  It exists because of linkage requirements.
-          Pipeline needs to function in mongod and mongos.  PipelineD
-          contains extra functionality required in mongod, and which can't
-          appear in mongos because the required symbols are unavailable
-          for linking there.  Consider PipelineD to be an extension of this
-          class for mongod only.
-         */
-        friend class PipelineD;
+        void operator()(Pipeline* pipeline) {
+            // It is illegal to call this method on a default-constructed Deleter.
+            invariant(_opCtx);
+            if (!_dismissed) {
+                pipeline->dispose(_opCtx);
+            }
+            delete pipeline;
+        }
 
     private:
-        class Optimizations {
-        public:
-            // These contain static functions that optimize pipelines in various ways.
-            // They are classes rather than namespaces so that they can be friends of Pipeline.
-            // Classes are defined in pipeline_optimizations.h.
-            class Local;
-            class Sharded;
-        };
+        OperationContext* _opCtx = nullptr;
 
-        friend class Optimizations::Local;
-        friend class Optimizations::Sharded;
-
-        static const char pipelineName[];
-        static const char explainName[];
-        static const char fromRouterName[];
-        static const char serverPipelineName[];
-        static const char mongosPipelineName[];
-
-        Pipeline(const boost::intrusive_ptr<ExpressionContext> &pCtx);
-
-        typedef std::deque<boost::intrusive_ptr<DocumentSource> > SourceContainer;
-        SourceContainer sources;
-        bool explain;
-
-        boost::intrusive_ptr<ExpressionContext> pCtx;
+        bool _dismissed = false;
     };
-} // namespace mongo
+
+    /**
+     * Parses a Pipeline from a vector of BSONObjs. Returns a non-OK status if it failed to parse.
+     * The returned pipeline is not optimized, but the caller may convert it to an optimized
+     * pipeline by calling optimizePipeline().
+     *
+     * It is illegal to create a pipeline using an ExpressionContext which contains a collation that
+     * will not be used during execution of the pipeline. Doing so may cause comparisons made during
+     * parse-time to return the wrong results.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> parse(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Parses a $facet Pipeline from a vector of BSONObjs. Validation checks which are only relevant
+     * to top-level pipelines are skipped, and additional checks applicable to $facet pipelines are
+     * performed. Returns a non-OK status if it failed to parse. The returned pipeline is not
+     * optimized, but the caller may convert it to an optimized pipeline by calling
+     * optimizePipeline().
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> parseFacetPipeline(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Creates a Pipeline from an existing SourceContainer.
+     *
+     * Returns a non-OK status if any stage is in an invalid position. For example, if an $out stage
+     * is present but is not the last stage.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> create(
+        SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Creates a $facet Pipeline from an existing SourceContainer.
+     *
+     * Returns a non-OK status if any stage is invalid. For example, if the pipeline is empty or if
+     * any stage is an initial source.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> createFacetPipeline(
+        SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    /**
+     * Returns true if the provided aggregation command has a $out stage.
+     */
+    static bool aggSupportsWriteConcern(const BSONObj& cmd);
+
+    const boost::intrusive_ptr<ExpressionContext>& getContext() const {
+        return pCtx;
+    }
+
+    /**
+     * Sets the OperationContext of 'pCtx' to nullptr.
+     *
+     * The PipelineProxyStage is responsible for detaching the OperationContext and releasing any
+     * storage-engine state of the DocumentSourceCursor that may be present in '_sources'.
+     */
+    void detachFromOperationContext();
+
+    /**
+     * Sets the OperationContext of 'pCtx' to 'opCtx'.
+     *
+     * The PipelineProxyStage is responsible for reattaching the OperationContext and reacquiring
+     * any storage-engine state of the DocumentSourceCursor that may be present in '_sources'.
+     */
+    void reattachToOperationContext(OperationContext* opCtx);
+
+    /**
+     * Releases any resources held by this pipeline such as PlanExecutors or in-memory structures.
+     * Must be called before deleting a Pipeline.
+     *
+     * There are multiple cleanup scenarios:
+     *  - This Pipeline will only ever use one OperationContext. In this case the Pipeline::Deleter
+     *    will automatically call dispose() before deleting the Pipeline, and the owner need not
+     *    call dispose().
+     *  - This Pipeline may use multiple OperationContexts over its lifetime. In this case it
+     *    is the owner's responsibility to call dispose() with a valid OperationContext before
+     *    deleting the Pipeline.
+     */
+    void dispose(OperationContext* opCtx);
+
+    /**
+     * Split the current Pipeline into a Pipeline for each shard, and a Pipeline that combines the
+     * results within mongos. This permanently alters this pipeline for the merging operation, and
+     * returns a Pipeline object that should be executed on each targeted shard.
+    */
+    std::unique_ptr<Pipeline, Pipeline::Deleter> splitForSharded();
+
+    /**
+     * Reassemble a split shard pipeline into its original form. Upon return, this pipeline will
+     * contain the original source list. Must be called on the shards part of a split pipeline
+     * returned by a call to splitForSharded(). It is an error to call this on the merge part of the
+     * pipeline, or on a pipeline that has not been split.
+     */
+    void unsplitFromSharded(std::unique_ptr<Pipeline, Pipeline::Deleter> pipelineForMergingShard);
+
+    /**
+     * Returns true if this pipeline is the part of a split pipeline which should be targeted to the
+     * shards.
+     */
+    bool isSplitForSharded() {
+        return _splitForSharded;
+    }
+
+    /**
+     * Returns true if this pipeline is the part of a split pipeline which is responsible for
+     * merging the results from the shards.
+     */
+    bool isSplitForMerge() {
+        return _splitForMerge;
+    }
+
+    /** If the pipeline starts with a $match, return its BSON predicate.
+     *  Returns empty BSON if the first stage isn't $match.
+     */
+    BSONObj getInitialQuery() const;
+
+    /**
+     * Returns whether or not any DocumentSource in the pipeline needs the primary shard.
+     */
+    bool needsPrimaryShardMerger() const;
+
+    /**
+     * Returns whether or not every DocumentSource in the pipeline can run on mongoS.
+     */
+    bool canRunOnMongos() const;
+
+    /**
+     * Modifies the pipeline, optimizing it by combining and swapping stages.
+     */
+    void optimizePipeline();
+
+    /**
+     * Returns any other collections involved in the pipeline in addition to the collection the
+     * aggregation is run on.
+     */
+    std::vector<NamespaceString> getInvolvedCollections() const;
+
+    /**
+     * Serializes the pipeline into a form that can be parsed into an equivalent pipeline.
+     */
+    std::vector<Value> serialize() const;
+
+    /// The initial source is special since it varies between mongos and mongod.
+    void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
+
+    /**
+     * Returns the next result from the pipeline, or boost::none if there are no more results.
+     */
+    boost::optional<Document> getNext();
+
+    /**
+     * Write the pipeline's operators to a std::vector<Value>, providing the level of detail
+     * specified by 'verbosity'.
+     */
+    std::vector<Value> writeExplainOps(ExplainOptions::Verbosity verbosity) const;
+
+    /**
+     * Returns the dependencies needed by this pipeline. 'metadataAvailable' should reflect what
+     * metadata is present on documents that are input to the front of the pipeline.
+     */
+    DepsTracker getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const;
+
+    const SourceContainer& getSources() {
+        return _sources;
+    }
+
+    /**
+     * PipelineD is a "sister" class that has additional functionality for the Pipeline. It exists
+     * because of linkage requirements. Pipeline needs to function in mongod and mongos. PipelineD
+     * contains extra functionality required in mongod, and which can't appear in mongos because the
+     * required symbols are unavailable for linking there. Consider PipelineD to be an extension of
+     * this class for mongod only.
+     */
+    friend class PipelineD;
+
+private:
+    class Optimizations {
+    public:
+        // This contains static functions that optimize pipelines in various ways.
+        // This is a class rather than a namespace so that it can be a friend of Pipeline.
+        // It is defined in pipeline_optimizations.h.
+        class Sharded;
+    };
+
+    friend class Optimizations::Sharded;
+
+    /**
+     * Used by both Pipeline::parse() and Pipeline::parseFacetPipeline() to build and validate the
+     * pipeline.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> parseTopLevelOrFacetPipeline(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const bool isFacetPipeline);
+
+    /**
+     * Used by both Pipeline::create() and Pipeline::createFacetPipeline() to build and validate the
+     * pipeline.
+     */
+    static StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> createTopLevelOrFacetPipeline(
+        SourceContainer sources,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const bool isSubPipeline);
+
+    Pipeline(const boost::intrusive_ptr<ExpressionContext>& pCtx);
+    Pipeline(SourceContainer stages, const boost::intrusive_ptr<ExpressionContext>& pCtx);
+
+    ~Pipeline();
+
+    /**
+     * Stitch together the source pointers by calling setSource() for each source in '_sources'.
+     * This function must be called any time the order of stages within the pipeline changes, e.g.
+     * in optimizePipeline().
+     */
+    void stitch();
+
+    /**
+     * Reset all stages' child pointers to nullptr. Used to prevent dangling pointers during the
+     * optimization process, where we might swap or destroy stages.
+     */
+    void unstitch();
+
+    /**
+     * Throws if the pipeline fails any of a set of semantic checks. For example, if an $out stage
+     * is present then it must come last in the pipeline, while initial stages such as $indexStats
+     * must be at the start.
+     */
+    void validatePipeline() const;
+
+    /**
+     * Throws if the $facet pipeline fails any of a set of semantic checks. For example, the
+     * pipeline cannot be empty and may not contain any initial stages.
+     */
+    void validateFacetPipeline() const;
+
+    /**
+     * Helper method which validates that each stage in pipeline is in a legal position. For
+     * example, $out must be at the end, while a $match stage with a text query must be at the
+     * start. Note that this method accepts an initial source as the first stage, which is illegal
+     * for $facet pipelines.
+     */
+    void ensureAllStagesAreInLegalPositions() const;
+
+    SourceContainer _sources;
+
+    // When a pipeline is split via splitForSharded(), the resulting shards pipeline will set
+    // '_unsplitSources' to be the original list of DocumentSources representing the full pipeline.
+    // This is to allow the split pipelines to be subsequently reassembled into the original
+    // pipeline, if necessary.
+    boost::optional<SourceContainer> _unsplitSources;
+
+    boost::intrusive_ptr<ExpressionContext> pCtx;
+    bool _splitForSharded = false;
+    bool _splitForMerge = false;
+    bool _disposed = false;
+};
+}  // namespace mongo

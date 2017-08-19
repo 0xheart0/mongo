@@ -36,57 +36,58 @@ namespace mongo {
 namespace repl {
 namespace {
 
-    const std::string kCandidateIdFieldName = "candidateId";
-    const std::string kTermFieldName = "term";
+constexpr StringData kCandidateIndexFieldName = "candidateIndex"_sd;
+constexpr StringData kTermFieldName = "term"_sd;
+constexpr StringData kIdFieldName = "_id"_sd;
 
-    const std::string kLegalFieldNames[] = {
-        kCandidateIdFieldName,
-        kTermFieldName,
-    };
+constexpr StringData kLegalFieldNames[] = {kCandidateIndexFieldName, kTermFieldName, kIdFieldName};
 
 }  // namespace
 
-    Status LastVote::initialize(const BSONObj& argsObj) {
-        Status status = bsonCheckOnlyHasFields("VotedFar",
-                                               argsObj,
-                                               kLegalFieldNames);
-        if (!status.isOK())
-            return status;
+LastVote::LastVote(long long term, long long candidateIndex)
+    : _candidateIndex(candidateIndex), _term(term) {}
 
-        status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
-        if (!status.isOK())
-            return status;
+StatusWith<LastVote> LastVote::readFromLastVote(const BSONObj& doc) {
+    Status status = bsonCheckOnlyHasFields("LastVote", doc, kLegalFieldNames);
+    if (!status.isOK())
+        return status;
 
-        status = bsonExtractIntegerField(argsObj, kCandidateIdFieldName, &_candidateId);
-        if (!status.isOK())
-            return status;
+    long long term;
+    status = bsonExtractIntegerField(doc, kTermFieldName, &term);
+    if (!status.isOK())
+        return status;
 
-        return Status::OK();
-    }
+    long long candidateIndex;
+    status = bsonExtractIntegerField(doc, kCandidateIndexFieldName, &candidateIndex);
+    if (!status.isOK())
+        return status;
 
-    void LastVote::setTerm(long long term) {
-        _term = term;
-    }
+    return LastVote{term, candidateIndex};
+}
 
-    void LastVote::setCandidateId(long long candidateId) {
-        _candidateId = candidateId;
-    }
+void LastVote::setTerm(long long term) {
+    _term = term;
+}
 
-    long long LastVote::getTerm() const {
-        return _term;
-    }
+void LastVote::setCandidateIndex(long long candidateIndex) {
+    _candidateIndex = candidateIndex;
+}
 
-    long long LastVote::getCandidateId() const {
-        return _candidateId;
-    }
+long long LastVote::getTerm() const {
+    return _term;
+}
+
+long long LastVote::getCandidateIndex() const {
+    return _candidateIndex;
+}
 
 
-    BSONObj LastVote::toBSON() const {
-        BSONObjBuilder builder;
-        builder.append(kTermFieldName, _term);
-        builder.append(kCandidateIdFieldName, _candidateId);
-        return builder.obj();
-    }
+BSONObj LastVote::toBSON() const {
+    BSONObjBuilder builder;
+    builder.append(kTermFieldName, _term);
+    builder.append(kCandidateIndexFieldName, _candidateIndex);
+    return builder.obj();
+}
 
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

@@ -29,7 +29,6 @@
 #pragma once
 
 #include <string>
-#include <vector>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
@@ -41,50 +40,34 @@
 
 namespace mongo {
 
-    class MultiCommandDispatch;
+// Used for reporting legacy write concern responses
+struct LegacyWCResponse {
+    std::string shardHost;
+    BSONObj gleResponse;
+    std::string errToReport;
+};
 
-    // Used for reporting legacy write concern responses
-    struct LegacyWCResponse {
-        std::string shardHost;
-        BSONObj gleResponse;
-        std::string errToReport;
-    };
+//
+// Below exposed for testing only
+//
 
-    /**
-     * Uses GLE and the shard hosts and opTimes last written by write commands to enforce a
-     * write concern across the previously used shards.
-     *
-     * Returns OK with the LegacyWCResponses containing only write concern error information
-     * Returns !OK if there was an error getting a GLE response
-     */
-    Status enforceLegacyWriteConcern( MultiCommandDispatch* dispatcher,
-                                      StringData dbName,
-                                      const BSONObj& options,
-                                      const HostOpTimeMap& hostOpTimes,
-                                      std::vector<LegacyWCResponse>* wcResponses );
+// Helper that acts as an auto-ptr for write and wc errors
+struct GLEErrors {
+    std::unique_ptr<WriteErrorDetail> writeError;
+    std::unique_ptr<WriteConcernErrorDetail> wcError;
+};
 
-    //
-    // Below exposed for testing only
-    //
+/**
+ * Given a GLE response, extracts a write error and a write concern error for the previous
+ * operation.
+ *
+ * Returns !OK if the GLE itself failed in an unknown way.
+ */
+Status extractGLEErrors(const BSONObj& gleResponse, GLEErrors* errors);
 
-    // Helper that acts as an auto-ptr for write and wc errors
-    struct GLEErrors {
-        std::auto_ptr<WriteErrorDetail> writeError;
-        std::auto_ptr<WCErrorDetail> wcError;
-    };
+/**
+ * Given a GLE response, strips out all non-write-concern related information
+ */
+BSONObj stripNonWCInfo(const BSONObj& gleResponse);
 
-    /**
-     * Given a GLE response, extracts a write error and a write concern error for the previous
-     * operation.
-     *
-     * Returns !OK if the GLE itself failed in an unknown way.
-     */
-    Status extractGLEErrors( const BSONObj& gleResponse, GLEErrors* errors );
-
-    /**
-     * Given a GLE response, strips out all non-write-concern related information
-     */
-    BSONObj stripNonWCInfo( const BSONObj& gleResponse );
-
-
-}
+}  // namespace mongo

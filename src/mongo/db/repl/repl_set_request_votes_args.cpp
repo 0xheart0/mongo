@@ -31,167 +31,158 @@
 #include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 
 namespace mongo {
 namespace repl {
 namespace {
 
-    const std::string kCandidateIdFieldName = "candidateId";
-    const std::string kCommandName = "replSetRequestVotes";
-    const std::string kConfigVersionFieldName = "configVersion";
-    const std::string kLastCommittedOpFieldName = "lastCommittedOp";
-    const std::string kOkFieldName = "ok";
-    const std::string kOpTimeFieldName = "ts";
-    const std::string kReasonFieldName = "reason";
-    const std::string kSetNameFieldName = "setName";
-    const std::string kTermFieldName = "term";
-    const std::string kVoteGrantedFieldName = "voteGranted";
+const std::string kCandidateIndexFieldName = "candidateIndex";
+const std::string kCommandName = "replSetRequestVotes";
+const std::string kConfigVersionFieldName = "configVersion";
+const std::string kDryRunFieldName = "dryRun";
+// The underlying field name is inaccurate, but changing it requires a fair amount of cross
+// compatibility work for no real benefit.
+const std::string kLastDurableOpTimeFieldName = "lastCommittedOp";
+const std::string kOkFieldName = "ok";
+const std::string kReasonFieldName = "reason";
+const std::string kSetNameFieldName = "setName";
+const std::string kTermFieldName = "term";
+const std::string kVoteGrantedFieldName = "voteGranted";
+const std::string kOperationTime = "operationTime";
 
-    const std::string kLegalArgsFieldNames[] = {
-        kCandidateIdFieldName,
-        kCommandName,
-        kConfigVersionFieldName,
-        kLastCommittedOpFieldName,
-        kOpTimeFieldName,
-        kSetNameFieldName,
-        kTermFieldName,
-    };
-
-    const std::string kLegalResponseFieldNames[] = {
-        kOkFieldName,
-        kReasonFieldName,
-        kTermFieldName,
-        kVoteGrantedFieldName,
-    };
+const std::string kLegalArgsFieldNames[] = {
+    kCandidateIndexFieldName,
+    kCommandName,
+    kConfigVersionFieldName,
+    kDryRunFieldName,
+    kLastDurableOpTimeFieldName,
+    kSetNameFieldName,
+    kTermFieldName,
+    kOperationTime,
+};
 
 }  // namespace
 
 
-    Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
-        Status status = bsonCheckOnlyHasFields("ReplSetRequestVotes",
-                                               argsObj,
-                                               kLegalArgsFieldNames);
-        if (!status.isOK())
-            return status;
+Status ReplSetRequestVotesArgs::initialize(const BSONObj& argsObj) {
+    Status status =
+        bsonCheckOnlyHasFieldsForCommand("ReplSetRequestVotes", argsObj, kLegalArgsFieldNames);
+    if (!status.isOK())
+        return status;
 
-        status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
-        if (!status.isOK())
-            return status;
+    status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
+    if (!status.isOK())
+        return status;
 
-        status = bsonExtractIntegerField(argsObj, kCandidateIdFieldName, &_candidateId);
-        if (!status.isOK())
-            return status;
+    status = bsonExtractIntegerField(argsObj, kCandidateIndexFieldName, &_candidateIndex);
+    if (!status.isOK())
+        return status;
 
-        status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgver);
-        if (!status.isOK())
-            return status;
+    status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_cfgver);
+    if (!status.isOK())
+        return status;
 
-        status = bsonExtractStringField(argsObj, kSetNameFieldName, &_setName);
-        if (!status.isOK())
-            return status;
+    status = bsonExtractStringField(argsObj, kSetNameFieldName, &_setName);
+    if (!status.isOK())
+        return status;
 
-        // extracting the lastCommittedOp is a bit of a process
-        BSONObj lastCommittedOp = argsObj[kLastCommittedOpFieldName].Obj();
-        Timestamp ts;
-        status = bsonExtractTimestampField(lastCommittedOp, kOpTimeFieldName, &ts);
-        if (!status.isOK())
-            return status;
-        long long term;
-        status = bsonExtractIntegerField(lastCommittedOp, kTermFieldName, &term);
-        if (!status.isOK())
-            return status;
-        _lastCommittedOp = OpTime(lastCommittedOp[kOpTimeFieldName].timestamp(),
-                                  lastCommittedOp[kTermFieldName].Long());
+    status = bsonExtractBooleanField(argsObj, kDryRunFieldName, &_dryRun);
+    if (!status.isOK())
+        return status;
 
-        return Status::OK();
-    }
+    status = bsonExtractOpTimeField(argsObj, kLastDurableOpTimeFieldName, &_lastDurableOpTime);
+    if (!status.isOK())
+        return status;
 
-    const std::string& ReplSetRequestVotesArgs::getSetName() const {
-        return _setName;
-    }
+    return Status::OK();
+}
 
-    long long ReplSetRequestVotesArgs::getTerm() const {
-        return _term;
-    }
+const std::string& ReplSetRequestVotesArgs::getSetName() const {
+    return _setName;
+}
 
-    long long ReplSetRequestVotesArgs::getCandidateId() const {
-        return _candidateId;
-    }
+long long ReplSetRequestVotesArgs::getTerm() const {
+    return _term;
+}
 
-    long long ReplSetRequestVotesArgs::getConfigVersion() const {
-        return _cfgver;
-    }
+long long ReplSetRequestVotesArgs::getCandidateIndex() const {
+    return _candidateIndex;
+}
 
-    OpTime ReplSetRequestVotesArgs::getLastCommittedOp() const {
-        return _lastCommittedOp;
-    }
+long long ReplSetRequestVotesArgs::getConfigVersion() const {
+    return _cfgver;
+}
 
-    void ReplSetRequestVotesArgs::addToBSON(BSONObjBuilder* builder) const {
-        builder->append(kCommandName, 1);
-        builder->append(kSetNameFieldName, _setName);
-        builder->append(kTermFieldName, _term);
-        builder->appendIntOrLL(kCandidateIdFieldName, _candidateId);
-        builder->appendIntOrLL(kConfigVersionFieldName, _cfgver);
-        BSONObjBuilder lastCommittedOp(builder->subobjStart(kLastCommittedOpFieldName));
-        lastCommittedOp.append(kOpTimeFieldName, _lastCommittedOp.getTimestamp());
-        lastCommittedOp.append(kTermFieldName, _lastCommittedOp.getTerm());
-        lastCommittedOp.done();
-    }
+OpTime ReplSetRequestVotesArgs::getLastDurableOpTime() const {
+    return _lastDurableOpTime;
+}
 
-    Status ReplSetRequestVotesResponse::initialize(const BSONObj& argsObj) {
-        Status status = bsonCheckOnlyHasFields("ReplSetRequestVotes",
-                                               argsObj,
-                                               kLegalResponseFieldNames);
-        if (!status.isOK())
-            return status;
+bool ReplSetRequestVotesArgs::isADryRun() const {
+    return _dryRun;
+}
 
-        status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
-        if (!status.isOK())
-            return status;
+void ReplSetRequestVotesArgs::addToBSON(BSONObjBuilder* builder) const {
+    builder->append(kCommandName, 1);
+    builder->append(kSetNameFieldName, _setName);
+    builder->append(kDryRunFieldName, _dryRun);
+    builder->append(kTermFieldName, _term);
+    builder->appendIntOrLL(kCandidateIndexFieldName, _candidateIndex);
+    builder->appendIntOrLL(kConfigVersionFieldName, _cfgver);
+    _lastDurableOpTime.append(builder, kLastDurableOpTimeFieldName);
+}
 
-        status = bsonExtractBooleanField(argsObj, kVoteGrantedFieldName, &_voteGranted);
-        if (!status.isOK())
-            return status;
+Status ReplSetRequestVotesResponse::initialize(const BSONObj& argsObj) {
+    auto status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
+    if (!status.isOK())
+        return status;
 
-        status = bsonExtractStringField(argsObj, kReasonFieldName, &_reason);
-        if (!status.isOK())
-            return status;
+    status = bsonExtractBooleanField(argsObj, kVoteGrantedFieldName, &_voteGranted);
+    if (!status.isOK())
+        return status;
 
-        status = bsonExtractBooleanField(argsObj, kOkFieldName, &_ok);
-        if (!status.isOK())
-            return status;
+    status = bsonExtractStringField(argsObj, kReasonFieldName, &_reason);
+    if (!status.isOK())
+        return status;
 
-        return Status::OK();
-    }
+    return Status::OK();
+}
 
-    bool ReplSetRequestVotesResponse::getOk() const {
-        return _ok;
-    }
+void ReplSetRequestVotesResponse::setVoteGranted(bool voteGranted) {
+    _voteGranted = voteGranted;
+}
 
-    long long ReplSetRequestVotesResponse::getTerm() const {
-        return _term;
-    }
+void ReplSetRequestVotesResponse::setTerm(long long term) {
+    _term = term;
+}
 
-    bool ReplSetRequestVotesResponse::getVoteGranted() const {
-        return _voteGranted;
-    }
+void ReplSetRequestVotesResponse::setReason(const std::string& reason) {
+    _reason = reason;
+}
 
-    const std::string& ReplSetRequestVotesResponse::getReason() const {
-        return _reason;
-    }
+long long ReplSetRequestVotesResponse::getTerm() const {
+    return _term;
+}
 
-    void ReplSetRequestVotesResponse::addToBSON(BSONObjBuilder* builder) const {
-        builder->append(kOkFieldName, _ok);
-        builder->append(kTermFieldName, _term);
-        builder->append(kVoteGrantedFieldName, _voteGranted);
-        builder->append(kReasonFieldName, _reason);
-    }
+bool ReplSetRequestVotesResponse::getVoteGranted() const {
+    return _voteGranted;
+}
 
-    BSONObj ReplSetRequestVotesResponse::toBSON() const {
-        BSONObjBuilder builder;
-        addToBSON(&builder);
-        return builder.obj();
-    }
+const std::string& ReplSetRequestVotesResponse::getReason() const {
+    return _reason;
+}
 
-} // namespace repl
-} // namespace mongo
+void ReplSetRequestVotesResponse::addToBSON(BSONObjBuilder* builder) const {
+    builder->append(kTermFieldName, _term);
+    builder->append(kVoteGrantedFieldName, _voteGranted);
+    builder->append(kReasonFieldName, _reason);
+}
+
+BSONObj ReplSetRequestVotesResponse::toBSON() const {
+    BSONObjBuilder builder;
+    addToBSON(&builder);
+    return builder.obj();
+}
+
+}  // namespace repl
+}  // namespace mongo

@@ -28,77 +28,74 @@
 
 #pragma once
 
-#include <boost/optional/optional.hpp>
 #include <boost/intrusive_ptr.hpp>
-#include <boost/shared_ptr.hpp>
-#include <boost/weak_ptr.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/record_id.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-    /**
-     * Stage for pulling results out from an aggregation pipeline.
-     */
-    class PipelineProxyStage : public PlanStage {
-    public:
-        PipelineProxyStage(boost::intrusive_ptr<Pipeline> pipeline,
-                           const boost::shared_ptr<PlanExecutor>& child,
-                           WorkingSet* ws);
+/**
+ * Stage for pulling results out from an aggregation pipeline.
+ */
+class PipelineProxyStage final : public PlanStage {
+public:
+    PipelineProxyStage(OperationContext* opCtx,
+                       std::unique_ptr<Pipeline, Pipeline::Deleter> pipeline,
+                       WorkingSet* ws);
 
-        virtual PlanStage::StageState work(WorkingSetID* out);
+    PlanStage::StageState doWork(WorkingSetID* out) final;
 
-        virtual bool isEOF();
+    bool isEOF() final;
 
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    //
+    // Manage our OperationContext.
+    //
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
 
-        //
-        // Manage our OperationContext. We intentionally don't propagate to the child
-        // Runner as that is handled by DocumentSourceCursor as it needs to.
-        //
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
+    // Returns empty PlanStageStats object
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        /**
-         * Make obj the next object returned by getNext().
-         */
-        void pushBack(const BSONObj& obj);
+    // Not used.
+    SpecificStats* getSpecificStats() const final {
+        MONGO_UNREACHABLE;
+    }
 
-        /**
-         * Return a shared pointer to the PlanExecutor that feeds the pipeline. The returned
-         * pointer may be NULL.
-         */
-        boost::shared_ptr<PlanExecutor> getChildExecutor();
+    void doInvalidate(OperationContext* opCtx, const RecordId& rid, InvalidationType type) final {
+        // A PlanExecutor with a PipelineProxyStage should be registered with the global cursor
+        // manager, so should not receive invalidations.
+        MONGO_UNREACHABLE;
+    }
 
-        //
-        // These should not be used.
-        //
+    std::string getPlanSummaryStr() const;
+    void getPlanSummaryStats(PlanSummaryStats* statsOut) const;
 
-        virtual PlanStageStats* getStats() { return NULL; }
-        virtual CommonStats* getCommonStats() const { return NULL; }
-        virtual SpecificStats* getSpecificStats() const { return NULL; }
+    StageType stageType() const final {
+        return STAGE_PIPELINE_PROXY;
+    }
 
-        // Not used.
-        virtual std::vector<PlanStage*> getChildren() const;
+    static const char* kStageType;
 
-        // Not used.
-        virtual StageType stageType() const { return STAGE_PIPELINE_PROXY; }
+protected:
+    void doDispose() final;
 
-    private:
-        boost::optional<BSONObj> getNextBson();
+private:
+    boost::optional<BSONObj> getNextBson();
 
-        // Things in the _stash sould be returned before pulling items from _pipeline.
-        const boost::intrusive_ptr<Pipeline> _pipeline;
-        std::vector<BSONObj> _stash;
-        const bool _includeMetaData;
-        boost::weak_ptr<PlanExecutor> _childExec;
+    // Things in the _stash should be returned before pulling items from _pipeline.
+    std::unique_ptr<Pipeline, Pipeline::Deleter> _pipeline;
+    std::vector<BSONObj> _stash;
+    const bool _includeMetaData;
 
-        // Not owned by us.
-        WorkingSet* _ws;
-    };
+    // Not owned by us.
+    WorkingSet* _ws;
+};
 
-} // namespace mongo
+}  // namespace mongo

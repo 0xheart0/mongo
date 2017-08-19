@@ -34,29 +34,39 @@
 
 namespace mongo {
 
-    class Status;
-    class ClientBasic;
-    class BSONObj;
+class Status;
+class Client;
+class BSONObj;
 
 namespace repl {
 
-    /**
-     * Base class for repl set commands.
-     */
-    class ReplSetCommand : public Command {
-    protected:
-        ReplSetCommand(const char * s, bool show=false) : Command(s, show) { }
+/**
+ * Base class for repl set commands.
+ */
+class ReplSetCommand : public BasicCommand {
+protected:
+    ReplSetCommand(const char* s) : BasicCommand(s) {}
 
-        bool slaveOk() const override { return true; }
+    bool slaveOk() const override {
+        return true;
+    }
 
-        bool adminOnly() const override { return true; }
+    bool adminOnly() const override {
+        return true;
+    }
 
-        bool isWriteCommandForConfigServer() const override { return false; }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
-        Status checkAuthForCommand(ClientBasic* client,
-                                   const std::string& dbname,
-                                   const BSONObj& cmdObj) override;
-    };
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) override;
 
-} // namespace repl
-} // namespace mongo
+    virtual ActionSet getAuthActionSet() const {
+        return ActionSet{ActionType::internal};
+    }
+};
+
+}  // namespace repl
+}  // namespace mongo

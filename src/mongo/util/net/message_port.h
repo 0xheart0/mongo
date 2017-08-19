@@ -29,144 +29,117 @@
 
 #pragma once
 
-#include <boost/noncopyable.hpp>
-#include <boost/shared_ptr.hpp>
 #include <vector>
 
 #include "mongo/config.h"
+#include "mongo/util/net/abstract_message_port.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/sock.h"
 
 namespace mongo {
 
-    class MessagingPort;
-    class PiggyBackData;
+class MessagingPort;
 
-    class AbstractMessagingPort : boost::noncopyable {
-    public:
-        AbstractMessagingPort() : tag(0), _connectionId(0) {}
-        virtual ~AbstractMessagingPort() { }
-        virtual void reply(Message& received, Message& response, MSGID responseTo) = 0; // like the reply below, but doesn't rely on received.data still being available
-        virtual void reply(Message& received, Message& response) = 0;
+class MessagingPort final : public AbstractMessagingPort {
+public:
+    MessagingPort(int fd, const SockAddr& remote);
 
-        virtual HostAndPort remote() const = 0;
-        virtual unsigned remotePort() const = 0;
-        virtual SockAddr remoteAddr() const = 0;
-        virtual SockAddr localAddr() const = 0;
-        
-        void setX509SubjectName(const std::string& x509SubjectName) {
-            _x509SubjectName = x509SubjectName;
-        }
+    // in some cases the timeout will actually be 2x this value - eg we do a partial send,
+    // then the timeout fires, then we try to send again, then the timeout fires again with
+    // no data sent, then we detect that the other side is down
+    MessagingPort(double so_timeout = 0, logger::LogSeverity logLevel = logger::LogSeverity::Log());
 
-        std::string getX509SubjectName() {
-            return _x509SubjectName;
-        }
+    MessagingPort(std::shared_ptr<Socket> socket);
 
-        long long connectionId() const { return _connectionId; }
-        void setConnectionId( long long connectionId );
+    ~MessagingPort() override;
 
-    public:
-        // TODO make this private with some helpers
+    void setTimeout(Milliseconds millis) override;
 
-        /* ports can be tagged with various classes.  see closeAllSockets(tag). defaults to 0. */
-        unsigned tag;
+    void shutdown() override;
 
-    private:
-        long long _connectionId;
-        std::string _x509SubjectName;
-    };
+    /* it's assumed if you reuse a message object, that it doesn't cross MessagingPort's.
+       also, the Message data will go out of scope on the subsequent recv call.
+    */
+    bool recv(Message& m) override;
+    bool call(const Message& toSend, Message& response) override;
 
-    class MessagingPort : public AbstractMessagingPort {
-    public:
-        MessagingPort(int fd, const SockAddr& remote);
+    void say(const Message& toSend) override;
 
-        // in some cases the timeout will actually be 2x this value - eg we do a partial send,
-        // then the timeout fires, then we try to send again, then the timeout fires again with
-        // no data sent, then we detect that the other side is down
-        MessagingPort(double so_timeout = 0,
-                      logger::LogSeverity logLevel = logger::LogSeverity::Log() );
+    unsigned remotePort() const override {
+        return _psock->remotePort();
+    }
+    virtual HostAndPort remote() const override;
+    virtual SockAddr remoteAddr() const override;
+    virtual SockAddr localAddr() const override;
 
-        MessagingPort(boost::shared_ptr<Socket> socket);
+    void send(const char* data, int len, const char* context) override {
+        _psock->send(data, len, context);
+    }
+    void send(const std::vector<std::pair<char*, int>>& data, const char* context) override {
+        _psock->send(data, context);
+    }
+    bool connect(SockAddr& farEnd) override {
+        return _psock->connect(farEnd);
+    }
 
-        virtual ~MessagingPort();
+    void setLogLevel(logger::LogSeverity ll) override {
+        _psock->setLogLevel(ll);
+    }
 
-        void setSocketTimeout(double timeout);
+    void clearCounters() override {
+        _psock->clearCounters();
+    }
 
-        void shutdown();
+    long long getBytesIn() const override {
+        return _psock->getBytesIn();
+    }
 
-        /* it's assumed if you reuse a message object, that it doesn't cross MessagingPort's.
-           also, the Message data will go out of scope on the subsequent recv call.
-        */
-        bool recv(Message& m);
-        void reply(Message& received, Message& response, MSGID responseTo);
-        void reply(Message& received, Message& response);
-        bool call(Message& toSend, Message& response);
+    long long getBytesOut() const override {
+        return _psock->getBytesOut();
+    }
 
-        void say(Message& toSend, int responseTo = 0);
+    void setX509PeerInfo(SSLPeerInfo x509PeerInfo) override;
 
-        /**
-         * this is used for doing 'async' queries
-         * instead of doing call( to , from )
-         * you would do
-         * say( to )
-         * recv( from )
-         * Note: if you fail to call recv and someone else uses this port,
-         *       horrible things will happen
-         */
-        bool recv( const Message& sent , Message& response );
+    const SSLPeerInfo& getX509PeerInfo() const override;
 
-        void piggyBack( Message& toSend , int responseTo = 0 );
+    void setConnectionId(const long long connectionId) override;
 
-        unsigned remotePort() const { return psock->remotePort(); }
-        virtual HostAndPort remote() const;
-        virtual SockAddr remoteAddr() const;
-        virtual SockAddr localAddr() const;
+    long long connectionId() const override;
 
-        boost::shared_ptr<Socket> psock;
-                
-        void send( const char * data , int len, const char *context ) {
-            psock->send( data, len, context );
-        }
-        void send(const std::vector< std::pair< char *, int > > &data, const char *context) {
-            psock->send( data, context );
-        }
-        bool connect(SockAddr& farEnd) {
-            return psock->connect( farEnd );
-        }
+    void setTag(const AbstractMessagingPort::Tag tag) override;
+
+    AbstractMessagingPort::Tag getTag() const override;
+
+    /**
+     * Initiates the TLS/SSL handshake on this MessagingPort.
+     * When this function returns, further communication on this
+     * MessagingPort will be encrypted.
+     * ssl - Pointer to the global SSLManager.
+     * remoteHost - The hostname of the remote server.
+     */
+    bool secure(SSLManagerInterface* ssl, const std::string& remoteHost) override {
 #ifdef MONGO_CONFIG_SSL
-        /**
-         * Initiates the TLS/SSL handshake on this MessagingPort.
-         * When this function returns, further communication on this
-         * MessagingPort will be encrypted.
-         * ssl - Pointer to the global SSLManager.
-         * remoteHost - The hostname of the remote server.
-         */
-        bool secure( SSLManagerInterface* ssl, const std::string& remoteHost ) {
-            return psock->secure( ssl, remoteHost );
-        }
+        return _psock->secure(ssl, remoteHost);
+#else
+        return false;
 #endif
+    }
 
-        bool isStillConnected() {
-            return psock->isStillConnected();
-        }
+    bool isStillConnected() const override {
+        return _psock->isStillConnected();
+    }
 
-        uint64_t getSockCreationMicroSec() const {
-            return psock->getSockCreationMicroSec();
-        }
+    uint64_t getSockCreationMicroSec() const override {
+        return _psock->getSockCreationMicroSec();
+    }
 
-    private:
-        
-        PiggyBackData * piggyBackData;
+private:
+    // this is the parsed version of remote
+    HostAndPort _remoteParsed;
+    SSLPeerInfo _x509PeerInfo;
+    long long _connectionId;
+    AbstractMessagingPort::Tag _tag;
+    std::shared_ptr<Socket> _psock;
+};
 
-        // this is the parsed version of remote
-        // mutable because its initialized only on call to remote()
-        mutable HostAndPort _remoteParsed; 
-
-    public:
-        static void closeAllSockets(unsigned tagMask = 0xffffffff);
-
-        friend class PiggyBackData;
-    };
-
-
-} // namespace mongo
+}  // namespace mongo

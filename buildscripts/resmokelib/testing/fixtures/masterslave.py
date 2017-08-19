@@ -5,6 +5,9 @@ Master/slave fixture for executing JSTests against.
 from __future__ import absolute_import
 
 import os.path
+import socket
+
+import pymongo
 
 from . import interface
 from . import standalone
@@ -18,8 +21,6 @@ class MasterSlaveFixture(interface.ReplFixture):
     Fixture which provides JSTests with a master/slave deployment to
     run against.
     """
-
-    AWAIT_REPL_TIMEOUT_MINS = 5
 
     def __init__(self,
                  logger,
@@ -53,24 +54,43 @@ class MasterSlaveFixture(interface.ReplFixture):
         self.slave = None
 
     def setup(self):
-        self.master = self._new_mongod_master()
+        if self.master is None:
+            self.master = self._new_mongod_master()
         self.master.setup()
         self.port = self.master.port
 
-        self.slave = self._new_mongod_slave()
+        if self.slave is None:
+            self.slave = self._new_mongod_slave()
         self.slave.setup()
 
     def await_ready(self):
         self.master.await_ready()
         self.slave.await_ready()
 
-    def teardown(self):
+        # Do a replicated write to ensure that the slave has finished with its initial sync before
+        # starting to run any tests.
+        client = utils.new_mongo_client(self.port)
+
+        # Keep retrying this until it times out waiting for replication.
+        def insert_fn(remaining_secs):
+            remaining_millis = int(round(remaining_secs * 1000))
+            write_concern = pymongo.WriteConcern(w=2, wtimeout=remaining_millis)
+            coll = client.resmoke.get_collection("await_ready", write_concern=write_concern)
+            coll.insert_one({"awaiting": "ready"})
+
+        try:
+            self.retry_until_wtimeout(insert_fn)
+        except pymongo.errors.WTimeoutError:
+            self.logger.info("Replication of write operation timed out.")
+            raise
+
+    def _do_teardown(self):
         running_at_start = self.is_running()
         success = True  # Still a success if nothing is running.
 
         if not running_at_start:
-            self.logger.info("Master-slave deployment was expected to be running in teardown(),"
-                             " but wasn't.")
+            self.logger.info(
+                "Master-slave deployment was expected to be running in _do_teardown(), but wasn't.")
 
         if self.slave is not None:
             if running_at_start:
@@ -102,17 +122,6 @@ class MasterSlaveFixture(interface.ReplFixture):
     def get_secondaries(self):
         return [self.slave]
 
-    def await_repl(self):
-        self.logger.info("Awaiting replication of insert (w=2, wtimeout=%d min) to master on port"
-                         " %d", MasterSlaveFixture.AWAIT_REPL_TIMEOUT_MINS, self.port)
-        repl_timeout = MasterSlaveFixture.AWAIT_REPL_TIMEOUT_MINS * 60 * 1000
-        client = utils.new_mongo_client(self.port)
-
-        # Use the same database as the jstests to ensure that the slave doesn't acknowledge the
-        # write as having completed before it has synced the test database.
-        client.test.resmoke_await_repl.insert({}, w=2, wtimeout=repl_timeout)
-        self.logger.info("Replication of write operation completed.")
-
     def _new_mongod(self, mongod_logger, mongod_options):
         """
         Returns a standalone.MongoDFixture with the specified logger and
@@ -130,8 +139,7 @@ class MasterSlaveFixture(interface.ReplFixture):
         master of a master-slave deployment.
         """
 
-        logger_name = "%s:master" % (self.logger.name)
-        mongod_logger = logging.loggers.new_logger(logger_name, parent=self.logger)
+        mongod_logger = self.logger.new_fixture_node_logger("master")
 
         mongod_options = self.mongod_options.copy()
         mongod_options.update(self.master_options)
@@ -145,12 +153,11 @@ class MasterSlaveFixture(interface.ReplFixture):
         slave of a master-slave deployment.
         """
 
-        logger_name = "%s:slave" % (self.logger.name)
-        mongod_logger = logging.loggers.new_logger(logger_name, parent=self.logger)
+        mongod_logger = self.logger.new_fixture_node_logger("slave")
 
         mongod_options = self.mongod_options.copy()
         mongod_options.update(self.slave_options)
         mongod_options["slave"] = ""
-        mongod_options["source"] = "localhost:%d" % (self.port)
+        mongod_options["source"] = "%s:%d" % (socket.gethostname(), self.port)
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "slave")
         return self._new_mongod(mongod_logger, mongod_options)

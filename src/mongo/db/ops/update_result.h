@@ -28,47 +28,43 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    namespace str = mongoutils::str;
+namespace str = mongoutils::str;
 
-    struct UpdateResult {
+struct UpdateResult {
+    UpdateResult(bool existing_,
+                 bool modifiers_,
+                 unsigned long long numDocsModified_,
+                 unsigned long long numMatched_,
+                 const BSONObj& upsertedObject_);
 
-        UpdateResult( bool existing_,
-                      bool modifiers_,
-                      unsigned long long numDocsModified_,
-                      unsigned long long numMatched_,
-                      const BSONObj& upsertedObject_);
 
+    // if existing objects were modified
+    const bool existing;
 
-        // if existing objects were modified
-        const bool existing;
+    // was this a $ mod
+    const bool modifiers;
 
-        // was this a $ mod
-        const bool modifiers;
+    // how many docs updated
+    const long long numDocsModified;
 
-        // how many docs updated
-        const long long numDocsModified;
+    // how many docs seen by update
+    const long long numMatched;
 
-        // how many docs seen by update
-        const long long numMatched;
+    // if something was upserted, the new _id of the object
+    BSONObj upserted;
 
-        // if something was upserted, the new _id of the object
-        BSONObj upserted;
+    const std::string toString() const {
+        return str::stream() << " upserted: " << upserted << " modifiers: " << modifiers
+                             << " existing: " << existing << " numDocsModified: " << numDocsModified
+                             << " numMatched: " << numMatched;
+    }
+};
 
-        const std::string toString() const {
-            return str::stream()
-                        << " upserted: " << upserted
-                        << " modifiers: " << modifiers
-                        << " existing: " << existing
-                        << " numDocsModified: " << numDocsModified
-                        << " numMatched: " << numMatched;
-        }
-    };
-
-} // namespace mongo
+}  // namespace mongo

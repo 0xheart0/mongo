@@ -26,138 +26,69 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
-#include <string>
+#include "mongo/db/commands/current_op_common.h"
 
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands.h"
 #include "mongo/db/commands/fsync.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/dbmessage.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/matcher.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/commands/run_aggregate.h"
+#include "mongo/db/pipeline/document.h"
 #include "mongo/db/stats/fill_locker_info.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
-    class CurrentOpCommand : public Command {
-    public:
+class CurrentOpCommand final : public CurrentOpCommandBase {
+    MONGO_DISALLOW_COPYING(CurrentOpCommand);
 
-        CurrentOpCommand() : Command("currentOp") {}
+public:
+    CurrentOpCommand() = default;
 
-        bool isWriteCommandForConfigServer() const final { return false; }
-
-        bool slaveOk() const final { return true; }
-
-        bool adminOnly() const final { return true; }
-
-        Status checkAuthForCommand(ClientBasic* client,
-                                   const std::string& dbname,
-                                   const BSONObj& cmdObj) final {
-
-            bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                                    ResourcePattern::forClusterResource(),
-                                    ActionType::inprog);
-            return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbName,
+                               const BSONObj& cmdObj) final {
+        AuthorizationSession* authzSession = AuthorizationSession::get(client);
+        if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                           ActionType::inprog)) {
+            return Status::OK();
         }
 
-        bool run(OperationContext* txn,
-                 const std::string& db,
-                 BSONObj& cmdObj,
-                 int options,
-                 std::string& errmsg,
-                 BSONObjBuilder& result) final {
-
-            const bool includeAll = cmdObj["$all"].trueValue();
-
-            // Filter the output
-            BSONObj filter;
-            {
-                BSONObjBuilder b;
-                BSONObjIterator i(cmdObj);
-                invariant(i.more());
-                i.next(); // skip {currentOp: 1} which is required to be the first element
-                while (i.more()) {
-                    BSONElement e = i.next();
-                    if (str::equals("$all", e.fieldName())) {
-                        continue;
-                    }
-
-                    b.append(e);
-                }
-                filter = b.obj();
-            }
-
-            const WhereCallbackReal whereCallback(txn, db);
-            const Matcher matcher(filter, whereCallback);
-
-            BSONArrayBuilder inprogBuilder(result.subarrayStart("inprog"));
-
-            for (ServiceContext::LockedClientsCursor cursor(txn->getClient()->getServiceContext());
-                 Client* client = cursor.next();) {
-
-                invariant(client);
-
-                boost::unique_lock<Client> uniqueLock(*client);
-                const OperationContext* opCtx = client->getOperationContext();
-
-                if (!includeAll) {
-                    // Skip over inactive connections.
-                    if (!opCtx || !opCtx->getCurOp() || !opCtx->getCurOp()->active()) {
-                        continue;
-                    }
-                }
-
-                BSONObjBuilder infoBuilder;
-
-                // The client information
-                client->reportState(infoBuilder);
-
-                // Operation context specific information
-                if (opCtx) {
-                    // CurOp
-                    if (opCtx->getCurOp()) {
-                        opCtx->getCurOp()->reportState(&infoBuilder);
-                    }
-
-                    // LockState
-                    Locker::LockerInfo lockerInfo;
-                    client->getOperationContext()->lockState()->getLockerInfo(&lockerInfo);
-                    fillLockerInfo(lockerInfo, infoBuilder);
-                }
-                else {
-                    // If no operation context, mark the operation as inactive
-                    infoBuilder.append("active", false);
-                }
-
-                infoBuilder.done();
-
-                const BSONObj info = infoBuilder.obj();
-
-                if (includeAll || matcher.matches(info)) {
-                    inprogBuilder.append(info);
-                }
-            }
-
-            inprogBuilder.done();
-
-            if (lockedForWriting()) {
-                result.append("fsyncLock", true);
-                result.append("info",
-                              "use db.fsyncUnlock() to terminate the fsync write/snapshot lock");
-            }
-
-            return true;
+        bool isAuthenticated = authzSession->getAuthenticatedUserNames().more();
+        if (isAuthenticated && cmdObj["$ownOps"].trueValue()) {
+            return Status::OK();
         }
 
-    } currentOpCommand;
+        return Status(ErrorCodes::Unauthorized, "Unauthorized");
+    }
+
+    virtual StatusWith<CursorResponse> runAggregation(
+        OperationContext* opCtx, const AggregationRequest& request) const final {
+        auto aggCmdObj = request.serializeToCommandObj().toBson();
+
+        BSONObjBuilder responseBuilder;
+
+        auto status = runAggregate(
+            opCtx, request.getNamespaceString(), request, std::move(aggCmdObj), responseBuilder);
+
+        if (!status.isOK()) {
+            return status;
+        }
+
+        appendCommandStatus(responseBuilder, Status::OK());
+
+        return CursorResponse::parseFromBSON(responseBuilder.obj());
+    }
+
+    virtual void appendToResponse(BSONObjBuilder* result) const final {
+        if (lockedForWriting()) {
+            result->append("fsyncLock", true);
+            result->append("info",
+                           "use db.fsyncUnlock() to terminate the fsync write/snapshot lock");
+        }
+    }
+
+} currentOpCommand;
 
 }  // namespace mongo
